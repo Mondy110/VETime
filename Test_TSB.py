@@ -217,7 +217,8 @@ def TSB_test(
     log_df = pd.DataFrame(runtime_log)
     csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}.csv')
     log_df.to_csv(csv_save_path, index=False)
-    TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting)
+    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting)
+    return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
 def _process_single_result_file(args):
     result_path, filename, sliding_window, args_test = args
@@ -243,7 +244,7 @@ def TSB_test_parallel_postprocess(
     args_test,
     data_setting=DATA_INIT_SETTING,
     dataset_setting=PASS_LIST,
-    num_workers=80
+    num_workers=24
 ):
     target_dir = args_test.target_dir
     file_list = args_test.file_list
@@ -263,7 +264,7 @@ def TSB_test_parallel_postprocess(
         tasks.append((result_path, filename, slidingWindow, args_test))
 
     results = []
-    mp.set_start_method('spawn', force=True)
+    mp.set_start_method('fork', force=True)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(_process_single_result_file, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
@@ -308,7 +309,17 @@ def TSB_test_parallel_postprocess(
     os.makedirs(args_test.save_dir, exist_ok=True)
     final_csv.to_csv(output_csv, index=False)
     print(f"📊 Final results saved to: {output_csv}")
-    return output_csv    
+
+    # 计算所有数据集的平均F1作为验证指标
+    avg_f1 = 0.0
+    if summary_rows and 'Standard-F1' in final_csv.columns:
+        # 获取所有_MEAN行的平均F1
+        mean_rows = final_csv[final_csv['file'].str.contains('_MEAN', na=False)]
+        if not mean_rows.empty:
+            avg_f1 = mean_rows['Standard-F1'].mean()
+            print(f"📈 Average Standard-F1 across datasets: {avg_f1:.4f}")
+
+    return avg_f1    
 
 import torch
 import numpy as np

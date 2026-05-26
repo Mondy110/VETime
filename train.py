@@ -28,6 +28,25 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 import torch
 torch.cuda.empty_cache()
 def main(args):
+    # 为 TSB_test 兼容性添加缺失的属性
+    import os
+    import pandas as pd
+    if not hasattr(args, 'save_dir'):
+        args.save_dir = './output'
+    if not hasattr(args, 'target_dir'):
+        args.target_dir = os.path.join(args.save_dir, args.model_name)
+        os.makedirs(args.target_dir, exist_ok=True)
+    if not hasattr(args, 'dataset_dir'):
+        args.dataset_dir = args.dataset_test_dir
+    if not hasattr(args, 'file_list') or isinstance(args.file_list, str):
+        # 如果 file_list 是字符串路径，读取 CSV 获取文件列表
+        if hasattr(args, 'file_list') and args.file_list.endswith('.csv'):
+            df = pd.read_csv(args.file_list)
+            args.file_list = df['filename'].tolist() if 'filename' in df.columns else df.iloc[:, 0].tolist()
+        else:
+            # 默认从 dataset_dir 获取所有文件
+            args.file_list = sorted(os.listdir(args.dataset_dir))
+
     accelerator = Accelerator(
         mixed_precision="bf16",          
         gradient_accumulation_steps=4,    
@@ -136,8 +155,9 @@ def main(args):
                 optimizer.step()
                 optimizer.zero_grad()
 
-            total_loss += loss1.item()+loss2.item()
-            progress_bar.set_postfix({"loss": total_loss})
+            batch_loss = loss1.item()+loss2.item()
+            total_loss += batch_loss
+            progress_bar.set_postfix({"loss": batch_loss})
 
             probs = torch.softmax(logits, dim=-1)[:, :,1]
             preds = (probs > 0.5).float()
@@ -167,7 +187,7 @@ def main(args):
             print(f"  Train {k}: {v:.4f}")
         if (epoch+1) % 2 == 0 or epoch == epochs - 1:
             model.eval()
-            avg_val_loss=TSB_test(model,args.model_name,args.data_setting,device,dataset_setting=PASS_LIST)
+            avg_val_loss=TSB_test(model,args,args.data_setting,device,dataset_setting=PASS_LIST)
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             timestamp = datetime.now().strftime("%m%d-%H")
@@ -186,7 +206,7 @@ def main(args):
             if early_stopping.early_stop:
                 print("Early stopping triggered.")
             
-    loss_all=TSB_test(model,args.model_name,args.data_setting,device,dataset_setting=PASS_LIST)
+    loss_all=TSB_test(model,args,args.data_setting,device,dataset_setting=PASS_LIST)
     print(loss_all)
     accelerator.end_training()
     logger.info("Training completed!")
