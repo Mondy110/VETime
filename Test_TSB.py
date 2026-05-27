@@ -48,35 +48,66 @@ logger = logging.getLogger(__name__)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
-PASS_LIST = [
-                "Daphnet",
-                "CATSv2",
-                "SWaT",
-                "LTDB",
-                "TAO",
-                "Exathlon",
-                "MITDB",
-                "MSL",
-                "SMAP",
-                "SMD",
-                "SVDB",
-                "OPP",
-            ]
-USE_LIST = [
-        "IOPS",
-        "MGAB",
-        "NAB",
-        "NEK",
-        "Power",
-        "SED",
-        "Stock",
-        "TODS",
-        "WSD",
-        "UCR",
-        "YAHOO",
-        "MSL",
-        "SMAP",
-        ]
+# 用于 TSB-AD-U (单变量数据集): 排除非原生单变量数据集
+PASS_LIST_UNI = [
+    "Daphnet",
+    "CATSv2",
+    "SWaT",
+    "LTDB",
+    "TAO",
+    "Exathlon",
+    "MITDB",
+    "MSL",
+    "SMAP",
+    "SMD",
+    "SVDB",
+    "OPP",
+]
+
+# 用于 TSB-AD-M (多变量数据集): 只保留 MSL, PSM, SMAP, SMD, SWaT，排除其他所有
+PASS_LIST_MULTI = [
+    "CATSv2",
+    "CreditCard",
+    "Daphnet",
+    "Exathlon",
+    "GECCO",
+    "GHL",
+    "Genesis",
+    "LTDB",
+    "MITDB",
+    "OPPORTUNITY",
+    "SVDB",
+    "TAO",
+]
+
+# 默认使用单变量过滤列表（保持向后兼容）
+PASS_LIST = PASS_LIST_UNI
+
+# 统计结果时使用的数据集分组
+USE_LIST_UNI = [
+    "IOPS",
+    "MGAB",
+    "NAB",
+    "NEK",
+    "Power",
+    "SED",
+    "Stock",
+    "TODS",
+    "WSD",
+    "UCR",
+    "YAHOO",
+]
+
+USE_LIST_MULTI = [
+    "MSL",
+    "PSM",
+    "SMAP",
+    "SMD",
+    "SWaT",
+]
+
+# 默认使用单变量统计列表（保持向后兼容）
+USE_LIST = USE_LIST_UNI
 
 DATA_INIT_SETTING = {
     "img_size": 224, 
@@ -139,7 +170,8 @@ def TSB_test(
     data_setting=DATA_INIT_SETTING,
     device='cuda:0',
     dataset_setting=PASS_LIST,
-    for_m =False
+    use_list=None,
+    for_m=False
 ):
     import os
     import time
@@ -214,25 +246,35 @@ def TSB_test(
             'run_time_seconds': run_time
         })
 
+        del df, datas, labels_full, data, labels, batch, images, time_series, att_mask, labels_tensor
+        torch.cuda.empty_cache()
+        import gc; gc.collect()
+
     log_df = pd.DataFrame(runtime_log)
     csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}.csv')
     log_df.to_csv(csv_save_path, index=False)
-    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting)
+    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list)
     return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
 def _process_single_result_file(args):
+    import gc
     result_path, filename, sliding_window, args_test = args
     try:
         df = pd.read_pickle(result_path)
         probs = np.array(df['anomaly_score'].tolist())
         labels = np.array(df['label'].tolist())
+        labels_len = len(labels)
+        del df
 
         pred_threshold = np.mean(probs) + 3 * np.std(probs)
         evaluation_result = get_metrics(probs, labels, slidingWindow=sliding_window, pred=probs > pred_threshold)
 
+        del probs, labels
+        gc.collect()
+
         return {
             'filename': filename,
-            'length': len(labels),
+            'length': labels_len,
             'metrics': evaluation_result,
         }
     except Exception as e:
@@ -244,11 +286,17 @@ def TSB_test_parallel_postprocess(
     args_test,
     data_setting=DATA_INIT_SETTING,
     dataset_setting=PASS_LIST,
+    use_list=None,
     num_workers=24
 ):
+    # 如果没有提供 use_list，使用全局的 USE_LIST
+    if use_list is None:
+        use_list = USE_LIST
+
     target_dir = args_test.target_dir
     file_list = args_test.file_list
-    
+
+    import gc
     tasks = []
     for filename in file_list:
         if any(filter_item in filename for filter_item in dataset_setting):
@@ -262,15 +310,19 @@ def TSB_test_parallel_postprocess(
         slidingWindow = find_length_rank(datas[:,0].reshape(-1, 1), rank=1)
 
         tasks.append((result_path, filename, slidingWindow, args_test))
+        del df, datas
+    gc.collect()
 
     results = []
-    mp.set_start_method('fork', force=True)
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    ctx = mp.get_context('spawn')
+    safe_workers = min(num_workers, mp.cpu_count() - 4)
+    with ProcessPoolExecutor(max_workers=safe_workers, mp_context=ctx) as executor:
         futures = [executor.submit(_process_single_result_file, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
             res = future.result()
             if res:
                 results.append(res)
+            del res
 
     write_csv = []
     col_w = None
@@ -282,7 +334,7 @@ def TSB_test_parallel_postprocess(
 
     w_csv = pd.DataFrame(write_csv, columns=col_w)
 
-    use_data = USE_LIST
+    use_data = use_list
 
     summary_rows = []
     for dataset_name in use_data:
@@ -379,6 +431,20 @@ if __name__ == '__main__':
     
     args_test = parser.parse_args()
 
+    # 根据数据集路径自动选择过滤列表
+    if "TSB-AD-M" in args_test.dataset_dir:
+        # 多变量数据集：只跑 MSL, PSM, SMAP, SMD, SWaT
+        dataset_pass_list = PASS_LIST_MULTI
+        dataset_use_list = USE_LIST_MULTI
+        print(f"[INFO] 检测到多变量数据集路径，使用 PASS_LIST_MULTI 过滤")
+        print(f"[INFO] 将只处理以下数据集: {USE_LIST_MULTI}")
+    else:
+        # 单变量数据集：排除非原生单变量
+        dataset_pass_list = PASS_LIST_UNI
+        dataset_use_list = USE_LIST_UNI
+        print(f"[INFO] 检测到单变量数据集路径，使用 PASS_LIST_UNI 过滤")
+        print(f"[INFO] 将处理以下数据集: {USE_LIST_UNI}")
+
     args_test.target_dir = os.path.join(args_test.save_dir, args_test.model_name)
     os.makedirs(args_test.target_dir, exist_ok = True)
     args_test.file_list = sorted(os.listdir(args_test.dataset_dir))
@@ -399,4 +465,5 @@ if __name__ == '__main__':
         model.load_state_dict(state_dict, strict=False)
 
     
-    TSB_test(model,args_test,args_test.data_setting,device,PASS_LIST,False)
+    TSB_test(model, args_test, args_test.data_setting, device,
+             dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False)

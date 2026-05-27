@@ -78,7 +78,7 @@ def main(args):
     train_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="train")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                               collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True)
+                              pin_memory=True, drop_last=True, persistent_workers=False)
     
 
     trainable_params = (param for param in model.parameters() if param.requires_grad)
@@ -185,7 +185,7 @@ def main(args):
         print(f"  Avg Loss: {avg_train_loss:.4f}")
         for k, v in train_metrics.items():
             print(f"  Train {k}: {v:.4f}")
-        if (epoch+1) % 2 == 0 or epoch == epochs - 1:
+        if (epoch+1) % 1 == 0 or epoch == epochs - 1:
             model.eval()
             avg_val_loss=TSB_test(model,args,args.data_setting,device,dataset_setting=PASS_LIST)
             accelerator.wait_for_everyone()
