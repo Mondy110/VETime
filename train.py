@@ -56,22 +56,32 @@ def main(args):
 
     logger.info(f"Using {accelerator.num_processes} {'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
 
+    print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     vision_model = V_model(args.vision_name,unpatch=True)
+    print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     config_v = vision_model.config
     if 'mae' in args.vision_name:
         patch_size=config_v['patch_size']
     else:
         patch_size=config_v.patch_size
 
-    ts_model = TS_Model(default_config_t) 
+    ts_model = TS_Model(default_config_t)
     if args.ts_path!=None:
+        print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
         state_ts_dict = torch.load(args.ts_path, map_location='cpu')['model_state_dict']
         ts_model.load_state_dict(state_ts_dict)
+        print(f"[INFO] TS Encoder 权重加载完成！")
+    else:
+        print(f"[WARNING] 未指定 --ts_path，TS Encoder 使用随机初始化！")
 
-    model = VETIME(config_v,vision_model,default_config_t,ts_model,args.model_name)  
+    model = VETIME(config_v,vision_model,default_config_t,ts_model,args.model_name)
     if args.vetime_path!=None:
+        print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
         state_dict = torch.load(args.vetime_path, map_location='cpu')
         model.load_state_dict(state_dict)
+        print(f"[INFO] VETime 权重加载完成（用于继续训练）")
+    else:
+        print(f"[INFO] 未指定 --vetime_path，VETime 融合模块从头训练")
     del vision_model,ts_model
 
     collatefn = partial(collate_fn, patch_size=patch_size)
