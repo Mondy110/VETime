@@ -15,9 +15,26 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 vision_PATH = os.path.join(BASE_DIR, 'checkpoints', 'weight_v')
 
 class V_model(nn.Module):
-    def __init__(self, vision_name=None,unpatch=True,MAX_L=5000,finetune_type='ln',**kwargs):
-        super().__init__() 
-        
+    def __init__(self, vision_name=None,unpatch=True,MAX_L=5000,finetune_type='none',**kwargs):
+        """
+        Vision Encoder based on MAE/ViT.
+
+        Args:
+            vision_name: Name of the vision weight file
+            unpatch: Whether to use unpatch operation
+            MAX_L: Maximum sequence length
+            finetune_type: Fine-tuning strategy for ViT
+                - 'none': Fully frozen (default, as per paper)
+                - 'ln': Only LayerNorm trainable
+                - 'bias': Only bias trainable
+                - 'full': All parameters trainable
+                - 'mlp': Only MLP layers trainable
+                - 'attn': Only attention layers trainable
+
+        Note: Paper specifies "the encoder of the frozen MAE", so default is 'none'.
+        """
+        super().__init__()
+
         vision_weight = os.path.join(vision_PATH,vision_name)
         if 'vit' in vision_name:
             self.encode_image= VitTS_AD(vision_weight)
@@ -31,8 +48,9 @@ class V_model(nn.Module):
             self.hidden_size = self.config['embed_dim']
 
         self.MAX_L=MAX_L
-        self._freeze_layers() 
+        self._freeze_layers()
 
+        # Apply fine-tuning strategy (default: 'none' = fully frozen, as per paper)
         if finetune_type != 'full':
             for n, param in self.encode_image.named_parameters():
                 if 'ln' == finetune_type:

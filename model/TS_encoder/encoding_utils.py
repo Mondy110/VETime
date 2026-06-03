@@ -12,6 +12,70 @@ import math
 from typing import Any, Tuple, Optional
 
 
+class LoRALinear(nn.Module):
+    """
+    LoRA (Low-Rank Adaptation) for linear layers.
+
+    As per paper: "we apply Low-Rank Adaptation (LoRA) to fine-tune the linear
+    projection matrices within both the Attention mechanism and the FFN modules.
+    Specifically, we set the LoRA rank r = 8 and the scaling hyperparameter α = 16,
+    resulting in a scaling factor of α/r = 2."
+
+    Args:
+        original_linear: The original linear layer (frozen)
+        r: LoRA rank (default: 8)
+        alpha: LoRA scaling factor (default: 16)
+    """
+    def __init__(self, original_linear: nn.Linear, r: int = 8, alpha: int = 16):
+        super().__init__()
+        self.original_linear = original_linear
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / r  # = 2 as per paper
+
+        in_features = original_linear.in_features
+        out_features = original_linear.out_features
+
+        # LoRA matrices: A (down-projection) and B (up-projection)
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+
+        # Initialize A with Kaiming uniform, B with zeros
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
+
+        # Freeze the original linear layer
+        for param in self.original_linear.parameters():
+            param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Original output (frozen weights) + LoRA adaptation
+        return self.original_linear(x) + (x @ self.lora_A.T @ self.lora_B.T) * self.scaling
+
+
+def apply_lora_to_module(module: nn.Module, r: int = 8, alpha: int = 16) -> nn.Module:
+    """
+    Apply LoRA to all linear layers in a module.
+
+    Args:
+        module: The module to apply LoRA to
+        r: LoRA rank
+        alpha: LoRA scaling factor
+
+    Returns:
+        The module with LoRA applied
+    """
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            # Replace Linear with LoRALinear
+            lora_linear = LoRALinear(child, r=r, alpha=alpha)
+            setattr(module, name, lora_linear)
+        else:
+            # Recursively apply to child modules
+            apply_lora_to_module(child, r=r, alpha=alpha)
+    return module
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Normalization layer."""
     def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
@@ -59,7 +123,7 @@ class BinaryAttentionBias(nn.Module):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(self, d_model, dim_feedforward=2048):
+    def __init__(self, d_model, dim_feedforward=2048, use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.hidden_size = d_model
         self.intermediate_size = dim_feedforward
@@ -68,13 +132,20 @@ class LlamaMLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=True)
         self.act_fn = F.gelu
 
+        # Apply LoRA if specified (as per paper)
+        if use_lora:
+            self.gate_proj = LoRALinear(self.gate_proj, r=lora_r, alpha=lora_alpha)
+            self.up_proj = LoRALinear(self.up_proj, r=lora_r, alpha=lora_alpha)
+            self.down_proj = LoRALinear(self.down_proj, r=lora_r, alpha=lora_alpha)
+
     def forward(self, x):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
 class CustomTransformerEncoder(nn.Module):
     """Stack of Transformer Encoder Layers."""
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features,
+                 use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayerWithRoPE(
@@ -83,7 +154,10 @@ class CustomTransformerEncoder(nn.Module):
                 dim_feedforward=dim_feedforward,
                 dropout=dropout,
                 activation=activation,
-                num_features=num_features
+                num_features=num_features,
+                use_lora=use_lora,
+                lora_r=lora_r,
+                lora_alpha=lora_alpha
             ) for _ in range(num_layers)
         ])
     def forward(self, src, freqs, src_id=None, attn_mask=None):
@@ -91,17 +165,20 @@ class CustomTransformerEncoder(nn.Module):
         for layer in self.layers:
             output = layer(output, freqs, src_id, attn_mask=attn_mask)
         return output
-    
+
 class TransformerEncoderLayerWithRoPE(nn.Module):
     """Transformer Encoder Layer with RoPE and RMSNorm."""
-    
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu", num_features=1,
+                 use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
-        self.self_attn = MultiheadAttentionWithRoPE(d_model, nhead, num_features)
+        self.self_attn = MultiheadAttentionWithRoPE(d_model, nhead, num_features,
+                                                    use_lora=use_lora, lora_r=lora_r, lora_alpha=lora_alpha)
         self.dropout = nn.Dropout(dropout)
         self.input_norm = RMSNorm(d_model)
         self.output_norm = RMSNorm(d_model)
-        self.mlp = LlamaMLP(d_model, dim_feedforward)
+        self.mlp = LlamaMLP(d_model, dim_feedforward,
+                           use_lora=use_lora, lora_r=lora_r, lora_alpha=lora_alpha)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
@@ -121,7 +198,7 @@ class MultiheadAttentionWithRoPE(nn.Module):
     """Multi-head Attention with Rotary Positional Encoding (RoPE), non-causal by default."""
     "========== NOtice that this applies BinaryAttentionBias ==========="
 
-    def __init__(self, embed_dim, num_heads, num_features):
+    def __init__(self, embed_dim, num_heads, num_features, use_lora=False, lora_r=8, lora_alpha=16):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -134,6 +211,13 @@ class MultiheadAttentionWithRoPE(nn.Module):
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Apply LoRA to attention projections if specified (as per paper)
+        if use_lora:
+            self.q_proj = LoRALinear(self.q_proj, r=lora_r, alpha=lora_alpha)
+            self.k_proj = LoRALinear(self.k_proj, r=lora_r, alpha=lora_alpha)
+            self.v_proj = LoRALinear(self.v_proj, r=lora_r, alpha=lora_alpha)
+            self.out_proj = LoRALinear(self.out_proj, r=lora_r, alpha=lora_alpha)
 
         # Binary attention bias for time series
         if num_features > 1:

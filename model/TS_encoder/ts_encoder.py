@@ -15,7 +15,7 @@ from typing import Dict, Optional
 @dataclass
 class TimeSeriesConfig:
     """Configuration for time series encoder.
-    
+
     Attributes:
         d_model: Dimension of model hidden states.
         d_proj: Dimension of projection layer.
@@ -26,6 +26,9 @@ class TimeSeriesConfig:
         use_rope: Whether to use Rotary Position Embedding.
         activation: Activation function name.
         num_features: Number of input features.
+        use_lora: Whether to use LoRA for parameter-efficient fine-tuning.
+        lora_r: LoRA rank (default: 8, as per paper).
+        lora_alpha: LoRA alpha (default: 16, as per paper).
     """
     d_model: int = 512
     d_proj: int = 256
@@ -37,11 +40,14 @@ class TimeSeriesConfig:
     use_rope: bool = True
     activation: str = "gelu"
     num_features: int = 1
+    use_lora: bool = True
+    lora_r: int = 8
+    lora_alpha: int = 16
 
 
 class TimeSeriesEncoder(nn.Module):
     """
-    Time Series Encoder with PatchTST-like patching, RoPE.
+    Time Series Encoder with PatchTST-like patching, RoPE, and LoRA support.
 
     Args:
         d_model (int): Model dimension
@@ -54,6 +60,9 @@ class TimeSeriesEncoder(nn.Module):
         use_rope (bool): Use RoPE if True
         num_features (int): Number of features in the time series
         activation (str): "relu" or "gelu"
+        use_lora (bool): Use LoRA for parameter-efficient fine-tuning (as per paper)
+        lora_r (int): LoRA rank (default: 8, as per paper)
+        lora_alpha (int): LoRA alpha (default: 16, as per paper)
 
     Inputs:
         time_series (Tensor): Shape (batch_size, seq_len, num_features)
@@ -62,9 +71,9 @@ class TimeSeriesEncoder(nn.Module):
     Outputs:
         local_embeddings (Tensor): Shape (batch_size, seq_len, num_features, d_proj)
     """
-    def __init__(self,d_model=512, d_proj=256, patch_size=14, num_layers=8, num_heads=8,
-                 d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1, #use_mv=False,
-                 activation="gelu",**kwargs):
+    def __init__(self, d_model=512, d_proj=256, patch_size=14, num_layers=8, num_heads=8,
+                 d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1,
+                 activation="gelu", use_lora=True, lora_r=8, lora_alpha=16, **kwargs):
         super().__init__()
         self.patch_size = patch_size
         self.d_model = d_model
@@ -76,12 +85,13 @@ class TimeSeriesEncoder(nn.Module):
         self.use_rope = use_rope
         self.num_features = num_features
         self.activation = activation
+        self.use_lora = use_lora
 
         # Patch embedding layer
         self.embedding_layer = nn.Linear(patch_size, d_model)
 
         if use_rope:
-            # Initialize RoPE and custom encoder
+            # Initialize RoPE and custom encoder with LoRA support
             self.rope_embedder = RotaryEmbedding(d_model)
             self.transformer_encoder = CustomTransformerEncoder(
                 d_model=d_model,
@@ -90,10 +100,11 @@ class TimeSeriesEncoder(nn.Module):
                 dropout=d_ff_dropout,
                 activation=activation,
                 num_layers=num_layers,
-                # use_mv=use_mv,
-                num_features=num_features
-            )        
-           
+                num_features=num_features,
+                use_lora=use_lora,
+                lora_r=lora_r,
+                lora_alpha=lora_alpha
+            )
         else:
             # Standard encoder without RoPE
             encoder_layer = nn.TransformerEncoderLayer(
@@ -106,19 +117,15 @@ class TimeSeriesEncoder(nn.Module):
             )
             self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        
-
         # Output projection layers
         self.projection_layer = nn.Linear(d_model, patch_size * d_proj)
         self._init_parameters()
 
     def _init_parameters(self):
         for name, param in self.named_parameters():
-            if 'weight' in name and 'linear' in name:
-                if self.activation == "relu":
-                    nn.init.kaiming_uniform_(param, nonlinearity='relu')
-                elif self.activation == "gelu":
-                    nn.init.kaiming_uniform_(param, nonlinearity='gelu')
+            if 'weight' in name and param.dim() >= 2:
+                # Use Xavier uniform for GELU activation
+                nn.init.xavier_uniform_(param)
             elif 'bias' in name:
                 nn.init.constant_(param, 0.0)
 
@@ -178,7 +185,7 @@ class TimeSeriesEncoder(nn.Module):
                 freqs=freqs,
                 attn_mask=full_mask
             )
-        
+
         # Extract and project local embeddings
         patch_embeddings = output  # (B, L, d_model)
         patch_proj = self.projection_layer(patch_embeddings)  # (B, L, patch_size * d_proj)
@@ -186,6 +193,4 @@ class TimeSeriesEncoder(nn.Module):
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)  # (B, num_patches, patch_size, num_features, d_proj)
         local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
 
-        return patch_embeddings,local_embeddings,full_mask
-    
-    
+        return patch_embeddings, local_embeddings, full_mask
