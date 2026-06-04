@@ -12,7 +12,9 @@ As per paper (B.4 Implementation Details):
 - Batch Size: 32
 """
 import argparse
+import gc
 import json
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -41,7 +43,29 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 torch.cuda.empty_cache()
 
 
+def set_seed(seed: int):
+    """设置所有随机种子以保证可复现性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # 确保CUDA操作确定性
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    """为每个DataLoader worker设置不同的种子"""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def main(args):
+    # 设置随机种子（必须在任何随机操作之前）
+    set_seed(args.seed)
+    print(f"[INFO] 随机种子已设置: {args.seed}")
+
     # 为 TSB_test 兼容性添加缺失的属性
     if not hasattr(args, 'save_dir'):
         args.save_dir = './output'
@@ -69,7 +93,7 @@ def main(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=10000, unpatch=True, finetune_type='none')
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
 
@@ -134,9 +158,15 @@ def main(args):
     # ========== Dataset and DataLoader ==========
     collatefn = partial(collate_fn, patch_size=patch_size)
     train_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="train")
+
+    # 为DataLoader设置随机种子生成器
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
                               collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True, persistent_workers=False)
+                              pin_memory=True, drop_last=True, persistent_workers=False,
+                              worker_init_fn=seed_worker, generator=g)
 
     # ========== Optimizer (as per paper: AdamW, lr=5e-4, weight_decay=1e-5) ==========
     trainable_params_list = [param for param in model.parameters() if param.requires_grad]
@@ -234,7 +264,10 @@ def main(args):
                 all_preds.append(preds[i].detach().cpu().numpy().reshape(-1))
                 all_labels.append(labels[i].detach().cpu().numpy().reshape(-1).astype(int))
 
+            # 清理变量
             del images_folded, logits, loss1, probs, preds, labels, loss2
+            del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+            del images, time_series, att_mask, init_img_size
             torch.cuda.empty_cache()
 
         all_probs = np.concatenate(all_probs)
@@ -253,9 +286,16 @@ def main(args):
         for k, v in train_metrics.items():
             print(f"  Train {k}: {v:.4f}")
 
-        if (epoch + 1) % 1 == 0 or epoch == epochs - 1:
+        # epoch结束后清理大数组（保留 train_metrics 供后续使用）
+        del all_probs, all_preds, all_labels
+        gc.collect()
+
+        if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
             model.eval()
-            avg_val_loss = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST)
+            avg_val_loss = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
+            # 验证后清理内存
+            gc.collect()
+            torch.cuda.empty_cache()
             accelerator.wait_for_everyone()
             unwrapped_model = accelerator.unwrap_model(model)
             timestamp = datetime.now().strftime("%m%d-%H")
@@ -277,7 +317,16 @@ def main(args):
                 print("Early stopping triggered.")
                 break
 
-    loss_all = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST)
+            # 验证后清理
+            model.train()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # 最后清理 train_metrics
+        del train_metrics
+        gc.collect()
+
+    loss_all = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
     print(f"Final validation loss: {loss_all}")
     accelerator.end_training()
     logger.info("Training completed!")

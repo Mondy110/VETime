@@ -171,7 +171,8 @@ def TSB_test(
     device='cuda:0',
     dataset_setting=PASS_LIST,
     use_list=None,
-    for_m=False
+    for_m=False,
+    verbose=True
 ):
     import os
     import time
@@ -184,12 +185,13 @@ def TSB_test(
     model_name = args_test.model_name
     file_list = args_test.file_list
     os.makedirs(target_dir, exist_ok=True)
-    print('Testing on TSB-AD datasets...')
+    if verbose:
+        print('Testing on TSB-AD datasets...')
     model.eval()
     model.to(device)
     runtime_log = []
     progress_bar = tqdm(file_list, desc=f"[Stage 1] Saving results for {model_name}")
-    
+
     for filename in progress_bar:
         if any(filter_item in filename for filter_item in dataset_setting):
             continue
@@ -240,25 +242,28 @@ def TSB_test(
         }).to_pickle(output_path)
 
         run_time = time.time() - start_time
-        print(f"Saved {output_path} (time: {run_time:.4f}s)")
+        if verbose:
+            print(f"Saved {output_path} (time: {run_time:.4f}s)")
         runtime_log.append({
             'filename': filename,
             'run_time_seconds': run_time
         })
 
+        # 彻底清理所有中间变量
         del df, datas, labels_full, data, labels, batch, images, time_series, att_mask, labels_tensor
+        del images_folded, local_embeddings, logits, probs, labels_np, values
         torch.cuda.empty_cache()
         import gc; gc.collect()
 
     log_df = pd.DataFrame(runtime_log)
     csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}.csv')
     log_df.to_csv(csv_save_path, index=False)
-    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list)
+    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list, verbose=verbose)
     return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
 def _process_single_result_file(args):
     import gc
-    result_path, filename, sliding_window, args_test = args
+    result_path, filename, sliding_window = args
     try:
         df = pd.read_pickle(result_path)
         probs = np.array(df['anomaly_score'].tolist())
@@ -269,14 +274,16 @@ def _process_single_result_file(args):
         pred_threshold = np.mean(probs) + 3 * np.std(probs)
         evaluation_result = get_metrics(probs, labels, slidingWindow=sliding_window, pred=probs > pred_threshold)
 
-        del probs, labels
+        del probs, labels, pred_threshold
         gc.collect()
 
-        return {
+        result = {
             'filename': filename,
             'length': labels_len,
             'metrics': evaluation_result,
         }
+        del evaluation_result, labels_len
+        return result
     except Exception as e:
         print(f"❌ Error processing {filename}: {e}")
         return None
@@ -287,7 +294,8 @@ def TSB_test_parallel_postprocess(
     data_setting=DATA_INIT_SETTING,
     dataset_setting=PASS_LIST,
     use_list=None,
-    num_workers=24
+    num_workers=24,
+    verbose=True
 ):
     # 如果没有提供 use_list，使用全局的 USE_LIST
     if use_list is None:
@@ -309,20 +317,21 @@ def TSB_test_parallel_postprocess(
         datas = df.iloc[:, 0:-1].values.astype(float)
         slidingWindow = find_length_rank(datas[:,0].reshape(-1, 1), rank=1)
 
-        tasks.append((result_path, filename, slidingWindow, args_test))
-        del df, datas
+        tasks.append((result_path, filename, slidingWindow))
+        del df, datas, slidingWindow
     gc.collect()
 
     results = []
     ctx = mp.get_context('spawn')
-    safe_workers = min(num_workers, mp.cpu_count() - 4)
+    safe_workers = min(num_workers, mp.cpu_count() - 2)
     with ProcessPoolExecutor(max_workers=safe_workers, mp_context=ctx) as executor:
         futures = [executor.submit(_process_single_result_file, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
             res = future.result()
             if res:
                 results.append(res)
-            del res
+            del res, future
+            gc.collect()
 
     write_csv = []
     col_w = None
