@@ -93,7 +93,7 @@ def main(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=10000, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=5000, unpatch=True, finetune_type='none')
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
 
@@ -103,38 +103,63 @@ def main(args):
     else:
         patch_size = config_v.patch_size
 
-    # ========== Time-Series Encoder (LoRA fine-tuning, as per paper) ==========
+    # ========== Time-Series Encoder (LoRA fine-tuning or Freeze, controlled by --ts_finetune_type) ==========
+    # 根据 ts_finetune_type 设置 use_lora 配置
+    if args.ts_finetune_type == 'lora':
+        default_config_t.use_lora = True
+        print(f"[INFO] TS Encoder 微调类型: LoRA (r={default_config_t.lora_r}, α={default_config_t.lora_alpha})")
+    else:  # freeze
+        default_config_t.use_lora = False
+        print(f"[INFO] TS Encoder 微调类型: 完全冻结")
+
     ts_model = TS_Model(default_config_t)
     if args.ts_path is not None:
         print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
         state_ts_dict = torch.load(args.ts_path, map_location='cpu')['model_state_dict']
 
-        # 由于使用了 LoRA，需要将预训练权重映射到 LoRALinear 的 original_linear 中
-        # 预训练权重的 key: ts_encoder.xxx.weight
-        # LoRA 模型的 key: ts_encoder.xxx.original_linear.weight
-        new_state_dict = {}
-        for key, value in state_ts_dict.items():
-            # 检查是否是需要映射的线性层权重
-            if any(x in key for x in ['q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'out_proj.weight',
-                                        'gate_proj.weight', 'gate_proj.bias', 'up_proj.weight', 'up_proj.bias',
-                                        'down_proj.weight', 'down_proj.bias']):
-                # 插入 .original_linear 到 key 中
-                parts = key.rsplit('.', 1)
-                new_key = f"{parts[0]}.original_linear.{parts[1]}"
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
+        if args.ts_finetune_type == 'lora':
+            # LoRA 模式：需要将预训练权重映射到 LoRALinear 的 original_linear 中
+            # 预训练权重的 key: ts_encoder.xxx.weight
+            # LoRA 模型的 key: ts_encoder.xxx.original_linear.weight
+            new_state_dict = {}
+            for key, value in state_ts_dict.items():
+                # 检查是否是需要映射的线性层权重
+                if any(x in key for x in ['q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'out_proj.weight',
+                                            'gate_proj.weight', 'gate_proj.bias', 'up_proj.weight', 'up_proj.bias',
+                                            'down_proj.weight', 'down_proj.bias']):
+                    # 插入 .original_linear 到 key 中
+                    parts = key.rsplit('.', 1)
+                    new_key = f"{parts[0]}.original_linear.{parts[1]}"
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value
 
-        # 使用 strict=False 因为 LoRA 参数 (lora_A, lora_B) 不在预训练权重中
-        missing, unexpected = ts_model.load_state_dict(new_state_dict, strict=False)
-        print(f"[INFO] TS Encoder 权重加载完成！")
-        if missing:
-            print(f"[INFO]   缺失的参数 (LoRA 参数，将随机初始化): {len([m for m in missing if 'lora' in m])} 个")
+            # 使用 strict=False 因为 LoRA 参数 (lora_A, lora_B) 不在预训练权重中
+            missing, unexpected = ts_model.load_state_dict(new_state_dict, strict=False)
+            print(f"[INFO] TS Encoder 权重加载完成！")
+            if missing:
+                print(f"[INFO]   缺失的参数 (LoRA 参数，将随机初始化): {len([m for m in missing if 'lora' in m])} 个")
+        else:  # freeze 模式
+            # Freeze 模式：直接加载权重，不修改键名
+            ts_model.load_state_dict(state_ts_dict, strict=False)
+            print(f"[INFO] TS Encoder 权重加载完成！")
     else:
         print(f"[WARNING] 未指定 --ts_path，TS Encoder 使用随机初始化！")
 
-    # Print LoRA configuration
-    print(f"[INFO] TS Encoder LoRA 配置: r={default_config_t.lora_r}, α={default_config_t.lora_alpha}, scaling={default_config_t.lora_alpha/default_config_t.lora_r}")
+    # Freeze 模式：选择性冻结（仅冻结核心骨干，保留任务头可训练）
+    if args.ts_finetune_type == 'freeze':
+        frozen_layers = []
+        trainable_layers = []
+        for name, param in ts_model.named_parameters():
+            if any(key in name for key in ['transformer_encoder', 'embedding_layer', 'rope_embedder']):
+                param.requires_grad = False
+                frozen_layers.append(name)
+            else:
+                param.requires_grad = True
+                trainable_layers.append(name)
+        print(f"[INFO] TS Encoder 开启选择性冻结：")
+        print(f"  已冻结核心骨干: {len(frozen_layers)} 个张量")
+        print(f"  保持可训练 (projection/anomaly/reconstruction): {len(trainable_layers)} 个张量")
 
     # ========== Create VETime Model ==========
     model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
@@ -258,11 +283,11 @@ def main(args):
             preds = (probs > 0.5).float()
 
             probs, preds, labels = accelerator.gather_for_metrics((probs, preds, labels))
-
-            for i in range(probs.shape[0]):
-                all_probs.append(probs[i].detach().cpu().numpy().reshape(-1))
-                all_preds.append(preds[i].detach().cpu().numpy().reshape(-1))
-                all_labels.append(labels[i].detach().cpu().numpy().reshape(-1).astype(int))
+            if global_step % 10 == 0:
+                for i in range(probs.shape[0]):
+                    all_probs.append(probs[i].detach().cpu().numpy().reshape(-1))
+                    all_preds.append(preds[i].detach().cpu().numpy().reshape(-1))
+                    all_labels.append(labels[i].detach().cpu().numpy().reshape(-1).astype(int))
 
             # 清理变量
             del images_folded, logits, loss1, probs, preds, labels, loss2
@@ -270,21 +295,33 @@ def main(args):
             del images, time_series, att_mask, init_img_size
             torch.cuda.empty_cache()
 
-        all_probs = np.concatenate(all_probs)
-        all_preds = np.concatenate(all_preds)
-        all_labels = np.concatenate(all_labels)
+        if len(all_probs) > 0:
+            # 将收集到的小部分数据拼接起来
+            all_probs_arr = np.concatenate(all_probs)
+            all_preds_arr = np.concatenate(all_preds)
+            all_labels_arr = np.concatenate(all_labels)
 
-        if np.any(np.isnan(all_probs)):
-            print("⚠️ Warning: all_probs contains NaN values!")
+            if np.any(np.isnan(all_probs_arr)):
+                print("⚠️ Warning: all_probs contains NaN values!")
 
-        train_metrics = fast_get_metrics(all_probs, all_labels)
+            # 拿着这部分“抽样”的数据去算精确指标
+            train_metrics = fast_get_metrics(all_probs_arr, all_labels_arr)
+
+            # 👇【把打印代码加回来，让你能在屏幕上看到效果】
+            for k, v in train_metrics.items():
+                print(f"  Train {k}: {v:.4f}")
+
+            # 👇【超级重要】：算完指标后，这些大数组就没用了，立刻手动删掉并回收内存！
+            del all_probs_arr, all_preds_arr, all_labels_arr
+            gc.collect()
+        else:
+            # 防御性代码：如果因为某些原因没采样到数据，给个空字典防止后面报错
+            train_metrics = {}
 
         avg_train_loss = total_loss / len(train_loader)
         accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
         print(f"\n[Epoch {epoch + 1}/{epochs}] 🟩 Training Summary:")
         print(f"  Avg Loss: {avg_train_loss:.4f}")
-        for k, v in train_metrics.items():
-            print(f"  Train {k}: {v:.4f}")
 
         # epoch结束后清理大数组（保留 train_metrics 供后续使用）
         del all_probs, all_preds, all_labels
@@ -362,6 +399,8 @@ if __name__ == "__main__":
     # Optimizer parameters (as per paper)
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate (paper: 5e-4)')
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay (paper: 1e-5)')
+    parser.add_argument('--ts_finetune_type', type=str, default='lora', choices=['lora', 'freeze'],
+                        help="TS Encoder fine-tuning type: 'lora' or 'freeze'")
 
     args = parser.parse_args()
     output_file_path = args.output_file_path.replace('result.json', f'{args.model_name.replace("/", "-")}_result.json')

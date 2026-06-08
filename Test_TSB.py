@@ -372,15 +372,15 @@ def TSB_test_parallel_postprocess(
     print(f"📊 Final results saved to: {output_csv}")
 
     # 计算所有数据集的平均F1作为验证指标
-    avg_f1 = 0.0
-    if summary_rows and 'Standard-F1' in final_csv.columns:
+    avg_pr = 0.0
+    if summary_rows and 'VUS-PR' in final_csv.columns:
         # 获取所有_MEAN行的平均F1
         mean_rows = final_csv[final_csv['file'].str.contains('_MEAN', na=False)]
         if not mean_rows.empty:
-            avg_f1 = mean_rows['Standard-F1'].mean()
-            print(f"📈 Average Standard-F1 across datasets: {avg_f1:.4f}")
+            avg_pr = mean_rows['VUS-PR'].mean()
+            print(f"📈 Average VUS-PR across datasets: {avg_pr:.4f}")
 
-    return avg_f1    
+    return avg_pr    
 
 import torch
 import numpy as np
