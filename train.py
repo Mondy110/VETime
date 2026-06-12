@@ -117,7 +117,12 @@ def create_model(args, num_features: int, vision_model, config_v):
     return model, ts_model
 
 
-def main(args):
+def train_univariate(args):
+    """
+    单变量训练：完全保留原有训练逻辑
+
+    此函数与原 main() 完全相同，确保单变量训练路径不受任何影响。
+    """
     # 设置随机种子（必须在任何随机操作之前）
     set_seed(args.seed)
     print(f"[INFO] 随机种子已设置: {args.seed}")
