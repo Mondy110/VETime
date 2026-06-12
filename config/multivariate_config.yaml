@@ -1,0 +1,32 @@
+# config/multivariate_config.yaml
+
+# 训练模式: univariate(单变量) 或 multivariate(多变量顺序训练)
+training_mode: multivariate
+
+# 多变量顺序训练配置
+multivariate:
+  # 数据集列表，按训练顺序排列
+  datasets:
+    - path: ./dataset/dim_1.pkl
+      dim: 1
+    - path: ./dataset/dim_38.pkl
+      dim: 38
+    - path: ./dataset/dim_55.pkl
+      dim: 55
+
+  # 维度到批次大小的映射
+  dim_batch_size_map:
+    "1": 32
+    "38": 8
+    "55": 4
+
+  # checkpoint 保存目录
+  checkpoint_dir: ./output/multivariate_checkpoints
+
+  # 是否严格按维度递增顺序检查
+  enforce_dim_order: false
+
+# 单变量训练配置（兼容原有方式）
+univariate:
+  dataset_path: ./dataset/univariate.pkl
+  batch_size: 32
