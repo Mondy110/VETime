@@ -1,0 +1,9 @@
+# config/univariate_config.yaml
+
+# 训练模式: univariate(单变量)
+training_mode: univariate
+
+# 单变量训练配置
+univariate:
+  dataset_path: ./dataset/univariate.pkl
+  batch_size: 32
