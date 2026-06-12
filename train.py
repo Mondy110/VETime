@@ -405,6 +405,8 @@ if __name__ == "__main__":
     }
 
     parser = argparse.ArgumentParser(description='VETime Training (as per paper)')
+    parser.add_argument('--config', type=str, default=None,
+                        help='训练配置文件路径（YAML格式），指定后将忽略部分命令行参数')
     parser.add_argument('--dataset_path', default='./dataset', type=str, help='Path to the training data')
     parser.add_argument('--dataset_test_dir', type=str, default='./dataset/TSB-AD/Datasets/TSB-AD-U')
     parser.add_argument('--file_list', type=str, default='./dataset/TSB-AD/Datasets/File_List/TSB-AD-U.csv')
