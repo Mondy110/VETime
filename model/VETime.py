@@ -61,7 +61,7 @@ class VETIME(TS_Model):
         I_embeddings0=self.I_att(I_embeddings, patch_mask)
 
         I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
-        loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels)
+        loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
         mix_out,m_w1 = self.mm_w(mix_out0,TS_embeddings0,I_embeddings0,mix_out0)
         mix_out2,m_w2 = self.mm_w(mix_out0,TS_embeddings0,I_embeddings0,mix_out0,mix_out0)

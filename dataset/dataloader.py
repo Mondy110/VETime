@@ -87,9 +87,9 @@ class AnomalyDataset(Dataset):
         random.shuffle(indices)
         num_train = int(len(dataset) * train_ratio)
         if split == 'train':
-            selected_indices = indices
+            selected_indices = indices[:num_train]  # 修复：使用前 train_ratio 的数据
         elif split == 'test':
-            selected_indices = indices[num_train:]
+            selected_indices = indices[num_train:]  # 后 (1-train_ratio) 作为验证集
         else:
             raise ValueError("split must be 'train' or 'test'")
 

@@ -154,7 +154,7 @@ def train_univariate(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=5000, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none')
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
 
@@ -432,6 +432,72 @@ def train_univariate(args):
     return output
 
 
+def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, vision_model):
+    """
+    多变量训练验证函数（参考 TimeRCD）
+
+    Returns:
+        avg_val_loss: 平均验证损失
+    """
+    model.eval()
+    vision_model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            labels = batch["labels"]
+            images = batch["image"]
+            time_series, att_mask = batch['time_series'], batch['attention_mask']
+            period = batch['period']
+            p_value = batch['padding_value']
+
+            if labels.shape[1] > model.MAX_L:
+                data_splits = model.split_data(images, time_series, att_mask, labels)
+                loss1_total = 0
+                loss2_total = 0
+
+                for data_part in data_splits:
+                    img_part, ts_part, att_mask_part, label_part = data_part
+                    images_folded, init_img_size = model.vit_encoder.fold_image(
+                        img_part, period, p_value, **data_setting)
+
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                        images_folded, ts_part, att_mask_part, init_img_size, label_part)
+
+                    loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
+                    loss02, _ = model.weighted_reconstruction_loss(
+                        local_embeddings2, ts_part, att_mask_part, label_part)
+
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                    loss1_total = loss1_total + loss01
+
+                batch_loss = loss1_total.item() + loss2_total.item()
+            else:
+                images_folded, init_img_size = model.vit_encoder.fold_image(
+                    images, period, p_value, **data_setting)
+
+                local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                    images_folded, time_series, att_mask, init_img_size, labels)
+
+                loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
+                loss2, _ = model.weighted_reconstruction_loss(
+                    local_embeddings2, time_series, att_mask, labels)
+                loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+
+                batch_loss = loss1.item() + loss2.item()
+
+            total_loss += batch_loss
+            num_batches += 1
+
+            del images_folded, local_embeddings1, local_embeddings2
+            del images, time_series, att_mask, labels
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    model.train()
+    return avg_loss
+
+
 def train_multivariate(args, config: Dict[str, Any]):
     """
     多变量顺序训练（参考 TimeRCD 范式）
@@ -441,6 +507,8 @@ def train_multivariate(args, config: Dict[str, Any]):
     2. 知识延续：strict=False 加载 checkpoint
     3. 参数纳管：重建 Optimizer 确保所有参数可训练
     4. 显存安全：Accelerator 循环外初始化，Vision Encoder 单次实例化
+    5. 动态梯度累积：目标有效 batch size = 128
+    6. 早停机制：基于验证集 loss（95%/5% 划分）
 
     Args:
         args: 命令行参数
@@ -452,6 +520,9 @@ def train_multivariate(args, config: Dict[str, Any]):
     checkpoint_dir = mv_config['checkpoint_dir']
     enforce_dim_order = mv_config.get('enforce_dim_order', False)
 
+    # 目标有效 batch size（用于动态梯度累积）
+    TARGET_EFFECTIVE_BATCH_SIZE = 128
+
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # 设置随机种子
@@ -459,9 +530,10 @@ def train_multivariate(args, config: Dict[str, Any]):
     print(f"[INFO] 随机种子已设置: {args.seed}")
 
     # ========== [关键] Accelerator 全局初始化（只执行一次）==========
+    # 注意：gradient_accumulation_steps 会在每个维度动态设置
     accelerator = Accelerator(
         mixed_precision="bf16",
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=1,  # 初始值，会在每个维度动态更新
         log_with="tensorboard",
         project_dir="./output/logs"
     )
@@ -473,7 +545,7 @@ def train_multivariate(args, config: Dict[str, Any]):
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     vision_model = V_model(
         args.vision_name,
-        MAX_L=5000,
+        MAX_L=1000,
         unpatch=True,
         finetune_type='none'
     )
@@ -519,11 +591,16 @@ def train_multivariate(args, config: Dict[str, Any]):
     for dataset_idx, dataset_info in enumerate(datasets):
         dataset_path = dataset_info['path']
         current_dim = dataset_info['dim']
-        batch_size = dim_batch_size_map.get(str(current_dim), 4)
+        batch_size = dim_batch_size_map.get(str(current_dim), 1)
+
+        # ========== 动态计算梯度累积步数 ==========
+        accumulation_steps = max(1, TARGET_EFFECTIVE_BATCH_SIZE // batch_size)
+        accelerator.gradient_accumulation_steps = accumulation_steps
 
         print(f"\n{'='*60}")
         print(f"[多变量训练] 数据集 {dataset_idx+1}/{len(datasets)}: {dataset_path}")
         print(f"  维度: {current_dim}, Batch Size: {batch_size}")
+        print(f"  梯度累积步数: {accumulation_steps} (有效 Batch Size: {batch_size * accumulation_steps})")
         if prev_checkpoint_path is not None:
             print(f"  继承上一维度权重: {prev_checkpoint_path}")
         print(f"{'='*60}\n")
@@ -567,8 +644,11 @@ def train_multivariate(args, config: Dict[str, Any]):
         )
         print(f"\n[INFO] 优化器配置: AdamW, lr={args.learning_rate}, weight_decay={args.weight_decay}")
 
-        # ========== 5. 创建 DataLoader ==========
-        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train")
+        # ========== 5. 创建 DataLoader（95%/5% 划分训练/验证集）==========
+        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train", train_ratio=0.95)
+        val_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="test", train_ratio=0.95)
+
+        print(f"[INFO] 数据集划分: 训练集 {len(train_dataset)} 样本, 验证集 {len(val_dataset)} 样本")
 
         g = torch.Generator()
         g.manual_seed(args.seed)
@@ -587,6 +667,19 @@ def train_multivariate(args, config: Dict[str, Any]):
             generator=g
         )
 
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            collate_fn=collatefn,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+            persistent_workers=False,
+            worker_init_fn=seed_worker,
+            generator=g
+        )
+
         # ========== 6. prepare 动态组件 ==========
         model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
 
@@ -594,13 +687,15 @@ def train_multivariate(args, config: Dict[str, Any]):
         model.train()
         vision_model.eval()
 
-        # ========== 8. 内层 Epoch 训练 ==========
+        # ========== 8. 早停机制初始化（基于验证集 loss）==========
+        best_val_loss = float('inf')
+        patience_counter = 0
+        early_stopping_patience = args.early_stop_patience
+
+        # ========== 9. 内层 Epoch 训练 ==========
         global_step = 0
         epochs = args.num_epochs
         img_size = data_setting['img_size']
-
-        early_stopping = EarlyStopping(patience=args.early_stop_patience, verbose=True,
-                                        path=os.path.join(checkpoint_dir, f'temp_dim{current_dim}_best.pth'))
 
         for epoch in range(epochs):
             model.train()
@@ -681,7 +776,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                 del images, time_series, att_mask, init_img_size
                 torch.cuda.empty_cache()
 
-            # 计算 epoch 指标
+            # 计算 epoch 训练指标
             if len(all_probs) > 0:
                 all_probs_arr = np.concatenate(all_probs)
                 all_preds_arr = np.concatenate(all_preds)
@@ -697,16 +792,36 @@ def train_multivariate(args, config: Dict[str, Any]):
             avg_train_loss = total_loss / len(train_loader)
             accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
             print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
-            print(f"  Avg Loss: {avg_train_loss:.4f}")
+            print(f"  Avg Train Loss: {avg_train_loss:.4f}")
 
             del all_probs, all_preds, all_labels
             gc.collect()
 
-            # 验证和保存
-            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
-                model.eval()
-                # 这里可以添加验证逻辑
+            # ========== 验证阶段（每个 epoch 都验证）==========
+            avg_val_loss = evaluate_multivariate(model, val_loader, accelerator, device, data_setting, vision_model)
+            print(f"  Avg Val Loss: {avg_val_loss:.4f}")
 
+            accelerator.log({"epoch_val_loss": avg_val_loss}, step=epoch)
+
+            # ========== 早停判断（基于验证 loss）==========
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                print(f"  ✓ New best validation loss: {best_val_loss:.4f}")
+
+                # 保存最佳模型
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                best_model_path = os.path.join(checkpoint_dir, f'vetime_dim{current_dim}_best.pth')
+                if accelerator.is_main_process:
+                    torch.save(unwrapped_model.state_dict(), best_model_path)
+                    print(f"  ✓ Best model saved: {best_model_path}")
+            else:
+                patience_counter += 1
+                print(f"  ✗ Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
+
+            # 定期保存 checkpoint
+            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
                 accelerator.wait_for_everyone()
                 unwrapped_model = accelerator.unwrap_model(model)
                 timestamp = datetime.now().strftime("%m%d-%H")
@@ -717,20 +832,19 @@ def train_multivariate(args, config: Dict[str, Any]):
                     torch.save(unwrapped_model.state_dict(), name_save)
                     logger.info(f"Model saved at epoch {epoch+1}")
 
-                early_stopping(avg_train_loss, model)
-                if early_stopping.early_stop:
-                    print("Early stopping triggered.")
-                    break
+            # ========== 早停触发检查 ==========
+            if patience_counter >= early_stopping_patience:
+                print(f"\n[早停] 维度 {current_dim} 训练提前终止于 epoch {epoch + 1}")
+                print(f"  最佳验证损失: {best_val_loss:.4f}")
+                break
 
-                model.train()
-                vision_model.eval()
-                gc.collect()
-                torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
 
             del train_metrics
             gc.collect()
 
-        # ========== 9. 保存维度最终 Checkpoint ==========
+        # ========== 10. 保存维度最终 Checkpoint ==========
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         checkpoint_path = os.path.join(checkpoint_dir, f'vetime_dim{current_dim}_final.pth')
@@ -741,8 +855,8 @@ def train_multivariate(args, config: Dict[str, Any]):
 
         prev_checkpoint_path = checkpoint_path
 
-        # ========== 10. 彻底清理显存 ==========
-        del model, optimizer, train_loader, ts_model, train_dataset
+        # ========== 11. 彻底清理显存 ==========
+        del model, optimizer, train_loader, val_loader, ts_model, train_dataset, val_dataset
         accelerator.free_memory()
         torch.cuda.empty_cache()
         gc.collect()
