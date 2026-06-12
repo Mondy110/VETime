@@ -16,6 +16,8 @@ import gc
 import json
 import random
 import numpy as np
+import yaml
+from typing import Dict, Any
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -69,6 +71,20 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def load_config(config_path: str) -> Dict[str, Any]:
+    """
+    加载 YAML 配置文件
+
+    Args:
+        config_path: 配置文件路径
+
+    Returns:
+        配置字典
+    """
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
 
 
 def main(args):
