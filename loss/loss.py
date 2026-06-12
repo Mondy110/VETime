@@ -212,16 +212,29 @@ class win_Contrastive_Loss(win_ContrastiveLoss_init):
         feat_modality2: (B, N, D) 为vision
         """
         B, N, D = f1.shape
-        assert f2.shape == (B, N, D)
+        assert f2.shape == (B, N, D), "视觉特征和时间序列特征维度必须完全一致！"
 
-        mask = labels0.view(B, N//num_f, -1)
+        N_seq = N // num_f
+        
+        # 前向传播时是 view(B, num_features * num_patches, D)
+        # 所以我们还原回 (Batch, 变量数, 时间步数, 特征维度)
+        f1_unflatten = f1.view(B, num_f, N_seq, D)
+        f2_unflatten = f2.view(B, num_f, N_seq, D)
+        
+        # 将 Batch 和 变量(num_f) 维度合并！
+        f1_aligned = f1_unflatten.view(B * num_f, N_seq, D)
+        f2_aligned = f2_unflatten.view(B * num_f, N_seq, D)
+        
+        mask = labels0.view(B, N_seq, -1)
         labels = mask.sum(dim=-1) > 0  # (B, num_patches)
 
-        assert labels.shape == (B, N//num_f)
+        labels_aligned = labels.repeat_interleave(num_f, dim=0)
+        
+        assert labels.shape == (B, N_seq), f"标签形状错误: {labels.shape}"
 
         # Project features
-        z10 = self.mlp1(f1)  # (B, N, D//4)
-        z20 = self.mlp2(f2)  # (B, N, D//4)
+        z10 = self.mlp1(f1_aligned)  # (B, N, D//4)
+        z20 = self.mlp2(f1_aligned)  # (B, N, D//4)
 
         # L2 normalize
         z1s = F.normalize(z10, dim=-1)
@@ -230,12 +243,12 @@ class win_Contrastive_Loss(win_ContrastiveLoss_init):
         total_loss = 0.0
         loss_intra = 0.0
 
-        segments_per_batch = self._find_segments(labels)
+        segments_per_batch = self._find_segments(labels_aligned)
         num_segments = 0
         for b in range(B):
             z1 =z1s[b]
             z2 = z2s[b]
-            label = labels[b]
+            label = labels_aligned[b]
             for (start, end) in segments_per_batch[b]:
                 L = end - start
                 if L <= 0:

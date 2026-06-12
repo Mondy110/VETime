@@ -1,0 +1,50 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "uni",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/cjm/.conda/envs/tslib2/bin/accelerate",
+            "args": [
+                "launch",
+                "train.py",
+                "--dataset_path", "/mnt/sda/cjmProject/VETime/dataset/vetime_train_all_100000.pkl",
+                "--model_name", "VETime",
+                "--batch_size", "32",
+                "--num_epochs", "20",
+                "--num_workers", "24"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "multi",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/cjm/.conda/envs/tslib2/bin/accelerate",
+            "args": [
+                "launch",
+                "train.py",
+                "--dataset_path", "/mnt/sda/cjmProject/VETime/dataset/vetime_multi_train_all_5000.pkl",
+                "--model_name", "VETime",
+                "--dataset_test_dir", "./dataset/TSB-AD/Datasets/TSB-AD-M",
+                "--file_list", "./dataset/TSB-AD/Datasets/File_List/TSB-AD-M.csv",
+                "--ts_path", "checkpoints/weight_ts/pretrain_checkpoint_best_multi.pth",
+                "--batch_size", "32",
+                "--num_epochs", "20",
+                "--num_workers", "24"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+    ]
+}

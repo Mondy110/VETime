@@ -29,7 +29,7 @@ class TimeSeriesConfig:
     num_query_tokens: int = 1
     use_rope: bool = True
     activation: str = "gelu"
-    num_features: int = 1
+    num_features: int = 8
     use_lora: bool = True
     lora_r: int = 8
     lora_alpha: int = 16

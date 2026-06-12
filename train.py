@@ -44,14 +44,24 @@ torch.cuda.empty_cache()
 
 
 def set_seed(seed: int):
-    """设置所有随机种子以保证可复现性"""
+    """设置所有随机种子以保证可复现性（PyTorch 2.4+ 支持确定性 Flash Attention）"""
+    import os
+    # 设置环境变量
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # CUDA 确定性所需
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
     # 确保CUDA操作确定性
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+    # ✅ PyTorch 2.1+ 支持确定性 Flash Attention
+    # 这会启用所有操作的确定性模式，包括 Flash Attention
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def seed_worker(worker_id):

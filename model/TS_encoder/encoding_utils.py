@@ -298,6 +298,8 @@ class MultiheadAttentionWithRoPE(nn.Module):
             # Compute scaled dot-product attention (non-causal) without binary bias
             # for param in self.binary_attention_bias.parameters():
             #     param.requires_grad = False
+            # 注意：为了可复现性，需要确保 Flash Attention 被禁用
+            # 可以在 train.py 的 set_seed() 中设置 torch.backends.cuda.enable_flash_sdp(False)
             y = F.scaled_dot_product_attention(
                 Q_rot, K_rot, V,
                 attn_mask=attn_mask,
