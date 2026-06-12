@@ -820,18 +820,6 @@ def train_multivariate(args, config: Dict[str, Any]):
                 patience_counter += 1
                 print(f"  ✗ Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
 
-            # 定期保存 checkpoint
-            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
-                accelerator.wait_for_everyone()
-                unwrapped_model = accelerator.unwrap_model(model)
-                timestamp = datetime.now().strftime("%m%d-%H")
-                name_save = os.path.join(checkpoint_dir,
-                    f'vetime_dim{current_dim}_epoch{epoch+1}_{timestamp}.pth')
-
-                if accelerator.is_main_process:
-                    torch.save(unwrapped_model.state_dict(), name_save)
-                    logger.info(f"Model saved at epoch {epoch+1}")
-
             # ========== 早停触发检查 ==========
             if patience_counter >= early_stopping_patience:
                 print(f"\n[早停] 维度 {current_dim} 训练提前终止于 epoch {epoch + 1}")
