@@ -755,6 +755,33 @@ def train_multivariate(args, config: Dict[str, Any]):
     return {"status": "completed", "datasets": len(datasets)}
 
 
+def main(args):
+    """
+    主入口：根据配置选择训练模式
+
+    - univariate: 单变量训练（原有逻辑）
+    - multivariate: 多变量顺序训练
+    """
+    # 加载配置文件
+    if args.config is not None:
+        config = load_config(args.config)
+        training_mode = config.get('training_mode', 'univariate')
+        print(f"[INFO] 加载配置文件: {args.config}")
+        print(f"[INFO] 训练模式: {training_mode}")
+    else:
+        config = None
+        training_mode = 'univariate'
+
+    if training_mode == 'univariate':
+        return train_univariate(args)
+    elif training_mode == 'multivariate':
+        if config is None:
+            raise ValueError("多变量训练模式需要指定 --config 参数")
+        return train_multivariate(args, config)
+    else:
+        raise ValueError(f"未知的训练模式: {training_mode}")
+
+
 if __name__ == "__main__":
     # Default settings as per paper (B.4 Implementation Details)
     DATA_INIT_SETTING = {
