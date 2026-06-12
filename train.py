@@ -87,6 +87,36 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
+def create_model(args, num_features: int, vision_model, config_v):
+    """
+    创建 VETime 模型（复用已存在的 vision_model）
+
+    根据 num_features 自动构建对应维度的组件：
+    - num_features=1: 不创建 BinaryAttentionBias
+    - num_features>1: 创建 BinaryAttentionBias
+
+    Args:
+        args: 命令行参数
+        num_features: 当前数据集的特征维度
+        vision_model: 已实例化的视觉编码器（复用，不重建）
+        config_v: 视觉模型配置
+
+    Returns:
+        model: VETIME 模型
+        ts_model: 时间序列编码器
+    """
+    # 更新 TS Encoder 配置
+    default_config_t.num_features = num_features
+
+    # 仅实例化 TS Encoder（根据 num_features 自动构建 BinaryAttentionBias）
+    ts_model = TS_Model(default_config_t)
+
+    # 构建 VETime 完整模型
+    model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
+
+    return model, ts_model
+
+
 def main(args):
     # 设置随机种子（必须在任何随机操作之前）
     set_seed(args.seed)
