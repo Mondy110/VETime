@@ -432,6 +432,329 @@ def train_univariate(args):
     return output
 
 
+def train_multivariate(args, config: Dict[str, Any]):
+    """
+    多变量顺序训练（参考 TimeRCD 范式）
+
+    核心策略：
+    1. 销毁重建：每次切换维度时全新实例化模型
+    2. 知识延续：strict=False 加载 checkpoint
+    3. 参数纳管：重建 Optimizer 确保所有参数可训练
+    4. 显存安全：Accelerator 循环外初始化，Vision Encoder 单次实例化
+
+    Args:
+        args: 命令行参数
+        config: YAML 配置字典
+    """
+    mv_config = config['multivariate']
+    datasets = mv_config['datasets']
+    dim_batch_size_map = mv_config['dim_batch_size_map']
+    checkpoint_dir = mv_config['checkpoint_dir']
+    enforce_dim_order = mv_config.get('enforce_dim_order', False)
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # 设置随机种子
+    set_seed(args.seed)
+    print(f"[INFO] 随机种子已设置: {args.seed}")
+
+    # ========== [关键] Accelerator 全局初始化（只执行一次）==========
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        gradient_accumulation_steps=4,
+        log_with="tensorboard",
+        project_dir="./output/logs"
+    )
+    device = accelerator.device
+
+    logger.info(f"Using {accelerator.num_processes} {'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
+
+    # ========== [关键] Vision Encoder 只实例化一次 ==========
+    print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
+    vision_model = V_model(
+        args.vision_name,
+        MAX_L=5000,
+        unpatch=True,
+        finetune_type='none'
+    )
+    # 移至正确的设备并开启 eval 模式
+    vision_model = vision_model.to(device)
+    vision_model.eval()
+
+    # 【防御性代码】显式冻结所有参数，防止意外梯度计算
+    for param in vision_model.parameters():
+        param.requires_grad = False
+
+    config_v = vision_model.config
+    if 'mae' in args.vision_name:
+        patch_size = config_v['patch_size']
+    else:
+        patch_size = config_v.patch_size
+    args.patch_size = patch_size
+
+    print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {patch_size}")
+    print(f"[INFO] Vision Encoder 状态: 完全冻结 (作为特征对齐锚点)")
+
+    # 检查维度顺序（可选）
+    if enforce_dim_order:
+        dims = [ds['dim'] for ds in datasets]
+        if dims != sorted(dims):
+            raise ValueError(f"数据集维度顺序非递增: {dims}，请调整 datasets 列表顺序或设置 enforce_dim_order: false")
+
+    # 设置 LoRA 配置
+    if args.ts_finetune_type == 'lora':
+        default_config_t.use_lora = True
+        print(f"[INFO] TS Encoder 微调类型: LoRA (r={default_config_t.lora_r}, α={default_config_t.lora_alpha})")
+    else:
+        default_config_t.use_lora = False
+        print(f"[INFO] TS Encoder 微调类型: 完全冻结")
+
+    # 全局 checkpoint 路径（用于维度间传递）
+    prev_checkpoint_path = None
+
+    # 数据设置
+    data_setting = args.data_setting
+
+    # ========== 外层维度循环 ==========
+    for dataset_idx, dataset_info in enumerate(datasets):
+        dataset_path = dataset_info['path']
+        current_dim = dataset_info['dim']
+        batch_size = dim_batch_size_map.get(str(current_dim), 4)
+
+        print(f"\n{'='*60}")
+        print(f"[多变量训练] 数据集 {dataset_idx+1}/{len(datasets)}: {dataset_path}")
+        print(f"  维度: {current_dim}, Batch Size: {batch_size}")
+        if prev_checkpoint_path is not None:
+            print(f"  继承上一维度权重: {prev_checkpoint_path}")
+        print(f"{'='*60}\n")
+
+        # ========== 1. 刷新配置 ==========
+        default_config_t.num_features = current_dim
+        args.batch_size = batch_size
+
+        # ========== 2. 全新实例化模型（复用 vision_model）==========
+        model, ts_model = create_model(args, current_dim, vision_model, config_v)
+
+        # ========== 3. 知识延续（strict=False 是灵魂）==========
+        if prev_checkpoint_path is not None:
+            print(f"[INFO] 加载上一维度 checkpoint: {prev_checkpoint_path}")
+            state_dict = torch.load(prev_checkpoint_path, map_location='cpu')
+
+            # 【防御性代码】剥离 DDP 的 'module.' 前缀，适配不同保存格式
+            if any(key.startswith('module.') for key in state_dict.keys()):
+                state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print(f"[INFO] 权重加载完成 (strict=False)")
+            if missing:
+                print(f"  缺失的参数（新维度组件，使用初始化值）: {len(missing)} 个")
+            if unexpected:
+                print(f"  未预期的参数: {len(unexpected)} 个")
+
+        # 打印参数统计
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"\n[INFO] 模型参数统计:")
+        print(f"  总参数: {total_params:,}")
+        print(f"  可训练参数: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+
+        # ========== 4. 重建 Optimizer ==========
+        trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params_list,
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
+        )
+        print(f"\n[INFO] 优化器配置: AdamW, lr={args.learning_rate}, weight_decay={args.weight_decay}")
+
+        # ========== 5. 创建 DataLoader ==========
+        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train")
+
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+
+        collatefn = partial(collate_fn, patch_size=patch_size)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            collate_fn=collatefn,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=False,
+            worker_init_fn=seed_worker,
+            generator=g
+        )
+
+        # ========== 6. prepare 动态组件 ==========
+        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+
+        # ========== 7. 设置训练模式（注意：vision_model 需保持 eval）==========
+        model.train()
+        vision_model.eval()
+
+        # ========== 8. 内层 Epoch 训练 ==========
+        global_step = 0
+        epochs = args.num_epochs
+        img_size = data_setting['img_size']
+
+        early_stopping = EarlyStopping(patience=args.early_stop_patience, verbose=True,
+                                        path=os.path.join(checkpoint_dir, f'temp_dim{current_dim}_best.pth'))
+
+        for epoch in range(epochs):
+            model.train()
+            vision_model.eval()  # 确保每个 epoch 开始时 vision_model 保持 eval
+
+            total_loss = 0
+            all_probs, all_preds, all_labels = [], [], []
+
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]",
+                               disable=not accelerator.is_local_main_process)
+
+            for batch in progress_bar:
+                labels = batch["labels"]
+                images = batch["image"]
+                time_series, att_mask = batch['time_series'], batch['attention_mask']
+                mask = batch['mask']
+                period = batch['period']
+                p_value = batch['padding_value']
+
+                if labels.shape[1] > model.MAX_L:
+                    data_splits = model.split_data(images, time_series, att_mask, labels)
+                    loss1 = 0
+                    loss2 = 0
+                    logits_list = []
+
+                    for data_part in data_splits:
+                        img_part, ts_part, att_mask_part, label_part = data_part
+                        images_folded, init_img_size = model.vit_encoder.fold_image(
+                            img_part, period, p_value, **data_setting)
+
+                        local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                            images_folded, ts_part, att_mask_part, init_img_size, label_part)
+
+                        loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
+                        loss02, rec = model.weighted_reconstruction_loss(
+                            local_embeddings2, ts_part, att_mask_part, label_part)
+
+                        loss2 = loss2 + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                        loss1 = loss1 + loss01
+                        logits_list.append(logit)
+
+                    logits = torch.cat(logits_list, dim=1)
+                else:
+                    images_folded, init_img_size = model.vit_encoder.fold_image(
+                        images, period, p_value, **data_setting)
+
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                        images_folded, time_series, att_mask, init_img_size, labels)
+
+                    loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
+                    loss2, rec = model.weighted_reconstruction_loss(
+                        local_embeddings2, time_series, att_mask, labels)
+                    loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+
+                accelerator.backward(loss1 + loss2)
+
+                global_step += 1
+                if global_step % accelerator.gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                batch_loss = loss1.item() + loss2.item()
+                total_loss += batch_loss
+                progress_bar.set_postfix({"loss": batch_loss})
+
+                probs = torch.softmax(logits, dim=-1)[:, :, 1]
+                preds = (probs > 0.5).float()
+                probs, preds, labels = accelerator.gather_for_metrics((probs, preds, labels))
+
+                if global_step % 10 == 0:
+                    for i in range(probs.shape[0]):
+                        all_probs.append(probs[i].detach().cpu().numpy().reshape(-1))
+                        all_preds.append(preds[i].detach().cpu().numpy().reshape(-1))
+                        all_labels.append(labels[i].detach().cpu().numpy().reshape(-1).astype(int))
+
+                del images_folded, logits, loss1, probs, preds, labels, loss2
+                del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+                del images, time_series, att_mask, init_img_size
+                torch.cuda.empty_cache()
+
+            # 计算 epoch 指标
+            if len(all_probs) > 0:
+                all_probs_arr = np.concatenate(all_probs)
+                all_preds_arr = np.concatenate(all_preds)
+                all_labels_arr = np.concatenate(all_labels)
+                train_metrics = fast_get_metrics(all_probs_arr, all_labels_arr)
+                for k, v in train_metrics.items():
+                    print(f"  Train {k}: {v:.4f}")
+                del all_probs_arr, all_preds_arr, all_labels_arr
+                gc.collect()
+            else:
+                train_metrics = {}
+
+            avg_train_loss = total_loss / len(train_loader)
+            accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
+            print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
+            print(f"  Avg Loss: {avg_train_loss:.4f}")
+
+            del all_probs, all_preds, all_labels
+            gc.collect()
+
+            # 验证和保存
+            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
+                model.eval()
+                # 这里可以添加验证逻辑
+
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                timestamp = datetime.now().strftime("%m%d-%H")
+                name_save = os.path.join(checkpoint_dir,
+                    f'vetime_dim{current_dim}_epoch{epoch+1}_{timestamp}.pth')
+
+                if accelerator.is_main_process:
+                    torch.save(unwrapped_model.state_dict(), name_save)
+                    logger.info(f"Model saved at epoch {epoch+1}")
+
+                early_stopping(avg_train_loss, model)
+                if early_stopping.early_stop:
+                    print("Early stopping triggered.")
+                    break
+
+                model.train()
+                vision_model.eval()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            del train_metrics
+            gc.collect()
+
+        # ========== 9. 保存维度最终 Checkpoint ==========
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        checkpoint_path = os.path.join(checkpoint_dir, f'vetime_dim{current_dim}_final.pth')
+
+        if accelerator.is_main_process:
+            torch.save(unwrapped_model.state_dict(), checkpoint_path)
+            print(f"[INFO] 维度 {current_dim} 最终 Checkpoint 已保存: {checkpoint_path}")
+
+        prev_checkpoint_path = checkpoint_path
+
+        # ========== 10. 彻底清理显存 ==========
+        del model, optimizer, train_loader, ts_model, train_dataset
+        accelerator.free_memory()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    print(f"\n{'='*60}")
+    print("[多变量训练] 所有数据集训练完成！")
+    print(f"{'='*60}")
+
+    accelerator.end_training()
+    return {"status": "completed", "datasets": len(datasets)}
+
+
 if __name__ == "__main__":
     # Default settings as per paper (B.4 Implementation Details)
     DATA_INIT_SETTING = {
