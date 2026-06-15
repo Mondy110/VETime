@@ -9,9 +9,9 @@
             "args": [
                 "launch",
                 "train.py",
-                "--dataset_path", "/mnt/sda/cjmProject/VETime/dataset/vetime_train_all_100000.pkl",
+                "--dataset_path", "/mnt/sda/cjmProject/VETime/dataset/vetime_train_all_32.pkl",
                 "--model_name", "VETime",
-                "--batch_size", "32",
+                "--batch_size", "8",
                 "--num_epochs", "20",
                 "--num_workers", "24"
             ],
@@ -30,14 +30,14 @@
             "args": [
                 "launch",
                 "train.py",
-                "--dataset_path", "/mnt/sda/cjmProject/VETime/dataset/vetime_multi_train_all_5000.pkl",
                 "--model_name", "VETime",
                 "--dataset_test_dir", "./dataset/TSB-AD/Datasets/TSB-AD-M",
                 "--file_list", "./dataset/TSB-AD/Datasets/File_List/TSB-AD-M.csv",
                 "--ts_path", "checkpoints/weight_ts/pretrain_checkpoint_best_multi.pth",
                 "--batch_size", "32",
-                "--num_epochs", "20",
-                "--num_workers", "24"
+                "--num_epochs", "2",
+                "--num_workers", "20",
+                "--config", "config/multivariate_config.yaml"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",

@@ -234,7 +234,7 @@ class win_Contrastive_Loss(win_ContrastiveLoss_init):
 
         # Project features
         z10 = self.mlp1(f1_aligned)  # (B, N, D//4)
-        z20 = self.mlp2(f1_aligned)  # (B, N, D//4)
+        z20 = self.mlp2(f2_aligned)  # (B, N, D//4)
 
         # L2 normalize
         z1s = F.normalize(z10, dim=-1)
@@ -245,7 +245,7 @@ class win_Contrastive_Loss(win_ContrastiveLoss_init):
 
         segments_per_batch = self._find_segments(labels_aligned)
         num_segments = 0
-        for b in range(B):
+        for b in range(B * num_f):
             z1 =z1s[b]
             z2 = z2s[b]
             label = labels_aligned[b]
