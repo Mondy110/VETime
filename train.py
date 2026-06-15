@@ -558,7 +558,8 @@ def load_full_checkpoint(
     checkpoint_path: str,
     model,
     optimizer,
-    accelerator
+    accelerator,
+    datasets: list = None
 ) -> dict:
     """
     加载完整的训练状态checkpoint
@@ -568,6 +569,7 @@ def load_full_checkpoint(
         model: 模型实例
         optimizer: 优化器实例
         accelerator: Accelerator实例
+        datasets: 数据集配置列表（用于从维度推断dataset_idx）
 
     Returns:
         包含恢复状态的字典: {
@@ -580,16 +582,40 @@ def load_full_checkpoint(
             'patience_counter': int
         }
     """
+    import re
     print(f"[INFO] 正在加载checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
     # 检查是否为完整checkpoint
     if 'model_state_dict' not in checkpoint:
         # 兼容旧格式（仅模型权重）
-        print("[INFO] 检测到旧格式checkpoint（仅模型权重），将作为预训练权重加载")
+        print("[INFO] 检测到旧格式checkpoint（仅模型权重）")
+
         unwrapped_model = accelerator.unwrap_model(model)
         missing, unexpected = unwrapped_model.load_state_dict(checkpoint, strict=False)
         print(f"[INFO] 模型权重加载完成 (strict=False)")
+
+        # 尝试从文件名推断维度
+        dim_match = re.search(r'dim(\d+)', os.path.basename(checkpoint_path))
+        if dim_match and datasets:
+            inferred_dim = int(dim_match.group(1))
+            # 查找对应的 dataset_idx
+            for idx, ds in enumerate(datasets):
+                if ds['dim'] == inferred_dim:
+                    dataset_idx = idx
+                    print(f"[INFO] 从文件名推断: 维度 {inferred_dim}, 数据集索引 {dataset_idx}")
+                    # 返回恢复状态：从下一个维度开始
+                    return {
+                        'start_epoch': 0,
+                        'global_step': 0,
+                        'dataset_idx': dataset_idx + 1,  # 下一个维度
+                        'current_dim': inferred_dim,
+                        'prev_checkpoint_path': checkpoint_path,
+                        'best_val_loss': float('inf'),
+                        'patience_counter': 0
+                    }
+            print(f"[WARNING] 无法在配置中找到维度 {inferred_dim} 对应的数据集")
+
         return None
 
     # 加载模型权重
@@ -766,7 +792,7 @@ def train_multivariate(args, config: Dict[str, Any]):
         temp_model, _ = create_model(args, datasets[0]['dim'], vision_model, config_v)
         temp_optimizer = torch.optim.AdamW([p for p in temp_model.parameters() if p.requires_grad])
 
-        resume_state = load_full_checkpoint(resume_path, temp_model, temp_optimizer, accelerator)
+        resume_state = load_full_checkpoint(resume_path, temp_model, temp_optimizer, accelerator, datasets)
 
         if resume_state is not None:
             start_dataset_idx = resume_state['dataset_idx']
