@@ -554,6 +554,80 @@ def save_full_checkpoint(
         print(f"[INFO] 完整Checkpoint已保存: {save_path}")
 
 
+def load_full_checkpoint(
+    checkpoint_path: str,
+    model,
+    optimizer,
+    accelerator
+) -> dict:
+    """
+    加载完整的训练状态checkpoint
+
+    Args:
+        checkpoint_path: checkpoint文件路径
+        model: 模型实例
+        optimizer: 优化器实例
+        accelerator: Accelerator实例
+
+    Returns:
+        包含恢复状态的字典: {
+            'start_epoch': int,
+            'global_step': int,
+            'dataset_idx': int,
+            'current_dim': int,
+            'prev_checkpoint_path': str,
+            'best_val_loss': float,
+            'patience_counter': int
+        }
+    """
+    print(f"[INFO] 正在加载checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+    # 检查是否为完整checkpoint
+    if 'model_state_dict' not in checkpoint:
+        # 兼容旧格式（仅模型权重）
+        print("[INFO] 检测到旧格式checkpoint（仅模型权重），将作为预训练权重加载")
+        unwrapped_model = accelerator.unwrap_model(model)
+        missing, unexpected = unwrapped_model.load_state_dict(checkpoint, strict=False)
+        print(f"[INFO] 模型权重加载完成 (strict=False)")
+        return None
+
+    # 加载模型权重
+    unwrapped_model = accelerator.unwrap_model(model)
+    missing, unexpected = unwrapped_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    print(f"[INFO] 模型权重加载完成")
+    if missing:
+        print(f"  缺失的参数: {len(missing)} 个")
+    if unexpected:
+        print(f"  未预期的参数: {len(unexpected)} 个")
+
+    # 加载optimizer状态
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    print(f"[INFO] Optimizer状态已恢复")
+
+    # 恢复随机状态
+    random_state = checkpoint.get('random_state', {})
+    if 'python' in random_state:
+        random.setstate(random_state['python'])
+    if 'numpy' in random_state:
+        np.random.set_state(random_state['numpy'])
+    if 'torch' in random_state:
+        torch.set_rng_state(random_state['torch'])
+    if 'cuda' in random_state and random_state['cuda'] is not None:
+        torch.cuda.set_rng_state_all(random_state['cuda'])
+    print(f"[INFO] 随机状态已恢复")
+
+    return {
+        'start_epoch': checkpoint['epoch'] + 1,  # 从下一个epoch开始
+        'global_step': checkpoint['global_step'],
+        'dataset_idx': checkpoint['dataset_idx'],
+        'current_dim': checkpoint['current_dim'],
+        'prev_checkpoint_path': checkpoint.get('prev_checkpoint_path'),
+        'best_val_loss': checkpoint['best_val_loss'],
+        'patience_counter': checkpoint['patience_counter']
+    }
+
+
 def train_multivariate(args, config: Dict[str, Any]):
     """
     多变量顺序训练（参考 TimeRCD 范式）
