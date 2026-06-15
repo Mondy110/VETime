@@ -806,6 +806,11 @@ def train_multivariate(args, config: Dict[str, Any]):
         # ========== 2. 全新实例化模型（复用 vision_model）==========
         model, ts_model = create_model(args, current_dim, vision_model, config_v)
 
+        # ========== 处理pretrain加载（仅第一个维度）==========
+        if pretrain_path is not None and dataset_idx == 0:
+            load_pretrain_weights(pretrain_path, model, accelerator)
+            print(f"[INFO] 预训练权重已加载，从头开始多变量训练")
+
         # ========== 3. 知识延续（strict=False 是灵魂）==========
         if prev_checkpoint_path is not None:
             print(f"[INFO] 加载上一维度 checkpoint: {prev_checkpoint_path}")
