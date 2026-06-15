@@ -17,7 +17,7 @@ import json
 import random
 import numpy as np
 import yaml
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -497,6 +497,61 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     model.train()
     return avg_loss
+
+
+def save_full_checkpoint(
+    model,
+    optimizer,
+    epoch: int,
+    global_step: int,
+    dataset_idx: int,
+    current_dim: int,
+    prev_checkpoint_path: Optional[str],
+    best_val_loss: float,
+    patience_counter: int,
+    save_path: str,
+    accelerator
+):
+    """
+    保存完整的训练状态checkpoint
+
+    Args:
+        model: 模型实例
+        optimizer: 优化器实例
+        epoch: 当前epoch（已完成）
+        global_step: 全局步数
+        dataset_idx: 当前数据集索引
+        current_dim: 当前维度
+        prev_checkpoint_path: 上一维度的checkpoint路径
+        best_val_loss: 最佳验证损失
+        patience_counter: 早停计数器
+        save_path: 保存路径
+        accelerator: Accelerator实例
+    """
+    accelerator.wait_for_everyone()
+    unwrapped_model = accelerator.unwrap_model(model)
+
+    checkpoint = {
+        'model_state_dict': unwrapped_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'global_step': global_step,
+        'dataset_idx': dataset_idx,
+        'current_dim': current_dim,
+        'prev_checkpoint_path': prev_checkpoint_path,
+        'best_val_loss': best_val_loss,
+        'patience_counter': patience_counter,
+        'random_state': {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+    }
+
+    if accelerator.is_main_process:
+        torch.save(checkpoint, save_path)
+        print(f"[INFO] 完整Checkpoint已保存: {save_path}")
 
 
 def train_multivariate(args, config: Dict[str, Any]):
