@@ -154,7 +154,7 @@ def train_univariate(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=5000, unpatch=True, finetune_type='none')
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
 
@@ -492,6 +492,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
 
             del images_folded, local_embeddings1, local_embeddings2
             del images, time_series, att_mask, labels
+            torch.cuda.empty_cache()
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     model.train()
@@ -545,7 +546,7 @@ def train_multivariate(args, config: Dict[str, Any]):
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     vision_model = V_model(
         args.vision_name,
-        MAX_L=1000,
+        MAX_L=3000,
         unpatch=True,
         finetune_type='none'
     )
@@ -645,8 +646,8 @@ def train_multivariate(args, config: Dict[str, Any]):
         print(f"\n[INFO] 优化器配置: AdamW, lr={args.learning_rate}, weight_decay={args.weight_decay}")
 
         # ========== 5. 创建 DataLoader（95%/5% 划分训练/验证集）==========
-        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train", train_ratio=0.95)
-        val_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="test", train_ratio=0.95)
+        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train", train_ratio=1.0)
+        val_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="test", train_ratio=0)
 
         print(f"[INFO] 数据集划分: 训练集 {len(train_dataset)} 样本, 验证集 {len(val_dataset)} 样本")
 
@@ -681,7 +682,8 @@ def train_multivariate(args, config: Dict[str, Any]):
         )
 
         # ========== 6. prepare 动态组件 ==========
-        model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+        model, optimizer, train_loader, val_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader)
 
         # ========== 7. 设置训练模式（注意：vision_model 需保持 eval）==========
         model.train()
@@ -916,6 +918,10 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay (paper: 1e-5)')
     parser.add_argument('--ts_finetune_type', type=str, default='lora', choices=['lora', 'freeze'],
                         help="TS Encoder fine-tuning type: 'lora' or 'freeze'")
+    parser.add_argument('--resume', type=str, default=None,
+                        help='从checkpoint继续训练的路径（完整状态恢复）')
+    parser.add_argument('--pretrain_from', type=str, default=None,
+                        help='预训练权重路径（仅模型权重），用于启动多变量训练')
 
     args = parser.parse_args()
     output_file_path = args.output_file_path.replace('result.json', f'{args.model_name.replace("/", "-")}_result.json')
