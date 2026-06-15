@@ -897,7 +897,16 @@ def train_multivariate(args, config: Dict[str, Any]):
         epochs = args.num_epochs
         img_size = data_setting['img_size']
 
-        for epoch in range(epochs):
+        # ========== 恢复训练状态（resume场景）==========
+        start_epoch = 0
+        if resume_state is not None and resume_state['dataset_idx'] == dataset_idx:
+            start_epoch = resume_state['start_epoch']
+            best_val_loss = resume_state['best_val_loss']
+            patience_counter = resume_state['patience_counter']
+            global_step = resume_state['global_step']
+            print(f"[INFO] 从epoch {start_epoch} 继续训练，best_val_loss={best_val_loss:.4f}")
+
+        for epoch in range(start_epoch, epochs):
             model.train()
             vision_model.eval()  # 确保每个 epoch 开始时 vision_model 保持 eval
 
@@ -1019,6 +1028,18 @@ def train_multivariate(args, config: Dict[str, Any]):
             else:
                 patience_counter += 1
                 print(f"  ✗ Validation loss did not improve. Patience: {patience_counter}/{early_stopping_patience}")
+
+            # ========== 保存完整checkpoint（每个epoch）==========
+            epoch_checkpoint_path = os.path.join(
+                checkpoint_dir,
+                f'vetime_dim{current_dim}_epoch{epoch}_full.pth'
+            )
+            save_full_checkpoint(
+                model, optimizer, epoch, global_step,
+                dataset_idx, current_dim, prev_checkpoint_path,
+                best_val_loss, patience_counter,
+                epoch_checkpoint_path, accelerator
+            )
 
             # ========== 早停触发检查 ==========
             if patience_counter >= early_stopping_patience:
