@@ -757,8 +757,32 @@ def train_multivariate(args, config: Dict[str, Any]):
     # 数据设置
     data_setting = args.data_setting
 
+    # ========== 处理resume恢复 ==========
+    resume_state = None
+    start_dataset_idx = 0
+
+    if resume_path:
+        # 先创建一个临时模型用于加载checkpoint检查维度
+        temp_model, _ = create_model(args, datasets[0]['dim'], vision_model, config_v)
+        temp_optimizer = torch.optim.AdamW([p for p in temp_model.parameters() if p.requires_grad])
+
+        resume_state = load_full_checkpoint(resume_path, temp_model, temp_optimizer, accelerator)
+
+        if resume_state is not None:
+            start_dataset_idx = resume_state['dataset_idx']
+            print(f"[INFO] 将从数据集索引 {start_dataset_idx} (维度 {resume_state['current_dim']}) 继续")
+
+        del temp_model, temp_optimizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
     # ========== 外层维度循环 ==========
     for dataset_idx, dataset_info in enumerate(datasets):
+        # 跳过已完成的维度（resume场景）
+        if resume_state is not None and dataset_idx < start_dataset_idx:
+            print(f"[INFO] 跳过已完成的数据集 {dataset_idx+1}/{len(datasets)}: 维度 {dataset_info['dim']}")
+            continue
+
         dataset_path = dataset_info['path']
         current_dim = dataset_info['dim']
         batch_size = dim_batch_size_map.get(str(current_dim), 1)
