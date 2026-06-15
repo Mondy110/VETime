@@ -86,8 +86,11 @@ class win_ContrastiveLoss_init(nn.Module):
         right_win_end = min(N, end + L)
         if right_win_end > right_win_start:
             Neg_candidates.append(z1[right_win_start:right_win_end].mean(dim=0))
-        
-        
+
+        # 如果没有找到负样本（整个窗口都是异常），跳过这个segment
+        if len(Neg_candidates) == 0:
+            return torch.tensor(0.0, device=z1.device, requires_grad=True), start, end
+
         # Stack positives: (K, D)
         negative = torch.stack(Neg_candidates)  # (K, D)
         K = negative.shape[0]
