@@ -671,6 +671,20 @@ def train_multivariate(args, config: Dict[str, Any]):
         config: YAML 配置字典
     """
     mv_config = config['multivariate']
+
+    # 解析 resume 和 pretrain 参数（命令行优先于配置文件）
+    resume_path = args.resume or mv_config.get('resume_from')
+    pretrain_path = args.pretrain_from or mv_config.get('pretrain_from')
+
+    if resume_path and pretrain_path:
+        print("[WARNING] 同时指定了 --resume 和 --pretrain_from，将使用 --resume")
+        pretrain_path = None
+
+    if resume_path:
+        print(f"[INFO] 继续训练模式: 从 {resume_path} 恢复")
+    elif pretrain_path:
+        print(f"[INFO] 预训练模式: 使用 {pretrain_path} 初始化")
+
     datasets = mv_config['datasets']
     dim_batch_size_map = mv_config['dim_batch_size_map']
     checkpoint_dir = mv_config['checkpoint_dir']
