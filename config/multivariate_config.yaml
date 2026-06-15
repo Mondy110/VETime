@@ -1,32 +1,73 @@
 # config/multivariate_config.yaml
+# 多变量顺序训练配置（4090 24GB 显存优化版）
 
-# 训练模式: univariate(单变量) 或 multivariate(多变量顺序训练)
+# 训练模式
 training_mode: multivariate
 
 # 多变量顺序训练配置
 multivariate:
-  # 数据集列表，按训练顺序排列
+  # 数据集列表，按维度递增顺序排列
   datasets:
-    - path: ./dataset/dim_1.pkl
-      dim: 1
-    - path: ./dataset/dim_38.pkl
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_2.pkl
+      dim: 2
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_3.pkl
+      dim: 3
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_4.pkl
+      dim: 4
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_6.pkl
+      dim: 6
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_10.pkl
+      dim: 10
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_12.pkl
+      dim: 12
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_14.pkl
+      dim: 14
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_16.pkl
+      dim: 16
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_20.pkl
+      dim: 20
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_24.pkl
+      dim: 24
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_25.pkl
+      dim: 25
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_28.pkl
+      dim: 28
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_32.pkl
+      dim: 32
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_38.pkl
       dim: 38
-    - path: ./dataset/dim_55.pkl
-      dim: 55
+    - path: ./dataset/vetime_multi_split/vetime-multi-train-all-3000_50.pkl
+      dim: 50
 
-  # 维度到批次大小的映射
+  # 维度到批次大小的映射（统一设为 1，适配 4090 24GB）
   dim_batch_size_map:
-    "1": 32
-    "38": 8
-    "55": 4
+    "2": 8
+    "3": 8
+    "4": 8
+    "6": 2
+    "10": 2
+    "12": 1
+    "14": 1
+    "16": 1
+    "20": 1
+    "24": 1
+    "25": 1
+    "28": 1
+    "32": 1
+    "38": 1
+    "50": 1
 
   # checkpoint 保存目录
   checkpoint_dir: ./output/multivariate_checkpoints
 
   # 是否严格按维度递增顺序检查
-  enforce_dim_order: false
+  enforce_dim_order: true
+
+  # 继续训练配置
+  resume_from: null       # 从checkpoint恢复的路径
+  pretrain_from: null     # 预训练权重路径（如单变量权重）
 
 # 单变量训练配置（兼容原有方式）
 univariate:
   dataset_path: ./dataset/univariate.pkl
-  batch_size: 32
+  batch_size: 1
