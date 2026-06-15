@@ -628,6 +628,32 @@ def load_full_checkpoint(
     }
 
 
+def load_pretrain_weights(pretrain_path: str, model, accelerator):
+    """
+    加载预训练权重（仅模型权重，用于启动新训练）
+
+    Args:
+        pretrain_path: 预训练权重路径
+        model: 模型实例
+        accelerator: Accelerator实例
+    """
+    print(f"[INFO] 正在加载预训练权重: {pretrain_path}")
+    state_dict = torch.load(pretrain_path, map_location='cpu')
+
+    # 处理可能的格式差异
+    if 'model_state_dict' in state_dict:
+        state_dict = state_dict['model_state_dict']
+
+    unwrapped_model = accelerator.unwrap_model(model)
+    missing, unexpected = unwrapped_model.load_state_dict(state_dict, strict=False)
+
+    print(f"[INFO] 预训练权重加载完成 (strict=False)")
+    if missing:
+        print(f"  缺失的参数（新维度组件，使用初始化值）: {len(missing)} 个")
+    if unexpected:
+        print(f"  未预期的参数: {len(unexpected)} 个")
+
+
 def train_multivariate(args, config: Dict[str, Any]):
     """
     多变量顺序训练（参考 TimeRCD 范式）
