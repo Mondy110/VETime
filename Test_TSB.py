@@ -612,10 +612,18 @@ if __name__ == '__main__':
 
     args_test.output_file_path = args_test.output_file_path.replace('result.json', f'{args_test.model_name.replace("/", "-")}_result.json')
 
-    device =args_test.device
+    device = args_test.device
+
+    # 从 checkpoint 推断 MAX_L（位置编码长度）
+    max_l = 5000  # 默认值
+    if args_test.vetime_path is not None and os.path.exists(args_test.vetime_path):
+        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
+        if 'pos_emb_v' in state_dict:
+            max_l = state_dict['pos_emb_v'].shape[1]
+            print(f"[INFO] Detected MAX_L={max_l} from checkpoint")
 
     # 预先实例化共用的 vision_model（单变量和多变量共用）
-    vision_model = V_model(args_test.vision_name, unpatch=True)
+    vision_model = V_model(args_test.vision_name, unpatch=True, MAX_L=max_l)
     config_v = vision_model.config
 
     # 根据数据集路径选择测试分支
