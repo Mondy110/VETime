@@ -121,6 +121,17 @@ class TimeSeriesEncoder(nn.Module):
         self.projection_layer = nn.Linear(d_model, patch_size * d_proj)
         self._init_parameters()
 
+        # Gradient checkpointing flag
+        self._gradient_checkpointing = False
+
+    def gradient_checkpointing_enable(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self._gradient_checkpointing = True
+
+    def gradient_checkpointing_disable(self):
+        """Disable gradient checkpointing."""
+        self._gradient_checkpointing = False
+
     def _init_parameters(self):
         for name, param in self.named_parameters():
             if 'weight' in name and param.dim() >= 2:
@@ -171,20 +182,38 @@ class TimeSeriesEncoder(nn.Module):
         else:
             freqs = None
 
-        # Encode sequence
-        if num_features > 1:
-            output = self.transformer_encoder(
-                embedded_patches,
-                freqs=freqs,
-                src_id=feature_id,
-                attn_mask=full_mask
+        # Encode sequence with optional gradient checkpointing
+        if self._gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+
+            def _encode_forward(embedded_patches, freqs, feature_id, full_mask, num_features):
+                if num_features > 1:
+                    return self.transformer_encoder(
+                        embedded_patches, freqs=freqs, src_id=feature_id, attn_mask=full_mask
+                    )
+                else:
+                    return self.transformer_encoder(
+                        embedded_patches, freqs=freqs, attn_mask=full_mask
+                    )
+
+            output = checkpoint(
+                _encode_forward,
+                embedded_patches, freqs, feature_id, full_mask, num_features
             )
         else:
-            output = self.transformer_encoder(
-                embedded_patches,
-                freqs=freqs,
-                attn_mask=full_mask
-            )
+            if num_features > 1:
+                output = self.transformer_encoder(
+                    embedded_patches,
+                    freqs=freqs,
+                    src_id=feature_id,
+                    attn_mask=full_mask
+                )
+            else:
+                output = self.transformer_encoder(
+                    embedded_patches,
+                    freqs=freqs,
+                    attn_mask=full_mask
+                )
 
         # Extract and project local embeddings
         patch_embeddings = output  # (B, L, d_model)

@@ -87,7 +87,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def create_model(args, num_features: int, vision_model, config_v):
+def create_model(args, num_features: int, vision_model, config_v, use_gradient_checkpointing=False):
     """
     创建 VETime 模型（复用已存在的 vision_model）
 
@@ -100,6 +100,7 @@ def create_model(args, num_features: int, vision_model, config_v):
         num_features: 当前数据集的特征维度
         vision_model: 已实例化的视觉编码器（复用，不重建）
         config_v: 视觉模型配置
+        use_gradient_checkpointing: 是否启用梯度检查点以节省显存
 
     Returns:
         model: VETIME 模型
@@ -112,7 +113,8 @@ def create_model(args, num_features: int, vision_model, config_v):
     ts_model = TS_Model(default_config_t)
 
     # 构建 VETime 完整模型
-    model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
+    model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name,
+                   use_gradient_checkpointing=use_gradient_checkpointing)
 
     return model, ts_model
 
@@ -713,11 +715,10 @@ def train_multivariate(args, config: Dict[str, Any]):
 
     datasets = mv_config['datasets']
     dim_batch_size_map = mv_config['dim_batch_size_map']
+    target_effective_batch_size_map = mv_config.get('target_effective_batch_size_map', {})
+    default_target_effective_batch_size = mv_config.get('default_target_effective_batch_size', 128)
     checkpoint_dir = mv_config['checkpoint_dir']
     enforce_dim_order = mv_config.get('enforce_dim_order', False)
-
-    # 目标有效 batch size（用于动态梯度累积）
-    TARGET_EFFECTIVE_BATCH_SIZE = 128
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -741,7 +742,7 @@ def train_multivariate(args, config: Dict[str, Any]):
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     vision_model = V_model(
         args.vision_name,
-        MAX_L=3000,
+        MAX_L=1000,
         unpatch=True,
         finetune_type='none'
     )
@@ -814,7 +815,12 @@ def train_multivariate(args, config: Dict[str, Any]):
         batch_size = dim_batch_size_map.get(str(current_dim), 1)
 
         # ========== 动态计算梯度累积步数 ==========
-        accumulation_steps = max(1, TARGET_EFFECTIVE_BATCH_SIZE // batch_size)
+        # 根据目标有效 batch size 计算梯度累积步数
+        target_effective_bs = target_effective_batch_size_map.get(
+            str(current_dim), default_target_effective_batch_size
+        )
+        accumulation_steps = max(1, target_effective_bs // batch_size)
+
         accelerator.gradient_accumulation_steps = accumulation_steps
 
         print(f"\n{'='*60}")
@@ -829,8 +835,12 @@ def train_multivariate(args, config: Dict[str, Any]):
         default_config_t.num_features = current_dim
         args.batch_size = batch_size
 
+        # 读取 gradient checkpointing 配置
+        use_gradient_checkpointing = mv_config.get('use_gradient_checkpointing', False)
+
         # ========== 2. 全新实例化模型（复用 vision_model）==========
-        model, ts_model = create_model(args, current_dim, vision_model, config_v)
+        model, ts_model = create_model(args, current_dim, vision_model, config_v,
+                                       use_gradient_checkpointing=use_gradient_checkpointing)
 
         # ========== 处理pretrain加载（仅第一个维度）==========
         if pretrain_path is not None and dataset_idx == 0:
@@ -870,8 +880,8 @@ def train_multivariate(args, config: Dict[str, Any]):
         print(f"\n[INFO] 优化器配置: AdamW, lr={args.learning_rate}, weight_decay={args.weight_decay}")
 
         # ========== 5. 创建 DataLoader（95%/5% 划分训练/验证集）==========
-        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train", train_ratio=1.0)
-        val_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="test", train_ratio=0)
+        train_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="train", train_ratio=0.95)
+        val_dataset = AnomalyDataset(dataset_path, patch_size=patch_size, split="test", train_ratio=0.95)
 
         print(f"[INFO] 数据集划分: 训练集 {len(train_dataset)} 样本, 验证集 {len(val_dataset)} 样本")
 
@@ -936,6 +946,12 @@ def train_multivariate(args, config: Dict[str, Any]):
             model.train()
             vision_model.eval()  # 确保每个 epoch 开始时 vision_model 保持 eval
 
+            # 显存监控
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[显存监控] Epoch {epoch+1} 开始: 已分配 {allocated:.2f} GB, 已保留 {reserved:.2f} GB")
+
             total_loss = 0
             all_probs, all_preds, all_labels = [], [], []
 
@@ -991,25 +1007,39 @@ def train_multivariate(args, config: Dict[str, Any]):
                 if global_step % accelerator.gradient_accumulation_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad()
+                    # 每次 optimizer step 后清理缓存
+                    torch.cuda.empty_cache()
 
                 batch_loss = loss1.item() + loss2.item()
                 total_loss += batch_loss
                 progress_bar.set_postfix({"loss": batch_loss})
 
-                probs = torch.softmax(logits, dim=-1)[:, :, 1]
-                preds = (probs > 0.5).float()
-                probs, preds, labels = accelerator.gather_for_metrics((probs, preds, labels))
-
+                # 只在需要时计算 probs/preds，避免不必要的显存占用
                 if global_step % 10 == 0:
-                    for i in range(probs.shape[0]):
-                        all_probs.append(probs[i].detach().cpu().numpy().reshape(-1))
-                        all_preds.append(preds[i].detach().cpu().numpy().reshape(-1))
-                        all_labels.append(labels[i].detach().cpu().numpy().reshape(-1).astype(int))
+                    with torch.no_grad():
+                        probs = torch.softmax(logits, dim=-1)[:, :, 1]
+                        preds = (probs > 0.5).float()
+                        probs, preds, labels_gathered = accelerator.gather_for_metrics((probs, preds, labels))
 
-                del images_folded, logits, loss1, probs, preds, labels, loss2
+                        for i in range(probs.shape[0]):
+                            all_probs.append(probs[i].cpu().numpy().reshape(-1))
+                            all_preds.append(preds[i].cpu().numpy().reshape(-1))
+                            all_labels.append(labels_gathered[i].cpu().numpy().reshape(-1).astype(int))
+
+                        del probs, preds, labels_gathered
+                else:
+                    del labels
+
+                del images_folded, logits, loss1, loss2
                 del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
                 del images, time_series, att_mask, init_img_size
-                torch.cuda.empty_cache()
+
+                # 定期显存监控
+                if global_step % 100 == 0 and torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    if allocated > 20:  # 超过 20GB 时警告并清理
+                        print(f"\n[警告] 显存使用过高: {allocated:.2f} GB，正在清理...")
+                        torch.cuda.empty_cache()
 
             # 计算 epoch 训练指标
             if len(all_probs) > 0:

@@ -13,16 +13,17 @@ from model.VTS_module import V_Attention, VTS_Alignment, M_moe
 
 class VETIME(TS_Model):
     """Model for time series pretraining with masked reconstruction and anomaly detection."""
-    
-    def __init__(self, config_v, vision_model,config_t,ts_model, model_name=None, **kwargs):
+
+    def __init__(self, config_v, vision_model,config_t,ts_model, model_name=None, use_gradient_checkpointing=False, **kwargs):
         super().__init__(config_t, **kwargs)
-        
+
         # vison setting
         self.vit_encoder = vision_model
         v_dim=vision_model.hidden_size
         t_dim=config_t.d_model
         self.name=model_name
         self.MAX_L=vision_model.MAX_L
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         t_dim2 = int(t_dim*2)
         self.mlp_i = nn.Sequential(
@@ -49,15 +50,38 @@ class VETIME(TS_Model):
         # loss setting
         self.cl_loss=win_Contrastive_Loss(t_dim,temperature=0.1)
 
+        # Enable gradient checkpointing for memory efficiency
+        if self.use_gradient_checkpointing:
+            self._enable_gradient_checkpointing()
+
     def forward(self, hidden_states: torch.Tensor,time_series: torch.Tensor, # grid_thw: torch.Tensor,size,
                 att_mask: Optional[torch.Tensor] = None,init_img_size=None,labels=None):
 
+        # 使用 gradient checkpointing 包装整个 forward 的核心计算
+        if self.use_gradient_checkpointing and self.training:
+            return self._forward_with_checkpointing(
+                hidden_states, time_series, att_mask, init_img_size, labels
+            )
+        else:
+            return self._forward_impl(
+                hidden_states, time_series, att_mask, init_img_size, labels
+            )
+
+    def _forward_impl(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
+                      att_mask: Optional[torch.Tensor] = None, init_img_size=None, labels=None):
+        """实际的 forward 实现"""
         TS_embeddings0,local_embeddings0,patch_mask=self.ts_encoder(time_series,att_mask)
         B, seq_len, num_features = time_series.size()
-        
+
+        patch_num = patch_mask.size(1) // num_features
+
+        temporal_pos_emb = self.pos_emb_v[:, :patch_num, :]
+
+        multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
+
         image_features,_=self.vit_encoder(hidden_states)
         I_embeddings = self.vit_encoder.unfold_image(image_features,init_img_size)
-        I_embeddings =self.mlp_i(I_embeddings+self.pos_emb_v[:, :I_embeddings.size(1), :])
+        I_embeddings =self.mlp_i(I_embeddings+ multivariate_pos_emb)
         I_embeddings0=self.I_att(I_embeddings, patch_mask)
 
         I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
@@ -71,19 +95,91 @@ class VETIME(TS_Model):
         local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()  # (B, num_patches, patch_size, num_features, d_proj)
         local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
-        
+
         patch_proj2 = self.projection_layer(mix_out2)
         local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()  # (B, num_patches, patch_size, num_features, d_proj)
-        local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, 
-        
+        local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B,
+
         return local_embeddings1,m_w1,loss_sc,local_embeddings2
+
+    def _forward_with_checkpointing(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
+                                    att_mask: Optional[torch.Tensor], init_img_size, labels):
+        """使用 gradient checkpointing 的 forward"""
+        from torch.utils.checkpoint import checkpoint
+
+        # 将 forward 分成多个可检查点的部分
+        B, seq_len, num_features = time_series.size()
+
+        # Part 1: TS encoder (已内置 checkpointing)
+        TS_embeddings0, local_embeddings0, patch_mask = self.ts_encoder(time_series, att_mask)
+
+        # Part 2: Vision encoder + fusion (使用 checkpoint)
+        def vision_fusion_forward(hidden_states, patch_mask, init_img_size, TS_embeddings0, num_features):
+            patch_num = patch_mask.size(1) // num_features
+            temporal_pos_emb = self.pos_emb_v[:, :patch_num, :]
+            multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
+
+            image_features, _ = self.vit_encoder(hidden_states)
+            I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
+            I_embeddings = self.mlp_i(I_embeddings + multivariate_pos_emb)
+            I_embeddings0 = self.I_att(I_embeddings, patch_mask)
+
+            I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
+            return I_embeddings, TS_embeddings, I_embeddings0
+
+        I_embeddings, TS_embeddings, I_embeddings0 = checkpoint(
+            vision_fusion_forward,
+            hidden_states, patch_mask, init_img_size, TS_embeddings0, num_features
+        )
+
+        loss_sc = self.compute_cl(I_embeddings, TS_embeddings, labels, num_features)
+
+        # Part 3: MoE + projection (使用 checkpoint)
+        def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
+            mix_out, m_w1 = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0)
+            mix_out2, m_w2 = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, mix_out0)
+            m_w1 = m_w1 + m_w2
+
+            patch_proj = self.projection_layer(mix_out)
+            local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            patch_proj2 = self.projection_layer(mix_out2)
+            local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            return local_embeddings1, local_embeddings2, m_w1
+
+        mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+        local_embeddings1, local_embeddings2, m_w1 = checkpoint(
+            moe_projection_forward,
+            mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features
+        )
+
+        return local_embeddings1, m_w1, loss_sc, local_embeddings2
     
     def compute_cl(self, I_emb, TS_emb, labels,num_features=1):
         if not self.training:
-            return 0.0  
+            return 0.0
         else:
             return self.cl_loss(I_emb, TS_emb, labels,num_features)
+
+    def _enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory-intensive modules."""
+        # Vit encoder 已冻结，不需要 checkpointing
+        # 只对 TS encoder 启用（self.ts_encoder 是 TS_Model, 内部 ts_encoder 是 TimeSeriesEncoder）
+        if hasattr(self.ts_encoder, 'ts_encoder') and hasattr(self.ts_encoder.ts_encoder, 'gradient_checkpointing_enable'):
+            self.ts_encoder.ts_encoder.gradient_checkpointing_enable()
+        print("[INFO] Gradient checkpointing enabled for TS encoder")
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        if hasattr(self.ts_encoder, 'ts_encoder') and hasattr(self.ts_encoder.ts_encoder, 'gradient_checkpointing_disable'):
+            self.ts_encoder.ts_encoder.gradient_checkpointing_disable()
+        print("[INFO] Gradient checkpointing disabled")
 
     def split_data(self,images, time_series, att_mask, labels):
         """

@@ -40,8 +40,9 @@ multivariate:
       dim: 50
 
   # 维度到批次大小的映射（统一设为 1，适配 4090 24GB）
+  # 注意：高维度时有效 batch size 会降低以保证显存安全
   dim_batch_size_map:
-    "2": 8
+    "2": 16
     "3": 8
     "4": 8
     "6": 2
@@ -57,15 +58,41 @@ multivariate:
     "38": 1
     "50": 1
 
+  # 目标有效 batch size 映射（按维度配置）
+  # 梯度累积步数 = target_effective_batch_size // batch_size
+  # 维度越高，目标有效 batch size 越小以节省显存
+  target_effective_batch_size_map:
+    "2": 128
+    "3": 128
+    "4": 128
+    "6": 128
+    "10": 128
+    "12": 128
+    "14": 128
+    "16": 128
+    "20": 128
+    "24": 32
+    "25": 32
+    "28": 32
+    "32": 16
+    "38": 16
+    "50": 8     # 极高维度使用最小累积步数
+
+  # 默认目标有效 batch size（未在 map 中配置的维度使用此值）
+  default_target_effective_batch_size: 64
+
+  # 启用 gradient checkpointing 以节省显存（会增加训练时间约 20%）
+  # 高维度（dim>=20）强烈建议启用
+  use_gradient_checkpointing: true
+
   # checkpoint 保存目录
   checkpoint_dir: ./output/multivariate_checkpoints
-
   # 是否严格按维度递增顺序检查
   enforce_dim_order: true
 
   # 继续训练配置
-  resume_from: null       # 从checkpoint恢复的路径
-  pretrain_from: null     # 预训练权重路径（如单变量权重）
+  resume_from: ./output/multivariate_checkpoints/vetime_dim38_final.pth  # 从checkpoint恢复，跳过已完成维度
+  pretrain_from: null     # 预训练权重路径（从头开始训练）
 
 # 单变量训练配置（兼容原有方式）
 univariate:
