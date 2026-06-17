@@ -342,15 +342,12 @@ def TSB_test_multivariate(
             active_model.to(device)
             patch_size = active_model.patch_size
 
-            # 加载对应维度的权重
-            weight_path = os.path.join(args_test.multi_weight_dir, f'vetime_dim{num_features}_best.pth')
-            if os.path.exists(weight_path):
-                state_dict = torch.load(weight_path, map_location='cpu')
+            # 加载用户指定的权重
+            if args_test.vetime_path is not None:
+                state_dict = torch.load(args_test.vetime_path, map_location='cpu')
                 active_model.load_state_dict(state_dict, strict=False)
                 if verbose:
-                    print(f"[INFO] Loaded weights from {weight_path}")
-            else:
-                print(f"[WARNING] Weight file not found: {weight_path}, using random initialization")
+                    print(f"[INFO] Loaded weights from {args_test.vetime_path}")
 
             current_dim = num_features
 
@@ -592,8 +589,6 @@ if __name__ == '__main__':
                         , help='vision_weight')
     parser.add_argument('--num_workers', type=int, default=10
                         , help='Number of workers for parallel processing')
-    parser.add_argument('--multi_weight_dir', type=str, default='./output/checkpoints_multi'
-                        , help='多变量训练保存权重的文件夹')
 
     args_test = parser.parse_args()
 
