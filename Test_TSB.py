@@ -283,6 +283,139 @@ def TSB_test(
     avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list, verbose=verbose)
     return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
+def TSB_test_multivariate(
+    vision_model,
+    config_v,
+    args_test,
+    data_setting=DATA_INIT_SETTING,
+    device='cuda:0',
+    dataset_setting=PASS_LIST_MULTI,
+    use_list=None,
+    verbose=True
+):
+    """
+    多变量数据集测试函数
+
+    根据每个数据集的特征维度动态创建模型并加载对应权重。
+    维度变化时自动销毁旧模型、清理显存、创建新模型。
+    """
+    import gc
+
+    target_dir = args_test.target_dir
+    model_name = args_test.model_name
+    file_list = args_test.file_list
+    os.makedirs(target_dir, exist_ok=True)
+
+    if verbose:
+        print('Testing on TSB-AD-M (Multivariate) datasets...')
+
+    current_dim = None
+    active_model = None
+    patch_size = None
+    runtime_log = []
+    progress_bar = tqdm(file_list, desc=f"[Stage 1] Saving results for {model_name}")
+
+    for filename in progress_bar:
+        if any(filter_item in filename for filter_item in dataset_setting):
+            continue
+
+        output_path = os.path.join(target_dir, f'{filename.split(".")[0]}_results.pkl')
+        file_path = os.path.join(args_test.dataset_dir, filename)
+        df = pd.read_csv(file_path).dropna()
+        datas = df.iloc[:, :-1].values.astype(float)
+        labels_full = df['Label'].astype(int).to_numpy()
+
+        # 获取当前数据的特征维度
+        num_features = datas.shape[1]
+
+        # 维度变化时：销毁旧模型，创建新模型，加载权重
+        if num_features != current_dim:
+            # 清理旧模型
+            if active_model is not None:
+                del active_model
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # 创建新模型
+            active_model = create_dynamic_model(args_test, num_features, vision_model, config_v)
+            active_model.eval()
+            active_model.to(device)
+            patch_size = active_model.patch_size
+
+            # 加载对应维度的权重
+            weight_path = os.path.join(args_test.multi_weight_dir, f'vetime_dim{num_features}_best.pth')
+            if os.path.exists(weight_path):
+                state_dict = torch.load(weight_path, map_location='cpu')
+                active_model.load_state_dict(state_dict, strict=False)
+                if verbose:
+                    print(f"[INFO] Loaded weights from {weight_path}")
+            else:
+                print(f"[WARNING] Weight file not found: {weight_path}, using random initialization")
+
+            current_dim = num_features
+
+        train_index = int(filename.split('.')[0].split('_')[-3])
+        data = datas[train_index:, :]
+        labels = labels_full[train_index:]
+
+        start_time = time.time()
+        batch = {k: v.to(device) for k, v in dataloader_TSB(data, labels, data_setting, patch_size).items()}
+        labels_tensor = batch["labels"]
+        images = batch["image"]
+        time_series = batch["time_series"]
+        att_mask = batch["attention_mask"]
+
+        with torch.no_grad():
+            if len(labels) > active_model.MAX_L:
+                data_splits = active_model.split_data(images, time_series, att_mask, labels_tensor)
+                logits_list = []
+                for data_part in data_splits:
+                    img_part, ts_part, att_mask_p, label_part = data_part
+                    images_folded, init_img_size = active_model.vit_encoder.fold_image(
+                        img_part, batch['period'].cpu().numpy(), batch['p_value'], **data_setting
+                    )
+                    local_embeddings, _, _, _ = active_model(images_folded, ts_part, att_mask_p, init_img_size)
+                    _, logits_part = active_model.anomaly_detection_loss(local_embeddings, label_part)
+                    logits_list.append(logits_part)
+                logits = torch.cat(logits_list, dim=1)
+            else:
+                images_folded, init_img_size = active_model.vit_encoder.fold_image(
+                    images, batch['period'].cpu().numpy(), batch['p_value'], **data_setting
+                )
+                local_embeddings, _, _, _ = active_model(images_folded, time_series, att_mask, init_img_size)
+                _, logits = active_model.anomaly_detection_loss(local_embeddings, labels_tensor)
+
+        probs = torch.softmax(logits, dim=-1)[:, :, 1].detach().squeeze().cpu().numpy()
+        labels_np = labels_tensor.squeeze().cpu().numpy()
+        values = time_series.detach().squeeze().cpu().numpy()
+        pd.DataFrame({
+            'value': values.tolist(),
+            'label': labels_np.tolist(),
+            'anomaly_score': probs.tolist(),
+        }).to_pickle(output_path)
+
+        run_time = time.time() - start_time
+        if verbose:
+            print(f"Saved {output_path} (dim={num_features}, time: {run_time:.4f}s)")
+        runtime_log.append({
+            'filename': filename,
+            'dim': num_features,
+            'run_time_seconds': run_time
+        })
+
+        # 清理中间变量
+        del df, datas, labels_full, data, labels, batch, images, time_series, att_mask, labels_tensor
+        del images_folded, local_embeddings, logits, probs, labels_np, values
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    log_df = pd.DataFrame(runtime_log)
+    csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}_multi.csv')
+    log_df.to_csv(csv_save_path, index=False)
+
+    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list, verbose=verbose)
+    return 1.0 - avg_f1
+
 def _process_single_result_file(args):
     import gc
     result_path, filename, sliding_window = args
