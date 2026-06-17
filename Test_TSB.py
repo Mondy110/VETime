@@ -592,7 +592,9 @@ if __name__ == '__main__':
                         , help='vision_weight')
     parser.add_argument('--num_workers', type=int, default=10
                         , help='Number of workers for parallel processing')
-    
+    parser.add_argument('--multi_weight_dir', type=str, default='./output/checkpoints_multi'
+                        , help='多变量训练保存权重的文件夹')
+
     args_test = parser.parse_args()
 
     # 根据数据集路径自动选择过滤列表
@@ -617,17 +619,29 @@ if __name__ == '__main__':
 
     device =args_test.device
 
-    vision_model = V_model(args_test.vision_name,unpatch=True)
+    # 预先实例化共用的 vision_model（单变量和多变量共用）
+    vision_model = V_model(args_test.vision_name, unpatch=True)
     config_v = vision_model.config
-    ts_model = TS_Model(default_config_t)
-    
-    model = VETIME(config_v,vision_model,default_config_t,ts_model,args_test.model_name)
-    model.eval().to(device)
-    
-    if args_test.vetime_path!=None:
-        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-        model.load_state_dict(state_dict, strict=False)
 
-    
-    TSB_test(model, args_test, args_test.data_setting, device,
-             dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False)
+    # 根据数据集路径选择测试分支
+    if "TSB-AD-M" in args_test.dataset_dir:
+        # 多变量测试：传入 vision_model，内部动态创建模型
+        TSB_test_multivariate(
+            vision_model, config_v, args_test,
+            args_test.data_setting, device,
+            dataset_setting=dataset_pass_list,
+            use_list=dataset_use_list,
+            verbose=True
+        )
+    else:
+        # 单变量测试：原有逻辑
+        ts_model = TS_Model(default_config_t)
+        model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+        model.eval().to(device)
+
+        if args_test.vetime_path is not None:
+            state_dict = torch.load(args_test.vetime_path, map_location='cpu')
+            model.load_state_dict(state_dict, strict=False)
+
+        TSB_test(model, args_test, args_test.data_setting, device,
+                 dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False)
