@@ -164,6 +164,28 @@ def dataloader_TSB(data, labels,data_setting,patch_size):
         'p_value':pad_value,
     }
 
+def create_dynamic_model(args_test, num_features, vision_model, config_v):
+    """
+    根据特征数量动态生成 VETime 模型
+
+    Args:
+        args_test: 命令行参数
+        num_features: 当前数据的特征维度
+        vision_model: 已实例化的视觉编码器（复用）
+        config_v: 视觉模型配置
+
+    Returns:
+        model: VETIME 模型实例
+    """
+    from model.TS_encoder.config import default_config_t
+    from model.TS_encoder.ts_model import TS_Model
+    from model.VETime import VETIME
+
+    default_config_t.num_features = num_features
+    ts_model = TS_Model(default_config_t)
+    model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+    return model
+
 def TSB_test(
     model,
     args_test,
