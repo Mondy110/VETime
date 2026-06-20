@@ -15,7 +15,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 vision_PATH = os.path.join(BASE_DIR, 'checkpoints', 'weight_v')
 
 class V_model(nn.Module):
-    def __init__(self, vision_name=None,unpatch=True,MAX_L=5000,finetune_type='none',**kwargs):
+    def __init__(self, vision_name=None, unpatch=True, MAX_L=5000, finetune_type='none',
+                 use_vectorized_fold=False, **kwargs):
         """
         Vision Encoder based on MAE/ViT.
 
@@ -30,10 +31,15 @@ class V_model(nn.Module):
                 - 'full': All parameters trainable
                 - 'mlp': Only MLP layers trainable
                 - 'attn': Only attention layers trainable
+            use_vectorized_fold: If True, use vectorized fold_image (faster, fixed T_sqrt=True).
+                                 If False, use original fold_image with period detection.
+                                 Default: False for backward compatibility.
 
         Note: Paper specifies "the encoder of the frozen MAE", so default is 'none'.
         """
         super().__init__()
+
+        self.use_vectorized_fold = use_vectorized_fold
 
         vision_weight = os.path.join(vision_PATH,vision_name)
         if 'vit' in vision_name:
@@ -69,7 +75,31 @@ class V_model(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
     
-    def fold_image(self,images, P_L,p_values, img_size=224,T_sqrt=False):
+    def fold_image(self, images, P_L, p_values, img_size=224, T_sqrt=False):
+        """
+        Fold time series images into 2D representation.
+
+        When use_vectorized_fold=True (set in __init__), this method automatically
+        uses the vectorized implementation which is ~150x faster but requires T_sqrt=True.
+        When use_vectorized_fold=False, uses the original implementation with period detection.
+
+        Args:
+            images: (B, 3, Num, W) input images
+            P_L: Period lengths for each sample (only used when T_sqrt=False)
+            p_values: Padding values, tuple of (C_ts, 3) tensors
+            img_size: Output image size, default 224
+            T_sqrt: If True, use sqrt(T) for period. If False, use detected period P_L.
+                   Note: Vectorized version always uses T_sqrt=True internally.
+
+        Returns:
+            img_2d_batch: (B, 3, img_size, img_size) folded 2D images
+            results_size_out: Size parameters for unfold_image
+        """
+        # 如果启用向量化版本，直接调用（向量化版本固定 T_sqrt=True）
+        if self.use_vectorized_fold:
+            return self.fold_image_vectorized(images, p_values, img_size=img_size)
+
+        # 原始实现
         B, C, Num, W = images.shape
         results_2d = []
         results_size_out = []
@@ -112,6 +142,78 @@ class V_model(nn.Module):
 
         img_2d_batch = torch.cat(results_2d, dim=0)
         return img_2d_batch,results_size_out
+
+    def fold_image_vectorized(self, images, p_values, img_size=224):
+        """
+        向量化版本的 fold_image，固定使用 T_sqrt=True。
+
+        同一 batch 内所有样本的 W 相同，T = W//patch_size 相同，
+        T_p = sqrt(T) 也相同，因此所有 fold 参数一致，
+        可以批量 pad + 重排 + interpolate，无需逐样本循环。
+
+        与 fold_image 的区别：
+        - 固定 T_sqrt=True（不使用周期 P）
+        - 批量处理，使用 unfold/reshape 代替循环
+        - 输出与 fold_image 完全一致，unfold_image 可直接使用
+
+        Args:
+            images: (B, 3, Num, W) 输入图像，其中 Num = C_ts * h_size
+            p_values: tuple of (C_ts, 3) 或 (B, C_ts, 3) padding 填充值
+            img_size: 输出图像尺寸，默认 224
+
+        Returns:
+            img_2d_batch: (B, 3, img_size, img_size) fold 后的 2D 图像
+            results_size_out: List[List[int]] 每个样本的尺寸参数，供 unfold_image 使用
+        """
+        B, C_img, Num, W = images.shape
+        step_size = self.patch_size
+        T = W // step_size
+        T_p = max(int(round(math.sqrt(T))), 1)
+
+        init_w = T_p
+        init_h_base = T // T_p
+        pad_patch = 0
+
+        # 处理 p_values：支持 tuple 或 tensor 输入
+        if isinstance(p_values, (tuple, list)):
+            # tuple of (C_ts, 3) -> stack to (B, C_ts, 3) -> permute to (B, 3, C_ts, 1)
+            p_values_tensor = torch.stack(p_values)  # (B, C_ts, 3)
+        else:
+            p_values_tensor = p_values  # 假设已经是 (B, C_ts, 3)
+
+        # 转换为 (B, 3, C_ts, 1) 用于广播填充
+        # 注意：C_ts 应该等于 Num（当 h_size=1 时）
+        p_values_4d = p_values_tensor.permute(0, 2, 1).unsqueeze(-1)  # (B, 3, C_ts, 1)
+
+        if T % T_p != 0:
+            pad_patch = T_p - T % T_p
+            pad_pixels = pad_patch * step_size
+            # 批量 padding: (B, 3, Num, W) -> (B, 3, Num, W+pad_pixels)
+            images = F.pad(images, (0, pad_pixels, 0, 0), mode='constant', value=0)
+            init_h = init_h_base + 1
+            # 填充 padding 区域: (B, 3, C_ts, 1) 广播到 (B, 3, Num, pad_pixels)
+            images[:, :, :, W:] = p_values_4d
+        else:
+            init_h = init_h_base
+
+        # 向量化重排：将每个样本的时间维度折叠成 2D 空间
+        # 原始逻辑：对每个 j in Num，切分 W 为 init_h 段，沿高度拼接
+        # 使用 unfold 实现无循环版本
+        # (B, 3, Num, init_h * T_p * step_size) -> (B, 3, Num, init_h, T_p * step_size)
+        img_2d = images.unfold(3, T_p * step_size, T_p * step_size)
+        # 调换维度: (B, 3, Num, init_h, T_p*step_size) -> (B, 3, Num*init_h, T_p*step_size)
+        img_2d = img_2d.permute(0, 1, 2, 3, 4).reshape(B, C_img, Num * init_h, T_p * step_size)
+
+        # 批量 resize: F.interpolate 需要 (N, C, H, W) 格式
+        # img_2d 已经是 (B, 3, Num*init_h, T_p*step_size)，符合要求
+        img_resized_y = F.interpolate(img_2d, size=(img_size, img_2d.shape[3]), mode='nearest', align_corners=None)
+        img_final = F.interpolate(img_resized_y, size=(img_size, img_size), mode='bilinear', align_corners=False)
+
+        # 构造 size_out（与 fold_image 输出格式一致）
+        img_size_out = [init_h, init_w, pad_patch, img_size, Num]
+        results_size_out = [img_size_out] * B
+
+        return img_final, results_size_out
 
     def unfold_image(self, x0,size):
         B, L, D = x0.shape

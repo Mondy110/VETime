@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pickle
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 import random
 
 from dataset.pre_image import ts2image_1d
@@ -134,6 +134,7 @@ class AnomalyDataset(Dataset):
             This function modifies the input data list in-place and also
             returns it for convenience.
         """
+        # 串行处理（更稳定，避免多进程内存问题）
         for idx, data0 in enumerate(data):
             target_length = ((len(data0['time_series']) + self.patch_size - 1) // self.patch_size) * self.patch_size
             img, period, padding_value = ts2image_1d(data0['time_series'], target_length, self.patch_size)
@@ -317,54 +318,225 @@ def create_random_mask(
     """
     Create random mask for time series patches in self-supervised learning.
 
-    This function generates a binary mask that randomly masks patches of the
-    time series while respecting the attention mask (only valid sequence
-    positions are masked). The masked positions are replaced with small
-    Gaussian noise for reconstruction-based pretraining.
-
-    The masking strategy:
-    1. Divide the valid sequence into patches of size `patch_size`
-    2. Randomly select `mask_ratio` fraction of patches to mask
-    3. Apply mask only to valid positions (respecting attention_mask)
-    4. Replace masked positions with Gaussian noise (std=0.1)
+    Vectorized implementation: generates per-sample random scores for all patches,
+    then selects the top-K scoring patches to mask. This avoids the slow Python
+    for-loop over samples and patches.
 
     Args:
-        time_series: Input time series tensor of shape (B, L, C) where B is
-                     batch size, L is sequence length, C is number of features.
-        attention_mask: Boolean tensor of shape (B, L) indicating valid positions
-                        (True = valid, False = padding).
-        patch_size: Size of each patch for masking. The sequence is divided
-                    into non-overlapping patches of this size. Default: 14.
-        mask_ratio: Ratio of patches to mask within valid regions. Must be in
-                    [0, 1]. Default: 0.3.
+        time_series: Input time series tensor of shape (B, L, C).
+        attention_mask: Boolean tensor of shape (B, L) indicating valid positions.
+        patch_size: Size of each patch for masking. Default: 14.
+        mask_ratio: Ratio of patches to mask within valid regions. Default: 0.3.
 
     Returns:
         A tuple containing:
             masked_time_series: Time series with masked positions replaced by
                                 small Gaussian noise. Same shape as input (B, L, C).
-            mask: Boolean tensor of shape (B, L) indicating masked positions
-                  (True = masked, False = visible).
+            mask: Boolean tensor of shape (B, L) indicating masked positions.
     """
-    batch_size, seq_len, num_features = time_series.shape
-    mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
-    valid_mask = attention_mask
-    
-    for i in range(batch_size):
-        valid_length = valid_mask[i].sum().item()
-        num_valid_patches = (valid_length + patch_size - 1) // patch_size
-        num_masked = max(1, int(num_valid_patches * mask_ratio)) if mask_ratio > 0 else 0
-        num_masked = min(num_masked, num_valid_patches)
+    B, L, C = time_series.shape
+    num_patches = (L + patch_size - 1) // patch_size
 
-        if num_masked > 0:
-            masked_patches = torch.randperm(num_valid_patches)[:num_masked]
-            for j in masked_patches:
-                start_idx = j * patch_size
-                end_idx = min((j + 1) * patch_size, valid_length)
-                mask[i, start_idx:end_idx] = 1
-    
-    mask = mask & valid_mask
+    # 每个 patch 的有效标记：只要 patch 内有任一有效位置就视为有效 patch
+    # patch_mask: (B, num_patches)
+    patch_mask = attention_mask[:, :num_patches * patch_size].reshape(B, num_patches, patch_size).any(dim=2)
+
+    # 每个样本要 mask 的 patch 数
+    num_valid = patch_mask.sum(dim=1)  # (B,)
+    num_to_mask = (num_valid.float() * mask_ratio).clamp(min=1).long()
+    num_to_mask = num_to_mask.clamp(max=num_valid)
+
+    # 对无效 patch 赋极低分数，确保不会被选中
+    scores = torch.rand(B, num_patches)
+    scores[~patch_mask] = -1.0
+
+    # 选 top-K 分数的 patch 作为 masked
+    K = num_to_mask.max().item()
+    if K > 0:
+        _, topk_indices = scores.topk(K, dim=1)  # (B, K)
+
+        # 构建patch级别的mask，再展开到token级别
+        patch_level_mask = torch.zeros(B, num_patches, dtype=torch.bool)
+        for i in range(B):
+            patch_level_mask[i, topk_indices[i, :num_to_mask[i]]] = True
+
+        # 展开 patch mask -> token mask
+        mask = patch_level_mask.unsqueeze(2).expand(-1, -1, patch_size).reshape(B, num_patches * patch_size)
+        mask = mask[:, :L]  # 截断到原始长度
+    else:
+        mask = torch.zeros(B, L, dtype=torch.bool)
+
+    mask = mask & attention_mask
+
     masked_time_series = time_series.clone()
-    mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_features)
+    mask_expanded = mask.unsqueeze(-1).expand(-1, -1, C)
     masked_time_series[mask_expanded] = torch.randn_like(masked_time_series[mask_expanded]) * 0.1
 
     return masked_time_series, mask
+
+
+class DynamicLengthBatchSampler(Sampler):
+    """
+    按序列长度动态调整 batch_size 的采样器。
+
+    核心思路：保持每 batch 的总 token 数（B * L_max）大致恒定，
+    短样本时自动增大 batch_size 充分利用 GPU，长样本时保持原始 batch_size。
+
+    同时通过 padding_ratio 约束同一 batch 内的 padding 浪费：
+    当新样本长度超过当前 batch 最短样本的 padding_ratio 倍时，强制切分，
+    避免 1K 样本和 68K 样本同 batch 导致大量 padding 浪费。
+
+    数据集需已按长度排序（AnomalyDataset 默认行为）。
+
+    Args:
+        lengths: 每个样本的序列长度列表（已排序）。
+        max_tokens_per_batch: 每 batch 允许的最大 token 数
+                              (B * L_max <= max_tokens_per_batch)。
+        min_batch_size: 最小 batch_size，防止梯度噪声过大。默认 32。
+        max_batch_size: 最大 batch_size，防止极短样本时 batch 过大。默认 256。
+        padding_ratio: 同一 batch 内允许的最大/最小长度比。
+                       超过此比例时强制切 batch，减少 padding 浪费。默认 4.0。
+        drop_last: 是否丢弃最后不满一个 batch 的数据。默认 True。
+        effective_batch_size: 目标有效 batch_size，用于计算梯度累积步数。
+                              设为 0 则不启用（accumulation_steps 固定为 1）。默认 0。
+        shuffle_each_epoch: 是否在每个 epoch 内打乱同长度区间的样本顺序。
+                            保持长度排序的宏观顺序不变。默认 False。
+        seed: 用于 shuffle 的随机种子。默认 42。
+    """
+
+    def __init__(
+        self,
+        lengths: List[int],
+        max_tokens_per_batch: int,
+        min_batch_size: int = 32,
+        max_batch_size: int = 256,
+        padding_ratio: float = 4.0,
+        drop_last: bool = True,
+        effective_batch_size: int = 0,
+        shuffle_each_epoch: bool = False,
+        seed: int = 42,
+    ):
+        self.lengths = lengths
+        self.max_tokens = max_tokens_per_batch
+        self.min_bs = min_batch_size
+        self.max_bs = max_batch_size
+        self.padding_ratio = padding_ratio
+        self.drop_last = drop_last
+        self.effective_bs = effective_batch_size
+        self.shuffle = shuffle_each_epoch
+        self.seed = seed
+        self.epoch = 0
+
+        # 预计算所有 batch
+        self._batches = self._compute_batches(self.lengths)
+
+    def _compute_batches(self, lengths: List[int]) -> List[List[int]]:
+        """
+        根据长度列表预计算所有 batch 的索引划分。
+
+        双重约束：
+        1. B * L_max <= max_tokens（显存约束）
+        2. L_max / L_min <= padding_ratio（padding 浪费约束）
+
+        遍历已排序的长度列表，逐步累加样本到当前 batch，
+        当任一约束被打破时切分出当前 batch。
+        """
+        batches = []
+        current_batch = []
+        current_max_len = 0
+        current_min_len = float('inf')
+
+        for idx, length in enumerate(lengths):
+            new_max_len = max(current_max_len, length)
+            new_min_len = min(current_min_len, length)
+            new_bs = len(current_batch) + 1
+
+            should_split = False
+            if new_bs > 1:
+                # 约束1: token 预算
+                if new_bs * new_max_len > self.max_tokens:
+                    should_split = True
+                # 约束2: padding 浪费（L_max / L_min 不超过 padding_ratio）
+                elif new_max_len / new_min_len > self.padding_ratio:
+                    should_split = True
+                # 约束3: batch_size 上限
+                elif new_bs > self.max_bs:
+                    should_split = True
+
+            if should_split:
+                if len(current_batch) >= self.min_bs or not self.drop_last:
+                    batches.append(current_batch)
+                current_batch = [idx]
+                current_max_len = length
+                current_min_len = length
+            else:
+                current_batch.append(idx)
+                current_max_len = new_max_len
+                current_min_len = new_min_len
+
+        # 处理最后一个 batch
+        if current_batch:
+            if self.drop_last and len(current_batch) < self.min_bs:
+                pass  # 丢弃
+            else:
+                batches.append(current_batch)
+
+        return batches
+
+    def get_accumulation_steps(self) -> int:
+        """
+        返回推荐的梯度累积步数，用于保证有效 batch_size 一致。
+
+        计算方式：effective_batch_size / median(actual_batch_size)
+        向上取整到最近的 2 的幂次，使累积更均匀。
+        """
+        if self.effective_bs <= 0:
+            return 1
+        median_bs = int(np.median([len(b) for b in self._batches]))
+        if median_bs <= 0:
+            return 1
+        steps = max(1, self.effective_bs // median_bs)
+        return steps
+
+    def get_batch_info(self) -> str:
+        """返回 batch 统计信息字符串，用于日志输出。"""
+        batch_sizes = [len(b) for b in self._batches]
+        max_lens = [max(self.lengths[i] for i in b) for b in self._batches]
+        return (
+            f"DynamicBatchSampler: {len(self._batches)} batches, "
+            f"bs range [{min(batch_sizes)}, {max(batch_sizes)}], "
+            f"len range [{min(max_lens)}, {max(max_lens)}], "
+            f"median bs={int(np.median(batch_sizes))}, "
+            f"accumulation_steps={self.get_accumulation_steps()}"
+        )
+
+    def __iter__(self):
+        batches = list(self._batches)
+
+        if self.shuffle:
+            # 在保持长度排序的前提下，打乱相邻同长度样本的顺序
+            rng = random.Random(self.seed + self.epoch)
+            # 将索引按长度分组，组内打乱
+            i = 0
+            while i < len(batches):
+                # 找到长度相近的连续 batch 区间
+                j = i + 1
+                while j < len(batches):
+                    len_i = max(self.lengths[idx] for idx in batches[i])
+                    len_j = max(self.lengths[idx] for idx in batches[j])
+                    if len_j > len_i * 1.5:  # 长度差异超过 50% 视为不同区间
+                        break
+                    j += 1
+                # 打乱 [i, j) 区间内的 batch 顺序
+                segment = batches[i:j]
+                rng.shuffle(segment)
+                batches[i:j] = segment
+                i = j
+
+        self.epoch += 1
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        return len(self._batches)

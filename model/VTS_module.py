@@ -28,12 +28,12 @@ class V_Attention(nn.Module):
 
     def forward(self, feat_I, mask=None):
         B, N_a, _ = feat_I.shape
-        out_a, attn_a = self.cross_attn_a_to_b(
+        out_a, _ = self.cross_attn_a_to_b(
             query=feat_I,
             key=feat_I,
             value=feat_I,
             key_padding_mask=~mask,
-            need_weights=True
+            need_weights=False  # 启用 Flash Attention，输出完全一致
         )
         out_a = feat_I + self.dropout(self.ffn_i(out_a))
         out_I = self.norm1_a(out_a)
@@ -102,25 +102,25 @@ class VTS_Alignment(nn.Module):
     def forward(self, feat_I, feat_TS, mask=None):
         feat_I = self.mlp_i(feat_I)
         feat_TS = self.mlp_t(feat_TS)
-        
+
         out_a, _ = self.cross_attn_a_to_b(
             query=feat_I,
             key=feat_TS,
             value=feat_TS,
             key_padding_mask=~mask,
-            need_weights=True
+            need_weights=False  # 启用 Flash Attention
         )
         out_a = feat_I + self.dropout(out_a)
         out_a = self.norm1_a(out_a)
         out_a = out_a + self.dropout(self.ffn_a(out_a))
         x_I = self.norm2_a(out_a)
 
-        out_b, attn_b = self.cross_attn_b_to_a(
+        out_b, _ = self.cross_attn_b_to_a(
             query=feat_TS,
             key=feat_I,
             value=feat_I,
             key_padding_mask=~mask,
-            need_weights=True
+            need_weights=False  # 启用 Flash Attention
         )
         out_b = feat_TS + self.dropout(out_b)
         out_b = self.norm1_b(out_b)

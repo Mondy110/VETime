@@ -29,7 +29,7 @@ from model.Vision_encoder.V_encoder import V_model
 from loss.loss import load_balance_loss
 from model.TS_encoder.ts_model import TS_Model
 from model.TS_encoder.config import default_config_t
-from dataset.dataloader import AnomalyDataset, collate_fn
+from dataset.dataloader import AnomalyDataset, collate_fn, DynamicLengthBatchSampler
 import logging
 from tqdm.auto import tqdm
 import os
@@ -146,7 +146,7 @@ def train_univariate(args):
 
     accelerator = Accelerator(
         mixed_precision="bf16",
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=2,
         log_with="tensorboard",
         project_dir="./output/logs"
     )
@@ -156,7 +156,7 @@ def train_univariate(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=5000, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none')
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
 
@@ -245,16 +245,102 @@ def train_univariate(args):
 
     # ========== Dataset and DataLoader ==========
     collatefn = partial(collate_fn, patch_size=patch_size)
-    train_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="train")
 
     # 为DataLoader设置随机种子生成器
     g = torch.Generator()
     g.manual_seed(args.seed)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                              collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True, persistent_workers=False,
-                              worker_init_fn=seed_worker, generator=g)
+    val_loader = None
+    if args.val_mode == 'split':
+        # 模式1: 从训练集中划分验证集（默认10%）
+        train_ratio = 1.0 - args.val_ratio
+        train_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="train",
+                                       train_ratio=train_ratio, seed=args.seed)
+        val_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="test",
+                                     train_ratio=train_ratio, seed=args.seed)
+        print(f"[INFO] 验证模式: split (从训练集划分)")
+        print(f"[INFO] 数据集划分: 训练集 {len(train_dataset)} 样本, 验证集 {len(val_dataset)} 样本 "
+              f"(val_ratio={args.val_ratio})")
+
+        # 动态 batch size：按序列长度动态调整，短样本增大 batch 充分利用 GPU
+        train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
+        val_lengths = [len(val_dataset.data[i]['time_series']) for i in range(len(val_dataset))]
+        # max_tokens = batch_size * max_length：保证最长样本 batch_size 不低于原始值
+        max_tokens = args.batch_size * max(train_lengths) if args.dynamic_batch else None
+
+        if args.dynamic_batch and max_tokens:
+            train_sampler = DynamicLengthBatchSampler(
+                train_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=args.batch_size,
+                max_batch_size=args.max_batch_size,
+                padding_ratio=args.padding_ratio,
+                drop_last=True, effective_batch_size=args.batch_size,
+                shuffle_each_epoch=args.shuffle_bucket, seed=args.seed,
+            )
+            val_sampler = DynamicLengthBatchSampler(
+                val_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=args.batch_size,
+                max_batch_size=args.max_batch_size,
+                padding_ratio=args.padding_ratio,
+                drop_last=False, effective_batch_size=0,
+            )
+            print(f"[INFO] 动态 Batch Size: {train_sampler.get_batch_info()}")
+
+            # 动态 batch 模式：由训练循环按样本数手动控制累积，accelerator 设为 1
+            accelerator.gradient_accumulation_steps = 1
+            print(f"[INFO] 梯度累积: 按样本数触发，每 {args.effective_batch_size} 个样本反向传播一次")
+
+            train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                      collate_fn=collatefn, num_workers=args.num_workers,
+                                      pin_memory=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker)
+            val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
+                                    collate_fn=collatefn, num_workers=args.num_workers,
+                                    pin_memory=True, persistent_workers=True,
+                                    worker_init_fn=seed_worker)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                                      collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
+                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker, generator=g)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size,
+                                    collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
+                                    pin_memory=True, drop_last=False, persistent_workers=True,
+                                    worker_init_fn=seed_worker, generator=g)
+    else:
+        # 模式2: 使用真实数据集(TSB_test)作为验证（原有逻辑）
+        train_dataset = AnomalyDataset(args.dataset_path, patch_size=patch_size, split="train")
+        print(f"[INFO] 验证模式: tsb (真实数据集验证)")
+        print(f"[INFO] 训练集: {len(train_dataset)} 样本")
+
+        # 动态 batch size
+        train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
+        max_tokens = args.batch_size * max(train_lengths) if args.dynamic_batch else None
+
+        if args.dynamic_batch and max_tokens:
+            train_sampler = DynamicLengthBatchSampler(
+                train_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=args.batch_size,
+                max_batch_size=args.max_batch_size,
+                padding_ratio=args.padding_ratio,
+                drop_last=True, effective_batch_size=args.batch_size,
+                shuffle_each_epoch=args.shuffle_bucket, seed=args.seed,
+            )
+            print(f"[INFO] 动态 Batch Size: {train_sampler.get_batch_info()}")
+
+            accumulation_steps = train_sampler.get_accumulation_steps()
+            accelerator.gradient_accumulation_steps = accumulation_steps
+            print(f"[INFO] 梯度累积步数: {accumulation_steps} (有效 batch size ≈ {accumulation_steps * int(np.median([len(b) for b in train_sampler._batches]))})")
+
+            train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                      collate_fn=collatefn, num_workers=args.num_workers,
+                                      pin_memory=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker)
+        else:
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
+                                      collate_fn=collatefn, shuffle=False, num_workers=args.num_workers,
+                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker, generator=g)
 
     # ========== Optimizer (as per paper: AdamW, lr=5e-4, weight_decay=1e-5) ==========
     trainable_params_list = [param for param in model.parameters() if param.requires_grad]
@@ -268,12 +354,18 @@ def train_univariate(args):
     print(f"  Learning Rate: {args.learning_rate}")
     print(f"  Weight Decay: {args.weight_decay}")
 
-    model, optimizer, train_loader = accelerator.prepare(
-        model, optimizer, train_loader
-    )
+    if val_loader is not None:
+        model, optimizer, train_loader, val_loader = accelerator.prepare(
+            model, optimizer, train_loader, val_loader
+        )
+    else:
+        model, optimizer, train_loader = accelerator.prepare(
+            model, optimizer, train_loader
+        )
 
     model.train()
     global_step = 0
+    accumulated_samples = 0  # 动态 batch 模式下按样本数累积
     epochs = args.num_epochs
     output = []
     device = accelerator.device
@@ -333,10 +425,20 @@ def train_univariate(args):
 
             accelerator.backward(loss1 + loss2)
 
-            global_step += 1
-            if global_step % accelerator.gradient_accumulation_steps == 0:
-                optimizer.step()
-                optimizer.zero_grad()
+            # 梯度累积：按样本数触发反向传播
+            current_bs = labels.shape[0]
+            if args.dynamic_batch:
+                accumulated_samples += current_bs
+                if accumulated_samples >= args.effective_batch_size:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    accumulated_samples = 0
+            else:
+                global_step += 1
+                if global_step % accelerator.gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             batch_loss = loss1.item() + loss2.item()
             total_loss += batch_loss
@@ -356,7 +458,13 @@ def train_univariate(args):
             del images_folded, logits, loss1, probs, preds, labels, loss2
             del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
             del images, time_series, att_mask, init_img_size
-            torch.cuda.empty_cache()
+
+        # epoch 结束时 flush 剩余梯度
+        if args.dynamic_batch and accumulated_samples > 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            global_step += 1
+            accumulated_samples = 0
 
         if len(all_probs) > 0:
             # 将收集到的小部分数据拼接起来
@@ -383,51 +491,120 @@ def train_univariate(args):
 
         avg_train_loss = total_loss / len(train_loader)
         accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
-        print(f"\n[Epoch {epoch + 1}/{epochs}] 🟩 Training Summary:")
-        print(f"  Avg Loss: {avg_train_loss:.4f}")
+        print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
+        print(f"  Avg Train Loss: {avg_train_loss:.4f}")
 
         # epoch结束后清理大数组（保留 train_metrics 供后续使用）
         del all_probs, all_preds, all_labels
         gc.collect()
 
-        if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
-            model.eval()
-            avg_val_loss = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
-            # 验证后清理内存
-            gc.collect()
-            torch.cuda.empty_cache()
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            timestamp = datetime.now().strftime("%m%d-%H")
-            name_save = f'./output/{args.model_name}__{img_size}_{avg_val_loss:.4f}_{timestamp}.pth'
+        # ========== 验证阶段 ==========
+        if args.val_mode == 'split':
+            # split 模式: 每个epoch用划分的验证集评估，用于早停
+            avg_val_loss = evaluate_univariate(model, val_loader, accelerator, data_setting)
+            accelerator.log({"epoch_val_loss": avg_val_loss}, step=epoch)
+            print(f"  Avg Val Loss (split): {avg_val_loss:.4f}")
 
-            torch.save(unwrapped_model.state_dict(), name_save)
-            logger.info(f"Model saved at epoch {epoch+1} with val_loss={avg_val_loss:.4f}")
-
-            epoch_log = {
-                "epoch": epoch + 1,
-                "train_loss": round(avg_train_loss, 6),
-                "train_metrics": {k: round(v, 6) for k, v in train_metrics.items()},
-                "val_loss": round(avg_val_loss, 6) if avg_val_loss is not None else None,
-            }
-            output.append(epoch_log)
-
+            # 早停判断
             early_stopping(avg_val_loss, model)
+            if avg_val_loss <= early_stopping.val_loss_min:
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                best_model_path = f'./output/{args.model_name}__{img_size}_best.pth'
+                if accelerator.is_main_process:
+                    torch.save(unwrapped_model.state_dict(), best_model_path)
+                    print(f"  Best model saved: {best_model_path} (val_loss={avg_val_loss:.4f})")
             if early_stopping.early_stop:
-                print("Early stopping triggered.")
+                print("Early stopping triggered (based on validation split).")
                 break
 
-            # 验证后清理
-            model.train()
-            gc.collect()
-            torch.cuda.empty_cache()
+            # split 模式下仍定期用 TSB_test 观测（不用于早停）
+            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
+                model.eval()
+                avg_tsb_val_loss = TSB_test(model, args, args.data_setting, device,
+                                            dataset_setting=PASS_LIST, verbose=False)
+                gc.collect()
+                torch.cuda.empty_cache()
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                timestamp = datetime.now().strftime("%m%d-%H")
+                name_save = f'./output/{args.model_name}__{img_size}_{avg_tsb_val_loss:.4f}_{timestamp}.pth'
+                torch.save(unwrapped_model.state_dict(), name_save)
+                logger.info(f"Model saved at epoch {epoch+1} with TSB_val_loss={avg_tsb_val_loss:.4f}")
+
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "train_loss": round(avg_train_loss, 6),
+                    "train_metrics": {k: round(v, 6) for k, v in train_metrics.items()},
+                    "val_loss_split": round(avg_val_loss, 6),
+                    "val_loss_tsb": round(avg_tsb_val_loss, 6) if avg_tsb_val_loss is not None else None,
+                }
+                output.append(epoch_log)
+                model.train()
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "train_loss": round(avg_train_loss, 6),
+                    "train_metrics": {k: round(v, 6) for k, v in train_metrics.items()},
+                    "val_loss_split": round(avg_val_loss, 6),
+                }
+                output.append(epoch_log)
+
+        else:
+            # tsb 模式: 用 TSB_test 作为验证集（原有逻辑），用于早停
+            if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
+                model.eval()
+                avg_val_loss = TSB_test(model, args, args.data_setting, device,
+                                        dataset_setting=PASS_LIST, verbose=False)
+                gc.collect()
+                torch.cuda.empty_cache()
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                timestamp = datetime.now().strftime("%m%d-%H")
+                name_save = f'./output/{args.model_name}__{img_size}_{avg_val_loss:.4f}_{timestamp}.pth'
+                torch.save(unwrapped_model.state_dict(), name_save)
+                logger.info(f"Model saved at epoch {epoch+1} with val_loss={avg_val_loss:.4f}")
+
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "train_loss": round(avg_train_loss, 6),
+                    "train_metrics": {k: round(v, 6) for k, v in train_metrics.items()},
+                    "val_loss_tsb": round(avg_val_loss, 6) if avg_val_loss is not None else None,
+                }
+                output.append(epoch_log)
+
+                early_stopping(avg_val_loss, model)
+                if early_stopping.early_stop:
+                    print("Early stopping triggered (based on TSB validation).")
+                    break
+
+                model.train()
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                epoch_log = {
+                    "epoch": epoch + 1,
+                    "train_loss": round(avg_train_loss, 6),
+                    "train_metrics": {k: round(v, 6) for k, v in train_metrics.items()},
+                }
+                output.append(epoch_log)
 
         # 最后清理 train_metrics
         del train_metrics
         gc.collect()
 
+    # 加载最佳模型（split 模式下由早停保存）
+    if args.val_mode == 'split':
+        best_model_path = f'./output/{args.model_name}__{img_size}_best.pth'
+        if os.path.exists(best_model_path):
+            print(f"\n[INFO] 加载早停保存的最佳模型: {best_model_path}")
+            unwrapped_model = accelerator.unwrap_model(model)
+            unwrapped_model.load_state_dict(torch.load(best_model_path, map_location='cpu'))
+
     loss_all = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
-    print(f"Final validation loss: {loss_all}")
+    print(f"Final TSB validation loss: {loss_all}")
     accelerator.end_training()
     logger.info("Training completed!")
 
@@ -494,7 +671,6 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
 
             del images_folded, local_embeddings1, local_embeddings2
             del images, time_series, att_mask, labels
-            torch.cuda.empty_cache()
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     model.train()
@@ -680,6 +856,77 @@ def load_pretrain_weights(pretrain_path: str, model, accelerator):
         print(f"  缺失的参数（新维度组件，使用初始化值）: {len(missing)} 个")
     if unexpected:
         print(f"  未预期的参数: {len(unexpected)} 个")
+
+
+def evaluate_univariate(model, val_loader, accelerator, data_setting):
+    """
+    单变量训练验证函数（基于训练集划分的验证集）
+
+    Args:
+        model: VETIME 模型
+        val_loader: 验证集 DataLoader
+        accelerator: Accelerator 实例
+        data_setting: 数据配置
+
+    Returns:
+        avg_val_loss: 平均验证损失
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in val_loader:
+            labels = batch["labels"]
+            images = batch["image"]
+            time_series, att_mask = batch['time_series'], batch['attention_mask']
+            period = batch['period']
+            p_value = batch['padding_value']
+
+            if labels.shape[1] > model.MAX_L:
+                data_splits = model.split_data(images, time_series, att_mask, labels)
+                loss1_total = 0
+                loss2_total = 0
+
+                for data_part in data_splits:
+                    img_part, ts_part, att_mask_part, label_part = data_part
+                    images_folded, init_img_size = model.vit_encoder.fold_image(
+                        img_part, period, p_value, **data_setting)
+
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                        images_folded, ts_part, att_mask_part, init_img_size, label_part)
+
+                    loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
+                    loss02, _ = model.weighted_reconstruction_loss(
+                        local_embeddings2, ts_part, att_mask_part, label_part)
+
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                    loss1_total = loss1_total + loss01
+
+                batch_loss = loss1_total.item() + loss2_total.item()
+            else:
+                images_folded, init_img_size = model.vit_encoder.fold_image(
+                    images, period, p_value, **data_setting)
+
+                local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                    images_folded, time_series, att_mask, init_img_size, labels)
+
+                loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
+                loss2, _ = model.weighted_reconstruction_loss(
+                    local_embeddings2, time_series, att_mask, labels)
+                loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+
+                batch_loss = loss1.item() + loss2.item()
+
+            total_loss += batch_loss
+            num_batches += 1
+
+            del images_folded, local_embeddings1, local_embeddings2
+            del images, time_series, att_mask, labels
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    model.train()
+    return avg_loss
 
 
 def train_multivariate(args, config: Dict[str, Any]):
@@ -889,31 +1136,73 @@ def train_multivariate(args, config: Dict[str, Any]):
         g.manual_seed(args.seed)
 
         collatefn = partial(collate_fn, patch_size=patch_size)
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            collate_fn=collatefn,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=False,
-            worker_init_fn=seed_worker,
-            generator=g
-        )
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            collate_fn=collatefn,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-            persistent_workers=False,
-            worker_init_fn=seed_worker,
-            generator=g
-        )
+        # 动态 batch size：对多变量训练同样适用
+        if args.dynamic_batch:
+            train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
+            val_lengths = [len(val_dataset.data[i]['time_series']) for i in range(len(val_dataset))]
+            # max_tokens = batch_size * max_length：保证最长样本不降 batch
+            max_tokens = batch_size * max(train_lengths)
+
+            train_sampler = DynamicLengthBatchSampler(
+                train_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=batch_size,
+                max_batch_size=args.max_batch_size,
+                padding_ratio=args.padding_ratio,
+                drop_last=True, effective_batch_size=target_effective_bs,
+                shuffle_each_epoch=args.shuffle_bucket, seed=args.seed,
+            )
+            val_sampler = DynamicLengthBatchSampler(
+                val_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=batch_size,
+                max_batch_size=args.max_batch_size,
+                padding_ratio=args.padding_ratio,
+                drop_last=False, effective_batch_size=0,
+            )
+            # 动态 batch 模式：由训练循环按样本数手动控制累积
+            accelerator.gradient_accumulation_steps = 1
+
+            print(f"[INFO] 动态 Batch Size: {train_sampler.get_batch_info()}")
+            print(f"[INFO] 梯度累积: 按样本数触发，每 {target_effective_bs} 个样本反向传播一次")
+
+            train_loader = DataLoader(
+                train_dataset, batch_sampler=train_sampler,
+                collate_fn=collatefn, num_workers=args.num_workers,
+                pin_memory=True, persistent_workers=True,
+                worker_init_fn=seed_worker,
+            )
+            val_loader = DataLoader(
+                val_dataset, batch_sampler=val_sampler,
+                collate_fn=collatefn, num_workers=args.num_workers,
+                pin_memory=True, persistent_workers=True,
+                worker_init_fn=seed_worker,
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size,
+                collate_fn=collatefn,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                drop_last=True,
+                persistent_workers=True,
+                worker_init_fn=seed_worker,
+                generator=g
+            )
+
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                collate_fn=collatefn,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+                drop_last=False,
+                persistent_workers=True,
+                worker_init_fn=seed_worker,
+                generator=g
+            )
 
         # ========== 6. prepare 动态组件 ==========
         model, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -930,6 +1219,7 @@ def train_multivariate(args, config: Dict[str, Any]):
 
         # ========== 9. 内层 Epoch 训练 ==========
         global_step = 0
+        accumulated_samples = 0  # 动态 batch 模式下按样本数累积
         epochs = args.num_epochs
         img_size = data_setting['img_size']
 
@@ -1003,12 +1293,20 @@ def train_multivariate(args, config: Dict[str, Any]):
 
                 accelerator.backward(loss1 + loss2)
 
-                global_step += 1
-                if global_step % accelerator.gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    # 每次 optimizer step 后清理缓存
-                    torch.cuda.empty_cache()
+                # 梯度累积：按样本数触发反向传播
+                current_bs = labels.shape[0]
+                if args.dynamic_batch:
+                    accumulated_samples += current_bs
+                    if accumulated_samples >= target_effective_bs:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        global_step += 1
+                        accumulated_samples = 0
+                else:
+                    global_step += 1
+                    if global_step % accelerator.gradient_accumulation_steps == 0:
+                        optimizer.step()
+                        optimizer.zero_grad()
 
                 batch_loss = loss1.item() + loss2.item()
                 total_loss += batch_loss
@@ -1040,6 +1338,13 @@ def train_multivariate(args, config: Dict[str, Any]):
                     if allocated > 20:  # 超过 20GB 时警告并清理
                         print(f"\n[警告] 显存使用过高: {allocated:.2f} GB，正在清理...")
                         torch.cuda.empty_cache()
+
+            # epoch 结束时 flush 剩余梯度
+            if args.dynamic_batch and accumulated_samples > 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
+                accumulated_samples = 0
 
             # 计算 epoch 训练指标
             if len(all_probs) > 0:
@@ -1178,8 +1483,22 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=64, help='Random seed')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (paper: 32)')
     parser.add_argument('--num_workers', type=int, default=5, help='Number of data loader workers')
+    parser.add_argument('--effective_batch_size', type=int, default=128,
+                        help='梯度累积的目标有效 batch size，每累积这么多样本就反向传播一次 (默认: 128)')
+    parser.add_argument('--dynamic_batch', action='store_true', default=False,
+                        help='启用动态 batch size，短样本时自动增大 batch 以充分利用 GPU')
+    parser.add_argument('--max_batch_size', type=int, default=256,
+                        help='动态 batch 模式下，短样本时的 batch_size 上限 (默认: 256)')
+    parser.add_argument('--padding_ratio', type=float, default=1.5,
+                        help='动态 batch 模式下，同一 batch 内最大/最小长度比阈值，'
+                             '超过则强制切 batch 以减少 padding 浪费 (默认: 4.0)')
+    parser.add_argument('--shuffle_bucket', action='store_true', default=False,
+                        help='动态 batch 模式下，在每个 epoch 内打乱同长度区间的 batch 顺序（保持宏观排序不变）')
     parser.add_argument('--num_epochs', type=int, default=25, help='Epochs number (paper: 25)')
     parser.add_argument('--early_stop_patience', type=int, default=4, help='Early stopping patience (paper: 4)')
+    parser.add_argument('--val_ratio', type=float, default=0.1, help='Ratio of training data used for validation split')
+    parser.add_argument('--val_mode', type=str, default='tsb', choices=['tsb', 'split'],
+                        help="Validation mode: 'tsb' uses real test data (original), 'split' uses train split for early stopping")
     parser.add_argument('--output_file_path', default='./output/result.json', type=str, help='Path to the output file')
     parser.add_argument('--keep_idx_path', type=str, required=False, help='Path to the keep idx file')
     parser.add_argument('--device', type=str, default='auto', help='Device to use for evaluation')

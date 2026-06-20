@@ -4,3 +4,4 @@ checkpoints
 *.pkl
 output/
 runtime_log_VETime.csv
+*.log

@@ -24,15 +24,26 @@ class MAETS_AD(nn.Module):
 
         checkpoint = torch.load(ckpt_path, map_location='cpu')
         self.vision_model.load_state_dict(checkpoint['model'], strict=True)
-           
+
     def forward(self, x):
-        # Forecasting using visual model.
-        # x: look-back window, size: [bs x context_len x nvars]
-        # fp64=True can avoid math overflow in some benchmark, like Bitcoin.
-        # return: forecasting window, size: [bs x pred_len x nvars]
+        """
+        Forward pass using encoder only (decoder is skipped for efficiency).
 
-        latent, pred, mask = self.vision_model(x, mask_ratio=0.0)  
+        The original MAE decoder (8 layers, ~30-40% of parameters) is never used
+        during VETime training since we only need the encoder features.
 
+        Args:
+            x: Input images [B, C, H, W]
+
+        Returns:
+            latent: Encoder output [B, L, embed_dim]
+        """
+        # 直接调用编码器，跳过解码器
+        # 原始: latent, pred, mask = self.vision_model(x, mask_ratio=0.0)
+        # 优化: 只调用 forward_encoder，节省 8 层 Transformer 的计算
+        latent, mask, ids_restore = self.vision_model.forward_encoder(
+            x, mask_ratio=0.0, noise=None, use_multiscale=True
+        )
         return latent
         
 
