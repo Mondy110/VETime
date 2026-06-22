@@ -156,9 +156,12 @@ def train_univariate(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none')
+    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none',
+                           use_vectorized_fold=args.use_vectorized_fold)
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
+    if args.use_vectorized_fold:
+        print(f"[INFO] fold_image 使用向量化版本 (约 150 倍加速)")
 
     config_v = vision_model.config
     if 'mae' in args.vision_name:
@@ -991,8 +994,11 @@ def train_multivariate(args, config: Dict[str, Any]):
         args.vision_name,
         MAX_L=1000,
         unpatch=True,
-        finetune_type='none'
+        finetune_type='none',
+        use_vectorized_fold=args.use_vectorized_fold
     )
+    if args.use_vectorized_fold:
+        print(f"[INFO] fold_image 使用向量化版本 (约 150 倍加速)")
     # 移至正确的设备并开启 eval 模式
     vision_model = vision_model.to(device)
     vision_model.eval()
@@ -1494,6 +1500,8 @@ if __name__ == "__main__":
                              '超过则强制切 batch 以减少 padding 浪费 (默认: 4.0)')
     parser.add_argument('--shuffle_bucket', action='store_true', default=False,
                         help='动态 batch 模式下，在每个 epoch 内打乱同长度区间的 batch 顺序（保持宏观排序不变）')
+    parser.add_argument('--use_vectorized_fold', action='store_true', default=False,
+                        help='使用向量化版本的 fold_image，约 150 倍加速，固定 T_sqrt=True')
     parser.add_argument('--num_epochs', type=int, default=25, help='Epochs number (paper: 25)')
     parser.add_argument('--early_stop_patience', type=int, default=4, help='Early stopping patience (paper: 4)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Ratio of training data used for validation split')
