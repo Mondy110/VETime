@@ -409,11 +409,16 @@ def train_univariate(args):
 
                     loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
                     loss2 = loss2 + loss02
-                    loss2 = loss2 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                    loss2 = loss2 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1 = loss1 + loss01
                     logits_list.append(logit)
 
                 logits = torch.cat(logits_list, dim=1)
+                
+                num_splits = len(data_splits)
+                if num_splits > 0:
+                    loss1 = loss1 / num_splits
+                    loss2 = loss2 / num_splits
 
             else:
                 images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
@@ -424,7 +429,7 @@ def train_univariate(args):
 
                 loss2, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
 
-                loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
             accelerator.backward(loss1 + loss2)
 
@@ -651,7 +656,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -665,7 +670,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -903,7 +908,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -917,7 +922,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -1280,7 +1285,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                         loss02, rec = model.weighted_reconstruction_loss(
                             local_embeddings2, ts_part, att_mask_part, label_part)
 
-                        loss2 = loss2 + loss02 + 0.1 * loss_cl + 0.2 * load_balance_loss(m_w)
+                        loss2 = loss2 + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                         loss1 = loss1 + loss01
                         logits_list.append(logit)
 
@@ -1295,7 +1300,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                     loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
                     loss2, rec = model.weighted_reconstruction_loss(
                         local_embeddings2, time_series, att_mask, labels)
-                    loss2 = loss2 + 0.2 * load_balance_loss(m_w) + 0.1 * loss_cl
+                    loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 accelerator.backward(loss1 + loss2)
 

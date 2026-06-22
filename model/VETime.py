@@ -87,21 +87,24 @@ class VETIME(TS_Model):
         I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
-        mix_out,m_w1 = self.mm_w(mix_out0,TS_embeddings0,I_embeddings0,mix_out0)
-        mix_out2,m_w2 = self.mm_w(mix_out0,TS_embeddings0,I_embeddings0,mix_out0,mix_out0)
-        m_w1 = m_w1+m_w2
+        # 两路任务干净并行：task 1 -> anomaly head(local_emb1), task 0 -> reconstruction head(local_emb2)
+        # 任务映射保持与原实现一致（原 mask=None 分支 = task 1 = anomaly）。
+        mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
+        mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
+        # 路由权重以 dict 单独保存（不再 m_w1+m_w2 破坏概率分布），供 load_balance_loss 各自平衡
+        m_w = {0: m_w_r, 1: m_w_a}
 
-        patch_proj = self.projection_layer(mix_out)
+        patch_proj = self.projection_layer(mix_out_a)
         local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()  # (B, num_patches, patch_size, num_features, d_proj)
         local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
 
-        patch_proj2 = self.projection_layer(mix_out2)
+        patch_proj2 = self.projection_layer(mix_out_r)
         local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()  # (B, num_patches, patch_size, num_features, d_proj)
         local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B,
 
-        return local_embeddings1,m_w1,loss_sc,local_embeddings2
+        return local_embeddings1,m_w,loss_sc,local_embeddings2
 
     def _forward_with_checkpointing(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
                                     att_mask: Optional[torch.Tensor], init_img_size, labels):
@@ -137,29 +140,33 @@ class VETIME(TS_Model):
 
         # Part 3: MoE + projection (使用 checkpoint)
         def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
-            mix_out, m_w1 = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0)
-            mix_out2, m_w2 = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, mix_out0)
-            m_w1 = m_w1 + m_w2
+            # 两路任务干净并行：task 1 -> anomaly, task 0 -> reconstruction（与 _forward_impl 一致）
+            mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
+            mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
 
-            patch_proj = self.projection_layer(mix_out)
+            patch_proj = self.projection_layer(mix_out_a)
             local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
             local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
             local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
 
-            patch_proj2 = self.projection_layer(mix_out2)
+            patch_proj2 = self.projection_layer(mix_out_r)
             local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
             local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
             local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
 
-            return local_embeddings1, local_embeddings2, m_w1
+            # 注意：torch.utils.checkpoint 只支持 Tensor / Tensor tuple，不支持 dict。
+            # 因此把 m_w 按 (task0, task1) 固定顺序平铺成 tuple 返回，外部重组为 dict。
+            return local_embeddings1, local_embeddings2, m_w_r, m_w_a
 
         mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
-        local_embeddings1, local_embeddings2, m_w1 = checkpoint(
+        local_embeddings1, local_embeddings2, m_w_r, m_w_a = checkpoint(
             moe_projection_forward,
             mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features
         )
+        # 重组为 dict，与 _forward_impl 的返回签名保持一致
+        m_w = {0: m_w_r, 1: m_w_a}
 
-        return local_embeddings1, m_w1, loss_sc, local_embeddings2
+        return local_embeddings1, m_w, loss_sc, local_embeddings2
     
     def compute_cl(self, I_emb, TS_emb, labels,num_features=1):
         if not self.training:

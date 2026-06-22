@@ -162,33 +162,61 @@ class router(nn.Module):
 
 
 class M_moe(nn.Module):
-    def __init__(self, dst_feature_dims):
+    """MMoE 软门控融合：每个任务拥有专属的 T/I/M 投影层，router 跨任务共享。
+
+    任务映射（与原 checkpoint 语义保持一致）：
+        task_id=0 -> reconstruction head (local_emb2)
+        task_id=1 -> anomaly head        (local_emb1)
+    """
+
+    # 三种原材料的模态标识，与 task_proj 的子 ModuleDict key 对应
+    _MODALITIES = ('T', 'I', 'M')
+
+    def __init__(self, dst_feature_dims, num_tasks=2, topk=3):
         super(M_moe, self).__init__()
         self.dims = dst_feature_dims
-        self.Router = router(self.dims * 2, 3)
+        # 稠密软门控：topk=3 让 3 个模态全参与纯 softmax，无逐 token 丢弃
+        self.Router = router(self.dims * 2, 3, topk=topk)
+        # 跨任务共享的混合特征加工：把 cat([F_T, F_I]) 的 2*dim 映射回 dim
         self.mlp_m = nn.Sequential(
             nn.Linear(self.dims * 2, self.dims * 2),
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(self.dims * 2, self.dims),
         )
+        # 任务专属投影层（按任务分组）：每个 task 一组 T/I/M 投影，解耦特征语义空间
+        self.task_proj = nn.ModuleDict({
+            str(t): nn.ModuleDict({
+                m: nn.Linear(self.dims, self.dims) for m in self._MODALITIES
+            }) for t in range(num_tasks)
+        })
 
-    def forward(self, F_M, F_T, F_I, router_input, mask=None):
-        B, T, _ = F_T.shape
-        F_M = self.mlp_m(F_M)
-        if mask is not None:
-            m_w_r = self.Router(router_input, 0)
-            c_fusion = (
-                F_T * m_w_r[:, :, 0:1] +
-                F_M * m_w_r[:, :, 1:2] +
-                F_I * m_w_r[:, :, 2:3]
-            )
-            return c_fusion, m_w_r
-        else:
-            m_w_c = self.Router(router_input, 1)
-            c_fusion = (
-                F_T * m_w_c[:, :, 0:1] +
-                F_M * m_w_c[:, :, 1:2] +
-                F_I * m_w_c[:, :, 2:3]
-            )
-            return c_fusion, m_w_c
+    def forward(self, F_M_raw, F_T, F_I, router_input, task_id):
+        """对 F_T / F_I / F_M 做任务专属投影后，按 router 软门控加权求和。
+
+        Args:
+            F_M_raw: 混合原材料 (B, T, 2*dim)，先经共享 mlp_m 得到 F_M (B, T, dim)
+            F_T:     时序特征 (B, T, dim)
+            F_I:     图像特征 (B, T, dim)
+            router_input: router 输入 (B, T, 2*dim)
+            task_id: int (0=reconstruction, 1=anomaly)
+
+        Returns:
+            c_fusion: 任务专属的融合特征 (B, T, dim)
+            m_w:      路由权重 (B, T, 3)，每行和为 1（供 load_balance_loss 使用）
+        """
+        # 1. 共享的混合特征（跨任务共用，避免重复计算）
+        F_M = self.mlp_m(F_M_raw)
+        # 2. 任务专属投影：解耦到各自任务的特征空间
+        proj = self.task_proj[str(task_id)]
+        F_T_p = proj['T'](F_T)
+        F_I_p = proj['I'](F_I)
+        F_M_p = proj['M'](F_M)
+        # 3. 软门控加权（router 已对 3 路做 softmax，每行和为 1）
+        m_w = self.Router(router_input, task_id)
+        c_fusion = (
+            F_T_p * m_w[..., 0:1] +
+            F_I_p * m_w[..., 1:2] +
+            F_M_p * m_w[..., 2:3]
+        )
+        return c_fusion, m_w
