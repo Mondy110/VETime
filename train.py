@@ -21,6 +21,7 @@ from typing import Dict, Any, Optional
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from Test_TSB import PASS_LIST, TSB_test
@@ -37,6 +38,7 @@ from datetime import datetime
 from model.VETime import VETIME
 from Test_TSB import EarlyStopping
 from functools import partial
+import psutil  # 硬件资源监控
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
@@ -356,6 +358,7 @@ def train_univariate(args):
     print(f"  Optimizer: AdamW")
     print(f"  Learning Rate: {args.learning_rate}")
     print(f"  Weight Decay: {args.weight_decay}")
+    print(f"  Scheduler: CosineAnnealingLR (T_max={args.num_epochs}, eta_min=1e-6)")
 
     if val_loader is not None:
         model, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -365,6 +368,14 @@ def train_univariate(args):
         model, optimizer, train_loader = accelerator.prepare(
             model, optimizer, train_loader
         )
+
+    # 创建学习率调度器 (CosineAnnealingLR)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+
+    # 初始化 TensorBoard tracker（每次训练使用独立的实验名称）
+    run_name = f"vetime_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    accelerator.init_trackers(run_name)
+    print(f"[INFO] TensorBoard 实验名称: {run_name}")
 
     model.train()
     global_step = 0
@@ -383,6 +394,10 @@ def train_univariate(args):
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
+        total_loss_mse = 0  # 重建损失 (MSE)
+        total_loss_cl = 0   # 对比学习损失
+        total_loss_e = 0    # 门控平衡损失 (Expert Balance)
         all_probs, all_preds, all_labels = [], [], []
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]", disable=not accelerator.is_local_main_process)
@@ -394,10 +409,17 @@ def train_univariate(args):
             period = batch['period']
             p_value = batch['padding_value']
 
+            # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
+            alpha_recon = 0.05  
+
             if labels.shape[1] > model.MAX_L:
                 data_splits = model.split_data(images, time_series, att_mask, labels)
                 loss1 = 0
                 loss2 = 0
+                batch_loss_bce = 0
+                batch_loss_mse = 0
+                batch_loss_cl = 0
+                batch_loss_e = 0
                 logits_list = []
                 for data_part in data_splits:
                     img_part, ts_part, att_mask_part, label_part = data_part
@@ -406,19 +428,34 @@ def train_univariate(args):
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
                     loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
-
+                    
+                    # 这是我们要缩放的纯重构损失
                     loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
-                    loss2 = loss2 + loss02
-                    loss2 = loss2 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                    # 计算负载均衡损失 (保持 Tensor 格式，为了后续反向传播)
+                    batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                    # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
+                    batch_loss_bce += loss01.item()
+                    batch_loss_mse += loss02.item() 
+                    batch_loss_cl += (0.1 * loss_cl).item()
+                    batch_loss_e += batch_loss_e_part.item()
+
+                    # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
+                    loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
                     loss1 = loss1 + loss01
                     logits_list.append(logit)
 
                 logits = torch.cat(logits_list, dim=1)
-                
+
                 num_splits = len(data_splits)
                 if num_splits > 0:
                     loss1 = loss1 / num_splits
                     loss2 = loss2 / num_splits
+                    batch_loss_bce /= num_splits
+                    batch_loss_mse /= num_splits
+                    batch_loss_cl /= num_splits
+                    batch_loss_e /= num_splits
 
             else:
                 images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
@@ -427,10 +464,23 @@ def train_univariate(args):
 
                 loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
 
-                loss2, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
+                # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
+                loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
 
-                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
+                # 【致命 Bug 修复】：原代码在这里加了 .item()，导致负载均衡损失脱离了计算图，完全没有梯度！
+                # 修复后：保留它作为 Tensor
+                loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                
+                # 【核心修改】只对 loss_recon 乘以缩放系数
+                loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
 
+                # 提取纯数值用于打 log
+                batch_loss_bce = loss1.item()
+                batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
+                batch_loss_cl = (0.1 * loss_cl).item()
+                batch_loss_e = loss_e_tensor.item()
+
+            # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
             accelerator.backward(loss1 + loss2)
 
             # 梯度累积：按样本数触发反向传播
@@ -450,7 +500,48 @@ def train_univariate(args):
 
             batch_loss = loss1.item() + loss2.item()
             total_loss += batch_loss
-            progress_bar.set_postfix({"loss": batch_loss})
+            total_loss_bce += batch_loss_bce
+            total_loss_mse += batch_loss_mse
+            total_loss_cl += batch_loss_cl
+            total_loss_e += batch_loss_e
+            progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+
+            # ========== TensorBoard 深度监控 ==========
+            # 任务1: 记录 batch 级别的损失和学习率
+            if global_step > 0:
+                accelerator.log({
+                    "Loss/Total": batch_loss,
+                    "Loss/BCE_Anomaly": batch_loss_bce,
+                    "Loss/MSE_Recon": batch_loss_mse,
+                    "Loss/CL_Contrastive": batch_loss_cl,
+                    "Loss/Balance": batch_loss_e,
+                    "Train/LR": scheduler.get_last_lr()[0],
+                }, step=global_step)
+
+            # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
+            if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
+                writer = accelerator.get_tracker("tensorboard").writer
+                unwrapped_model = accelerator.unwrap_model(model)
+
+                # 记录参数和梯度直方图
+                for name, param in unwrapped_model.named_parameters():
+                    if param.requires_grad:
+                        # 记录权重
+                        writer.add_histogram(f"Parameters/{name}", param.data, global_step)
+                        # 记录梯度（如果有）
+                        if param.grad is not None:
+                            writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
+
+                # 记录硬件资源利用率
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                    writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
+                    writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
+
+                # 记录系统 RAM
+                ram_used = psutil.virtual_memory().used / (1024 ** 3)
+                writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
             probs = torch.softmax(logits, dim=-1)[:, :, 1]
             preds = (probs > 0.5).float()
@@ -498,13 +589,28 @@ def train_univariate(args):
             train_metrics = {}
 
         avg_train_loss = total_loss / len(train_loader)
-        accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
+        avg_loss_bce = total_loss_bce / len(train_loader)
+        avg_loss_mse = total_loss_mse / len(train_loader)
+        avg_loss_cl = total_loss_cl / len(train_loader)
+        avg_loss_e = total_loss_e / len(train_loader)
+
+        accelerator.log({
+            "epoch_train_loss": avg_train_loss,
+            "epoch_loss_bce": avg_loss_bce,
+            "epoch_loss_mse": avg_loss_mse,
+            "epoch_loss_cl": avg_loss_cl,
+            "epoch_loss_e": avg_loss_e,
+        }, step=epoch)
+
         print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
-        print(f"  Avg Train Loss: {avg_train_loss:.4f}")
+        print(f"  Avg Train Loss: {avg_train_loss:.4f} (BCE: {avg_loss_bce:.4f}, MSE: {avg_loss_mse:.4f}, CL: {avg_loss_cl:.4f}, Bal: {avg_loss_e:.4f})")
 
         # epoch结束后清理大数组（保留 train_metrics 供后续使用）
         del all_probs, all_preds, all_labels
         gc.collect()
+
+        # 学习率调度
+        scheduler.step()
 
         # ========== 验证阶段 ==========
         if args.val_mode == 'split':
@@ -656,7 +762,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -670,7 +776,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
+                loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -908,7 +1014,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -922,7 +1028,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
+                loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -990,6 +1096,9 @@ def train_multivariate(args, config: Dict[str, Any]):
         project_dir="./output/logs"
     )
     device = accelerator.device
+
+    # 初始化 TensorBoard tracker（全局只执行一次）
+    accelerator.init_trackers("vetime_project")
 
     logger.info(f"Using {accelerator.num_processes} {'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
 
@@ -1219,6 +1328,9 @@ def train_multivariate(args, config: Dict[str, Any]):
         model, optimizer, train_loader, val_loader = accelerator.prepare(
             model, optimizer, train_loader, val_loader)
 
+        # 创建学习率调度器 (CosineAnnealingLR)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+
         # ========== 7. 设置训练模式（注意：vision_model 需保持 eval）==========
         model.train()
         vision_model.eval()
@@ -1254,6 +1366,10 @@ def train_multivariate(args, config: Dict[str, Any]):
                 print(f"[显存监控] Epoch {epoch+1} 开始: 已分配 {allocated:.2f} GB, 已保留 {reserved:.2f} GB")
 
             total_loss = 0
+            total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
+            total_loss_mse = 0  # 重建损失 (MSE)
+            total_loss_cl = 0   # 对比学习损失
+            total_loss_e = 0    # 门控平衡损失 (Expert Balance)
             all_probs, all_preds, all_labels = [], [], []
 
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]",
@@ -1266,42 +1382,78 @@ def train_multivariate(args, config: Dict[str, Any]):
                 mask = batch['mask']
                 period = batch['period']
                 p_value = batch['padding_value']
+                # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
+                alpha_recon = 0.05  
 
                 if labels.shape[1] > model.MAX_L:
                     data_splits = model.split_data(images, time_series, att_mask, labels)
                     loss1 = 0
                     loss2 = 0
+                    batch_loss_bce = 0
+                    batch_loss_mse = 0
+                    batch_loss_cl = 0
+                    batch_loss_e = 0
                     logits_list = []
-
                     for data_part in data_splits:
                         img_part, ts_part, att_mask_part, label_part = data_part
-                        images_folded, init_img_size = model.vit_encoder.fold_image(
-                            img_part, period, p_value, **data_setting)
+                        images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
-                        local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                            images_folded, ts_part, att_mask_part, init_img_size, label_part)
+                        local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
                         loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
-                        loss02, rec = model.weighted_reconstruction_loss(
-                            local_embeddings2, ts_part, att_mask_part, label_part)
+                        
+                        # 这是我们要缩放的纯重构损失
+                        loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
 
-                        loss2 = loss2 + loss02 + 0.1 * loss_cl + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                        # 计算负载均衡损失 (保持 Tensor 格式，为了后续反向传播)
+                        batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                        # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
+                        batch_loss_bce += loss01.item()
+                        batch_loss_mse += loss02.item() 
+                        batch_loss_cl += (0.1 * loss_cl).item()
+                        batch_loss_e += batch_loss_e_part.item()
+
+                        # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
+                        loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
                         loss1 = loss1 + loss01
                         logits_list.append(logit)
 
                     logits = torch.cat(logits_list, dim=1)
-                else:
-                    images_folded, init_img_size = model.vit_encoder.fold_image(
-                        images, period, p_value, **data_setting)
 
-                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                        images_folded, time_series, att_mask, init_img_size, labels)
+                    num_splits = len(data_splits)
+                    if num_splits > 0:
+                        loss1 = loss1 / num_splits
+                        loss2 = loss2 / num_splits
+                        batch_loss_bce /= num_splits
+                        batch_loss_mse /= num_splits
+                        batch_loss_cl /= num_splits
+                        batch_loss_e /= num_splits
+
+                else:
+                    images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
+
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, time_series, att_mask, init_img_size, labels)
 
                     loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
-                    loss2, rec = model.weighted_reconstruction_loss(
-                        local_embeddings2, time_series, att_mask, labels)
-                    loss2 = loss2 + 0.2 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
+                    # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
+                    loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
+
+                    # 【致命 Bug 修复】：原代码在这里加了 .item()，导致负载均衡损失脱离了计算图，完全没有梯度！
+                    # 修复后：保留它作为 Tensor
+                    loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    
+                    # 【核心修改】只对 loss_recon 乘以缩放系数
+                    loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
+
+                    # 提取纯数值用于打 log
+                    batch_loss_bce = loss1.item()
+                    batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
+                    batch_loss_cl = (0.1 * loss_cl).item()
+                    batch_loss_e = loss_e_tensor.item()
+
+                # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
                 accelerator.backward(loss1 + loss2)
 
                 # 梯度累积：按样本数触发反向传播
@@ -1321,7 +1473,48 @@ def train_multivariate(args, config: Dict[str, Any]):
 
                 batch_loss = loss1.item() + loss2.item()
                 total_loss += batch_loss
-                progress_bar.set_postfix({"loss": batch_loss})
+                total_loss_bce += batch_loss_bce
+                total_loss_mse += batch_loss_mse
+                total_loss_cl += batch_loss_cl
+                total_loss_e += batch_loss_e
+                progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+
+                # ========== TensorBoard 深度监控 ==========
+                # 任务1: 记录 batch 级别的损失和学习率
+                if global_step > 0:
+                    accelerator.log({
+                        "Loss/Total": batch_loss,
+                        "Loss/BCE_Anomaly": batch_loss_bce,
+                        "Loss/MSE_Recon": batch_loss_mse,
+                        "Loss/CL_Contrastive": batch_loss_cl,
+                        "Loss/Balance": batch_loss_e,
+                        "Train/LR": scheduler.get_last_lr()[0],
+                    }, step=global_step)
+
+                # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
+                if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
+                    writer = accelerator.get_tracker("tensorboard").writer
+                    unwrapped_model = accelerator.unwrap_model(model)
+
+                    # 记录参数和梯度直方图
+                    for name, param in unwrapped_model.named_parameters():
+                        if param.requires_grad:
+                            # 记录权重
+                            writer.add_histogram(f"Parameters/{name}", param.data, global_step)
+                            # 记录梯度（如果有）
+                            if param.grad is not None:
+                                writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
+
+                    # 记录硬件资源利用率
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                        writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
+                        writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
+
+                    # 记录系统 RAM
+                    ram_used = psutil.virtual_memory().used / (1024 ** 3)
+                    writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
                 # 只在需要时计算 probs/preds，避免不必要的显存占用
                 if global_step % 10 == 0:
@@ -1371,12 +1564,27 @@ def train_multivariate(args, config: Dict[str, Any]):
                 train_metrics = {}
 
             avg_train_loss = total_loss / len(train_loader)
-            accelerator.log({"epoch_train_loss": avg_train_loss}, step=epoch)
+            avg_loss_bce = total_loss_bce / len(train_loader)
+            avg_loss_mse = total_loss_mse / len(train_loader)
+            avg_loss_cl = total_loss_cl / len(train_loader)
+            avg_loss_e = total_loss_e / len(train_loader)
+
+            accelerator.log({
+                "epoch_train_loss": avg_train_loss,
+                "epoch_loss_bce": avg_loss_bce,
+                "epoch_loss_mse": avg_loss_mse,
+                "epoch_loss_cl": avg_loss_cl,
+                "epoch_loss_e": avg_loss_e,
+            }, step=epoch)
+
             print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
-            print(f"  Avg Train Loss: {avg_train_loss:.4f}")
+            print(f"  Avg Train Loss: {avg_train_loss:.4f} (BCE: {avg_loss_bce:.4f}, MSE: {avg_loss_mse:.4f}, CL: {avg_loss_cl:.4f}, Bal: {avg_loss_e:.4f})")
 
             del all_probs, all_preds, all_labels
             gc.collect()
+
+            # 学习率调度
+            scheduler.step()
 
             # ========== 验证阶段（每个 epoch 都验证）==========
             avg_val_loss = evaluate_multivariate(model, val_loader, accelerator, device, data_setting, vision_model)

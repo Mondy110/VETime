@@ -120,7 +120,7 @@ def dataloader_TSB(data, labels,data_setting,patch_size):
     lengths = time_series.shape[0]
     target_length = ((lengths + patch_size-1) // patch_size) * patch_size
 
-    ts = (time_series - time_series.mean(axis=0, keepdims=True)) / (time_series.std(axis=0, keepdims=True) + 1e-8)
+    ts = (time_series - time_series.mean(axis=0, keepdims=True)) / (time_series.std(axis=0, keepdims=True) + 1e-2)
     
     img,period,pad_value = ts2image_Test(ts,patch_size,**data_setting) 
 

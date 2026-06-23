@@ -121,7 +121,7 @@ class TS_Model(nn.Module):
 
         return reconstruction_loss, reconstructed
     
-    def anomaly_detection_loss(self, 
+    def anomaly_detection_loss(self,
                                local_embeddings: torch.Tensor,
                                labels: torch.Tensor) -> torch.Tensor:
         """Compute anomaly detection loss for each timestep."""
@@ -131,14 +131,21 @@ class TS_Model(nn.Module):
         # Reshape for loss computation
         attention_mask= (labels != -1)
         # Create mask for valid labels (not padding)
-        
+
         # Compute loss only on valid timesteps
         if attention_mask.sum() > 0:
+            valid_labels = labels[attention_mask].long()
+            valid_logits = logits[attention_mask]
+
+            # 固定权重以解决类别极度不平衡问题（异常比例通常 1%~5%，给予 20 倍权重）
+            class_weights = torch.tensor([1.0, 20.0], device=valid_logits.device)
+
             anomaly_loss = F.cross_entropy(
-                logits[attention_mask],
-                labels[attention_mask].long()
+                valid_logits,
+                valid_labels,
+                weight=class_weights
             )
         else:
             anomaly_loss = torch.tensor(0.0, device=logits.device)
-            
+
         return anomaly_loss,logits
