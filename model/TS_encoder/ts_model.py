@@ -124,28 +124,46 @@ class TS_Model(nn.Module):
     def anomaly_detection_loss(self,
                                local_embeddings: torch.Tensor,
                                labels: torch.Tensor) -> torch.Tensor:
-        """Compute anomaly detection loss for each timestep."""
-        # Project local embeddings to anomaly scores
-        logits = self.anomaly_head(local_embeddings)  # [B, seq_len, 2]
-        logits = torch.mean(logits, dim=-2)
-        # Reshape for loss computation
-        attention_mask= (labels != -1)
-        # Create mask for valid labels (not padding)
+        """Masked Focal Loss for extreme class-imbalanced anomaly detection.
 
-        # Compute loss only on valid timesteps
+        - Per-timestep focal loss on valid (non-padding) positions only
+        - Decoupled + normalised class weights to keep loss scale stable
+        """
+        # Project & average across num_features (same as original)
+        logits = self.anomaly_head(local_embeddings)  # [B, seq_len, num_features, 2]
+        logits = logits.mean(dim=-2)                  # [B, seq_len, 2]
+
+        # Mask out padding timesteps (labels == -1)
+        attention_mask = (labels != -1)  # [B, seq_len]
+
         if attention_mask.sum() > 0:
-            valid_labels = labels[attention_mask].long()
-            valid_logits = logits[attention_mask]
+            valid_logits = logits[attention_mask]        # [N_valid, 2]
+            valid_labels = labels[attention_mask].long()  # [N_valid]
 
-            # 固定权重以解决类别极度不平衡问题（异常比例通常 1%~5%，给予 20 倍权重）
-            class_weights = torch.tensor([1.0, 20.0], device=valid_logits.device)
+            # Per-token focal loss
+            bce_loss = F.cross_entropy(valid_logits, valid_labels, reduction='none')
+            pt = torch.exp(-bce_loss)
+            gamma = 2.0
+            focal_loss = (1 - pt) ** gamma * bce_loss
 
-            anomaly_loss = F.cross_entropy(
-                valid_logits,
-                valid_labels,
-                weight=class_weights
-            )
+            # Decoupled per-class mean + normalised weights
+            is_anomaly = (valid_labels == 1)
+            is_normal = (valid_labels == 0)
+
+            loss_anom = focal_loss[is_anomaly]
+            loss_norm = focal_loss[is_normal]
+
+            mean_anom = loss_anom.mean() if loss_anom.numel() > 0 else torch.tensor(0.0, device=logits.device)
+            mean_norm = loss_norm.mean() if loss_norm.numel() > 0 else torch.tensor(0.0, device=logits.device)
+
+            w_anom, w_norm = 1.2, 0.8
+            if loss_anom.numel() > 0 and loss_norm.numel() > 0:
+                anomaly_loss = (mean_anom * w_anom + mean_norm * w_norm) / (w_anom + w_norm)
+            elif loss_anom.numel() > 0:
+                anomaly_loss = mean_anom
+            else:
+                anomaly_loss = mean_norm
         else:
-            anomaly_loss = torch.tensor(0.0, device=logits.device)
+            anomaly_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        return anomaly_loss,logits
+        return anomaly_loss, logits

@@ -21,7 +21,7 @@ from typing import Dict, Any, Optional
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from Test_TSB import PASS_LIST, TSB_test
@@ -158,7 +158,7 @@ def train_univariate(args):
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
     # finetune_type='none' means fully frozen (as per paper: "the encoder of the frozen MAE")
-    vision_model = V_model(args.vision_name, MAX_L=1000, unpatch=True, finetune_type='none',
+    vision_model = V_model(args.vision_name, MAX_L=5000, unpatch=True, finetune_type='none',
                            use_vectorized_fold=args.use_vectorized_fold)
     print(f"[INFO] Vision Encoder 权重加载完成！Patch Size: {vision_model.patch_size}, Hidden Size: {vision_model.hidden_size}")
     print(f"[INFO] Vision Encoder 状态: 完全冻结 (as per paper)")
@@ -358,7 +358,6 @@ def train_univariate(args):
     print(f"  Optimizer: AdamW")
     print(f"  Learning Rate: {args.learning_rate}")
     print(f"  Weight Decay: {args.weight_decay}")
-    print(f"  Scheduler: CosineAnnealingLR (T_max={args.num_epochs}, eta_min=1e-6)")
 
     if val_loader is not None:
         model, optimizer, train_loader, val_loader = accelerator.prepare(
@@ -369,8 +368,18 @@ def train_univariate(args):
             model, optimizer, train_loader
         )
 
-    # 创建学习率调度器 (CosineAnnealingLR)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+    # 创建学习率调度器 (Warmup + CosineAnnealingLR, batch级别衰减)
+    if args.dynamic_batch:
+        steps_per_epoch = len(train_dataset) // args.effective_batch_size
+    else:
+        steps_per_epoch = len(train_loader) // accelerator.gradient_accumulation_steps
+    warmup_steps = steps_per_epoch  # 1 epoch warmup
+    total_steps = (args.early_stop_patience + 2) * steps_per_epoch  # 基于早停耐心值估算实际训练步数
+    cosine_steps = total_steps - warmup_steps
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+    print(f"  Scheduler: Warmup({warmup_steps} steps) + Cosine(cosine_steps={cosine_steps}, eta_min=1e-6), total={total_steps} steps ({args.early_stop_patience + 2} epochs)")
 
     # 初始化 TensorBoard tracker（每次训练使用独立的实验名称）
     run_name = f"vetime_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -488,14 +497,18 @@ def train_univariate(args):
             if args.dynamic_batch:
                 accumulated_samples += current_bs
                 if accumulated_samples >= args.effective_batch_size:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
                     accumulated_samples = 0
             else:
                 global_step += 1
                 if global_step % accelerator.gradient_accumulation_steps == 0:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
 
             batch_loss = loss1.item() + loss2.item()
@@ -515,7 +528,7 @@ def train_univariate(args):
                     "Loss/MSE_Recon": batch_loss_mse,
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
-                    "Train/LR": scheduler.get_last_lr()[0],
+                    "Train/LR": optimizer.param_groups[0]['lr'],
                 }, step=global_step)
 
             # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
@@ -560,6 +573,7 @@ def train_univariate(args):
 
         # epoch 结束时 flush 剩余梯度
         if args.dynamic_batch and accumulated_samples > 0:
+            accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
             global_step += 1
@@ -608,9 +622,6 @@ def train_univariate(args):
         # epoch结束后清理大数组（保留 train_metrics 供后续使用）
         del all_probs, all_preds, all_labels
         gc.collect()
-
-        # 学习率调度
-        scheduler.step()
 
         # ========== 验证阶段 ==========
         if args.val_mode == 'split':
@@ -1328,8 +1339,18 @@ def train_multivariate(args, config: Dict[str, Any]):
         model, optimizer, train_loader, val_loader = accelerator.prepare(
             model, optimizer, train_loader, val_loader)
 
-        # 创建学习率调度器 (CosineAnnealingLR)
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+        # 创建学习率调度器 (Warmup + CosineAnnealingLR, batch级别衰减)
+        if args.dynamic_batch:
+            steps_per_epoch = len(train_dataset) // target_effective_bs
+        else:
+            steps_per_epoch = len(train_loader) // accelerator.gradient_accumulation_steps
+        warmup_steps = steps_per_epoch  # 1 epoch warmup
+        total_steps = (args.early_stop_patience + 2) * steps_per_epoch  # 基于早停耐心值估算实际训练步数
+        cosine_steps = total_steps - warmup_steps
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+        cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=1e-6)
+        scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+        print(f"  Scheduler: Warmup({warmup_steps} steps) + Cosine(cosine_steps={cosine_steps}, eta_min=1e-6), total={total_steps} steps ({args.early_stop_patience + 2} epochs)")
 
         # ========== 7. 设置训练模式（注意：vision_model 需保持 eval）==========
         model.train()
@@ -1461,14 +1482,18 @@ def train_multivariate(args, config: Dict[str, Any]):
                 if args.dynamic_batch:
                     accumulated_samples += current_bs
                     if accumulated_samples >= target_effective_bs:
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
+                        scheduler.step()
                         optimizer.zero_grad()
                         global_step += 1
                         accumulated_samples = 0
                 else:
                     global_step += 1
                     if global_step % accelerator.gradient_accumulation_steps == 0:
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
+                        scheduler.step()
                         optimizer.zero_grad()
 
                 batch_loss = loss1.item() + loss2.item()
@@ -1488,7 +1513,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Loss/MSE_Recon": batch_loss_mse,
                         "Loss/CL_Contrastive": batch_loss_cl,
                         "Loss/Balance": batch_loss_e,
-                        "Train/LR": scheduler.get_last_lr()[0],
+                        "Train/LR": optimizer.param_groups[0]['lr'],
                     }, step=global_step)
 
                 # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
@@ -1545,6 +1570,7 @@ def train_multivariate(args, config: Dict[str, Any]):
 
             # epoch 结束时 flush 剩余梯度
             if args.dynamic_batch and accumulated_samples > 0:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
@@ -1582,9 +1608,6 @@ def train_multivariate(args, config: Dict[str, Any]):
 
             del all_probs, all_preds, all_labels
             gc.collect()
-
-            # 学习率调度
-            scheduler.step()
 
             # ========== 验证阶段（每个 epoch 都验证）==========
             avg_val_loss = evaluate_multivariate(model, val_loader, accelerator, device, data_setting, vision_model)
