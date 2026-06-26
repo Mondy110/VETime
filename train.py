@@ -400,7 +400,77 @@ def train_univariate(args):
     output_path0 = f'./output/score/uni/{args.model_name}_train'
     os.makedirs(output_path0, exist_ok=True)
 
-    for epoch in range(epochs):
+    # ========== 处理resume恢复 ==========
+    start_epoch = 0
+    best_val_loss_resume = None  # 用于恢复早停中的最佳验证损失
+    checkpoint_dir = f'./output/checkpoints/{args.model_name}'
+    if args.resume:
+        resume_path = args.resume
+        if not os.path.exists(resume_path):
+            print(f"[ERROR] Resume checkpoint 不存在: {resume_path}")
+        else:
+            print(f"[INFO] 正在加载resume checkpoint: {resume_path}")
+            checkpoint = torch.load(resume_path, map_location='cpu')
+
+            if 'model_state_dict' in checkpoint:
+                # 完整checkpoint格式
+                unwrapped_model = accelerator.unwrap_model(model)
+                missing, unexpected = unwrapped_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                print(f"[INFO] 模型权重已恢复")
+                if missing:
+                    print(f"  缺失的参数: {len(missing)} 个")
+                if unexpected:
+                    print(f"  未预期的参数: {len(unexpected)} 个")
+
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"[INFO] Optimizer状态已恢复")
+
+                start_epoch = checkpoint['epoch'] + 1
+                global_step = checkpoint['global_step']
+                best_val_loss_resume = checkpoint.get('best_val_loss')
+                if best_val_loss_resume is not None:
+                    early_stopping.val_loss_min = best_val_loss_resume
+                    print(f"[INFO] 早停最佳验证损失已恢复: {best_val_loss_resume:.4f}")
+
+                # 恢复调度器状态
+                scheduler_state = checkpoint.get('scheduler_state_dict')
+                if scheduler_state is not None:
+                    scheduler.load_state_dict(scheduler_state)
+                    print(f"[INFO] 学习率调度器状态已恢复，当前LR={scheduler.get_last_lr()[0]:.2e}")
+                else:
+                    print(f"[WARNING] 旧checkpoint无调度器状态，手动推进{global_step}步（可能存在微小误差）")
+                    for _ in range(global_step):
+                        scheduler.step()
+
+                # 恢复随机状态
+                random_state = checkpoint.get('random_state', {})
+                if 'python' in random_state:
+                    random.setstate(random_state['python'])
+                if 'numpy' in random_state:
+                    np.random.set_state(random_state['numpy'])
+                if 'torch' in random_state:
+                    torch.set_rng_state(random_state['torch'])
+                if 'cuda' in random_state and random_state['cuda'] is not None:
+                    torch.cuda.set_rng_state_all(random_state['cuda'])
+                print(f"[INFO] 随机状态已恢复")
+
+                print(f"[INFO] 从epoch {start_epoch} 继续训练，global_step={global_step}")
+            else:
+                # 旧格式：仅模型权重
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.load_state_dict(checkpoint, strict=False)
+                print(f"[INFO] 旧格式checkpoint，仅恢复了模型权重，从epoch 0开始训练")
+
+    for epoch in range(start_epoch, epochs):
+        # ========== 两阶段训练范式（Two-Stage Training）==========
+        # 阶段1 (epoch < stage1_epochs): 纯重建预训练，切断异常分类损失，防止"梯度海啸"淹没分类头
+        # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
+        is_stage_1 = epoch < args.stage1_epochs
+        if is_stage_1:
+            print(f"[Stage 1] Epoch {epoch+1}/{epochs}: 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+        else:
+            print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
+
         model.train()
         total_loss = 0
         total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
@@ -441,8 +511,19 @@ def train_univariate(args):
                     # 这是我们要缩放的纯重构损失
                     loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    # 计算负载均衡损失 (保持 Tensor 格式，为了后续反向传播)
-                    batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    # ========== 两阶段训练范式：门控负载均衡损失 ==========
+                    # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
+                    # 阶段2: 恢复双分支计算
+                    if is_stage_1:
+                        batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                    else:
+                        batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                    # ========== 两阶段训练范式：异常分类损失 ==========
+                    # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
+                    # 阶段2: 恢复正常的异常分类损失
+                    if is_stage_1:
+                        loss01 = torch.tensor(0.0, device=device)
 
                     # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
                     batch_loss_bce += loss01.item()
@@ -476,9 +557,19 @@ def train_univariate(args):
                 # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
                 loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
 
-                # 【致命 Bug 修复】：原代码在这里加了 .item()，导致负载均衡损失脱离了计算图，完全没有梯度！
-                # 修复后：保留它作为 Tensor
-                loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                # ========== 两阶段训练范式：门控负载均衡损失 ==========
+                # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
+                # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
+                if is_stage_1:
+                    loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                else:
+                    loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                # ========== 两阶段训练范式：异常分类损失 ==========
+                # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
+                # 阶段2: 恢复正常的异常分类损失
+                if is_stage_1:
+                    loss1 = torch.tensor(0.0, device=device)
                 
                 # 【核心修改】只对 loss_recon 乘以缩放系数
                 loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
@@ -716,6 +807,21 @@ def train_univariate(args):
                 }
                 output.append(epoch_log)
 
+        # ========== 保存完整checkpoint（每个epoch）==========
+        accelerator.wait_for_everyone()
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        epoch_checkpoint_path = os.path.join(
+            checkpoint_dir,
+            f'univariate_epoch{epoch}_full.pth'
+        )
+        save_full_checkpoint(
+            model, optimizer, scheduler, epoch, global_step,
+            0, 0, None,  # dataset_idx, current_dim, prev_checkpoint_path (单变量不适用)
+            early_stopping.val_loss_min,  # best_val_loss
+            0,  # patience_counter (由 EarlyStopping 对象管理)
+            epoch_checkpoint_path, accelerator
+        )
+
         # 最后清理 train_metrics
         del train_metrics
         gc.collect()
@@ -805,6 +911,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
 def save_full_checkpoint(
     model,
     optimizer,
+    scheduler,
     epoch: int,
     global_step: int,
     dataset_idx: int,
@@ -844,6 +951,7 @@ def save_full_checkpoint(
         'prev_checkpoint_path': prev_checkpoint_path,
         'best_val_loss': best_val_loss,
         'patience_counter': patience_counter,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'random_state': {
             'python': random.getstate(),
             'numpy': np.random.get_state(),
@@ -915,7 +1023,8 @@ def load_full_checkpoint(
                         'current_dim': inferred_dim,
                         'prev_checkpoint_path': checkpoint_path,
                         'best_val_loss': float('inf'),
-                        'patience_counter': 0
+                        'patience_counter': 0,
+                        'scheduler_state_dict': None
                     }
             print(f"[WARNING] 无法在配置中找到维度 {inferred_dim} 对应的数据集")
 
@@ -953,7 +1062,8 @@ def load_full_checkpoint(
         'current_dim': checkpoint['current_dim'],
         'prev_checkpoint_path': checkpoint.get('prev_checkpoint_path'),
         'best_val_loss': checkpoint['best_val_loss'],
-        'patience_counter': checkpoint['patience_counter']
+        'patience_counter': checkpoint['patience_counter'],
+        'scheduler_state_dict': checkpoint.get('scheduler_state_dict')
     }
 
 
@@ -1374,11 +1484,30 @@ def train_multivariate(args, config: Dict[str, Any]):
             best_val_loss = resume_state['best_val_loss']
             patience_counter = resume_state['patience_counter']
             global_step = resume_state['global_step']
+            # 恢复调度器状态，确保学习率曲线连续
+            scheduler_state = resume_state.get('scheduler_state_dict')
+            if scheduler_state is not None:
+                scheduler.load_state_dict(scheduler_state)
+                print(f"[INFO] 学习率调度器状态已恢复，当前LR={scheduler.get_last_lr()[0]:.2e}")
+            else:
+                # 旧checkpoint无调度器状态，手动推进调度器到global_step
+                print(f"[WARNING] 旧checkpoint无调度器状态，手动推进{global_step}步（可能存在微小误差）")
+                for _ in range(global_step):
+                    scheduler.step()
             print(f"[INFO] 从epoch {start_epoch} 继续训练，best_val_loss={best_val_loss:.4f}")
 
         for epoch in range(start_epoch, epochs):
             model.train()
             vision_model.eval()  # 确保每个 epoch 开始时 vision_model 保持 eval
+
+            # ========== 两阶段训练范式（Two-Stage Training）==========
+            # 阶段1 (epoch < stage1_epochs): 纯重建预训练，切断异常分类损失，防止"梯度海啸"淹没分类头
+            # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
+            is_stage_1 = epoch < args.stage1_epochs
+            if is_stage_1:
+                print(f"[Stage 1] Epoch {epoch+1}/{epochs} (dim={current_dim}): 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+            else:
+                print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
 
             # 显存监控
             if torch.cuda.is_available():
@@ -1426,8 +1555,19 @@ def train_multivariate(args, config: Dict[str, Any]):
                         # 这是我们要缩放的纯重构损失
                         loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
 
-                        # 计算负载均衡损失 (保持 Tensor 格式，为了后续反向传播)
-                        batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                        # ========== 两阶段训练范式：门控负载均衡损失 ==========
+                        # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
+                        # 阶段2: 恢复双分支计算
+                        if is_stage_1:
+                            batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                        else:
+                            batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                        # ========== 两阶段训练范式：异常分类损失 ==========
+                        # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
+                        # 阶段2: 恢复正常的异常分类损失
+                        if is_stage_1:
+                            loss01 = torch.tensor(0.0, device=device)
 
                         # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
                         batch_loss_bce += loss01.item()
@@ -1461,9 +1601,19 @@ def train_multivariate(args, config: Dict[str, Any]):
                     # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
                     loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
 
-                    # 【致命 Bug 修复】：原代码在这里加了 .item()，导致负载均衡损失脱离了计算图，完全没有梯度！
-                    # 修复后：保留它作为 Tensor
-                    loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    # ========== 两阶段训练范式：门控负载均衡损失 ==========
+                    # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
+                    # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
+                    if is_stage_1:
+                        loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                    else:
+                        loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+
+                    # ========== 两阶段训练范式：异常分类损失 ==========
+                    # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
+                    # 阶段2: 恢复正常的异常分类损失
+                    if is_stage_1:
+                        loss1 = torch.tensor(0.0, device=device)
                     
                     # 【核心修改】只对 loss_recon 乘以缩放系数
                     loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
@@ -1638,7 +1788,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                 f'vetime_dim{current_dim}_epoch{epoch}_full.pth'
             )
             save_full_checkpoint(
-                model, optimizer, epoch, global_step,
+                model, optimizer, scheduler, epoch, global_step,
                 dataset_idx, current_dim, prev_checkpoint_path,
                 best_val_loss, patience_counter,
                 epoch_checkpoint_path, accelerator
@@ -1739,6 +1889,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_vectorized_fold', action='store_true', default=False,
                         help='使用向量化版本的 fold_image，约 150 倍加速，固定 T_sqrt=True')
     parser.add_argument('--num_epochs', type=int, default=25, help='Epochs number (paper: 25)')
+    parser.add_argument('--stage1_epochs', type=int, default=1,
+                        help='纯重建预训练的 epoch 数量（两阶段训练：前 stage1_epochs 个 epoch 仅训练重建任务，切断异常分类损失）')
     parser.add_argument('--early_stop_patience', type=int, default=4, help='Early stopping patience (paper: 4)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Ratio of training data used for validation split')
     parser.add_argument('--val_mode', type=str, default='tsb', choices=['tsb', 'split'],
