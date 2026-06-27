@@ -184,12 +184,37 @@ class M_moe(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(self.dims * 2, self.dims),
         )
-        # 任务专属投影层（按任务分组）：每个 task 一组 T/I/M 投影，解耦特征语义空间
-        self.task_proj = nn.ModuleDict({
-            str(t): nn.ModuleDict({
-                m: nn.Linear(self.dims, self.dims) for m in self._MODALITIES
-            }) for t in range(num_tasks)
-        })
+        
+        # 任务专属投影层（按任务分组）：区别对待不同任务的特性
+        self.task_proj = nn.ModuleDict()
+        for t in range(num_tasks):
+            task_dict = nn.ModuleDict()
+            for m in self._MODALITIES:
+                layers = []
+                # 1. 任务层最上面的稳压层 (LayerNorm)
+                layers.append(nn.LayerNorm(self.dims))
+                
+                # 2. 第一次线性变换
+                layers.append(nn.Linear(self.dims, self.dims))
+                
+                # 3. 两个线性层之间的稳压层 (LayerNorm)
+                layers.append(nn.LayerNorm(self.dims))
+                
+                # 4. 非线性激活
+                layers.append(nn.GELU())
+                
+                # 5. 任务专用的正则化隔离
+                # t=1 是分类任务(Anomaly)，需要 Dropout 防过拟合
+                # t=0 是重构任务(Reconstruction)，严禁 Dropout 以保证输出数值极度平滑
+                if t == 1:
+                    layers.append(nn.Dropout(0.1))
+                
+                # 6. 第二次线性变换
+                layers.append(nn.Linear(self.dims, self.dims))
+                
+                task_dict[m] = nn.Sequential(*layers)
+            
+            self.task_proj[str(t)] = task_dict
 
     def forward(self, F_M_raw, F_T, F_I, router_input, task_id):
         """对 F_T / F_I / F_M 做任务专属投影后，按 router 软门控加权求和。
@@ -207,11 +232,13 @@ class M_moe(nn.Module):
         """
         # 1. 共享的混合特征（跨任务共用，避免重复计算）
         F_M = self.mlp_m(F_M_raw)
+        
         # 2. 任务专属投影：解耦到各自任务的特征空间
         proj = self.task_proj[str(task_id)]
         F_T_p = proj['T'](F_T)
         F_I_p = proj['I'](F_I)
         F_M_p = proj['M'](F_M)
+        
         # 3. 软门控加权（router 已对 3 路做 softmax，每行和为 1）
         m_w = self.Router(router_input, task_id)
         c_fusion = (
