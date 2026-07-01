@@ -171,7 +171,76 @@ git commit -m "feat: 改造 weighted_reconstruction_loss 为 denoising_reconstru
         return pred_interp
 ```
 
-**Step 3: 更新 `_forward_impl` 中的注释，反映 task_id 语义变化**
+**Step 3: 扩展 `split_data` 方法以支持 Task A 的张量切分**
+
+Task A 也经过 TimeSeriesEncoder（Transformer），显存占用 O(L²)。当序列超过 MAX_L 时，Task A **必须**和 Task B/C 一起被切块处理，否则超长序列会直接打爆显存。
+
+将 `model/VETime.py` 第 191-246 行的 `split_data` 方法**整体替换**为：
+
+```python
+    def split_data(self, images, time_series, att_mask, labels,
+                   normal_ts=None, mask_normal_ts=None, normal_mask=None):
+        """
+        Split batched time-series data into chunks of length <= max_len along the time dimension (dim=1).
+
+        Args:
+            images:          [B, C, H, T]
+            time_series:     [B, T, F]
+            att_mask:        [B, T]
+            labels:          [B, T] or [B, T, 1]
+            normal_ts:       [B, T, F] 可选，Task A 的正常序列目标
+            mask_normal_ts:  [B, T, F] 可选，Task A 的掩码后正常序列输入
+            normal_mask:     [B, T] 可选，Task A 的掩码位置
+
+        Returns:
+            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk,
+                              normal_ts_chunk, mask_normal_ts_chunk, normal_mask_chunk), ...]
+        """
+        B, T, _ = time_series.shape
+        if T != labels.shape[1]:
+            raise ValueError("Data and labels must have the same length in the first dimension.")
+
+        if T % self.patch_size != 0:
+            raise ValueError(f"Total length T={T} is not divisible by patch_size={self.patch_size}.")
+
+        if self.MAX_L < self.patch_size:
+            raise ValueError(f"MAX_length ({self.MAX_L}) must be >= patch_size ({self.patch_size}).")
+
+        # Work in "patch units"
+        num_patches = T // self.patch_size
+        max_patches_per_chunk = self.MAX_L // self.patch_size
+
+        if max_patches_per_chunk == 0:
+            raise ValueError("MAX_length is too small to fit even one patch.")
+
+        min_splits = (num_patches + max_patches_per_chunk - 1) // max_patches_per_chunk
+        base_patches = num_patches // min_splits
+        remainder = num_patches % min_splits
+
+        chunks = []
+        start_time = 0
+
+        for i in range(min_splits):
+            patches_in_this_chunk = base_patches + (1 if i < remainder else 0)
+            chunk_length = patches_in_this_chunk * self.patch_size
+            end_time = start_time + chunk_length
+
+            img_chunk = images[:, :, :, start_time:end_time]
+            ts_chunk = time_series[:, start_time:end_time, :]
+            mask_chunk = att_mask[:, start_time:end_time]
+            label_chunk = labels[:, start_time:end_time]
+
+            normal_ts_chunk = normal_ts[:, start_time:end_time, :] if normal_ts is not None else None
+            mask_normal_ts_chunk = mask_normal_ts[:, start_time:end_time, :] if mask_normal_ts is not None else None
+            normal_mask_chunk = normal_mask[:, start_time:end_time] if normal_mask is not None else None
+
+            chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk,
+                           normal_ts_chunk, mask_normal_ts_chunk, normal_mask_chunk))
+            start_time = end_time
+        return chunks
+```
+
+**Step 4: 更新 `_forward_impl` 中的注释，反映 task_id 语义变化**
 
 将 `model/VETime.py` 第 90-91 行的注释：
 
@@ -194,17 +263,17 @@ git commit -m "feat: 改造 weighted_reconstruction_loss 为 denoising_reconstru
             # 两路任务干净并行：task 1 -> anomaly, task 0 -> denoising reconstruction（与 _forward_impl 一致）
 ```
 
-**Step 4: 验证语法正确**
+**Step 5: 验证语法正确**
 
 Run: `python -c "from model.VETime import VETIME; print('OK')"`
 
 Expected: `OK`（可能因缺少 vision checkpoint 打印警告，但不应报 ImportError/AttributeError）
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add model/VETime.py
-git commit -m "feat: VETime 新增 forward_task_a 轻量1D旁路和 interpolation_head 引用"
+git commit -m "feat: VETime 新增 forward_task_a、interpolation_head 引用，扩展 split_data 支持 Task A 切分"
 ```
 
 ---
@@ -366,88 +435,71 @@ git commit -m "feat: collate_fn 只对 normal_time_series 做掩码，异常序�
 
 **Step 4: 修改训练循环核心 — 长序列 split 分支（第 494-548 行）**
 
-在 `for data_part in data_splits:` 循环**之前**，新增 Task A（Task A 不受 split 影响，用完整序列）：
+🚨 **关键约束**：Task A 经过 TimeSeriesEncoder（Transformer），显存占用 O(L²)。当序列超过 MAX_L 时，Task A **必须**和 Task B/C 一起在 split 循环内部执行，否则超长序列会直接 OOM。
+
+将长序列分支整体替换为：
 
 ```python
-                # === Task A: 纯1D插值（不受 split 影响）===
-                pred_A = model.forward_task_a(mask_normal_ts, att_mask)
-                loss_A = model.denoising_reconstruction_loss(pred_A, normal_ts, att_mask)
-```
-
-**注意**：Task A 的 loss 应该用 `interpolation_loss`，但这里 `pred_A` 已经是 `interpolation_head` 的输出。需要改为：
-
-```python
-                # === Task A: 纯1D插值（不受 split 影响，无需切分序列）===
-                pred_A = model.forward_task_a(mask_normal_ts, att_mask)
-                loss_A = model.interpolation_loss(pred_A, normal_ts, normal_mask)
-```
-
-然后在 split 循环**内部**，将 `weighted_reconstruction_loss` 替换为 `denoising_reconstruction_loss`：
-
-```python
-                        # Task B: 降噪重建
-                        loss02, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
-```
-
-**注意**：split 循环中 `normal_ts` 也需要对应切分。在 split 循环之前准备 `normal_ts_splits`：
-
-```python
-                # Task A: 纯1D插值（不受 split 影响，无需切分序列）
-                pred_A = model.forward_task_a(mask_normal_ts, att_mask)
-                loss_A = model.interpolation_loss(pred_A, normal_ts, normal_mask)
-
-                # 切分 normal_ts 以匹配 data_splits
-                normal_ts_splits = []
-                start = 0
+            if labels.shape[1] > model.MAX_L:
+                # split_data 现在同时切分 normal_ts, mask_normal_ts, normal_mask
+                data_splits = model.split_data(
+                    images, time_series, att_mask, labels,
+                    normal_ts=normal_ts, mask_normal_ts=mask_normal_ts, normal_mask=normal_mask
+                )
+                loss1 = 0
+                loss2 = 0
+                batch_loss_bce = 0
+                batch_loss_mse = 0
+                batch_loss_interp = 0
+                batch_loss_cl = 0
+                batch_loss_e = 0
+                logits_list = []
                 for data_part in data_splits:
-                    chunk_len = data_part[1].shape[1]  # ts_part 的长度
-                    normal_ts_splits.append(normal_ts[:, start:start+chunk_len, :])
-                    start += chunk_len
-```
-
-然后在循环内部使用 `normal_ts_part = normal_ts_splits[idx]`：
-
-```python
-                for idx, data_part in enumerate(data_splits):
                     img_part, ts_part, att_mask_part, label_part = data_part
-                    normal_ts_part = normal_ts_splits[idx]
+                    normal_ts_part, mask_normal_ts_part, normal_mask_part = data_part[4], data_part[5], data_part[6]
+
+                    # === Task A: 纯1D插值（在 split 内部，与 B/C 对称）===
+                    pred_A_part = model.forward_task_a(mask_normal_ts_part, att_mask_part)
+                    loss_A_part = model.interpolation_loss(pred_A_part, normal_ts_part, normal_mask_part)
+
+                    # === Task B & C: 多模态路径 ===
                     images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
-                    loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
-
                     # Task B: 降噪重建
-                    loss02, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
+                    loss_B_part, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
 
+                    # Task C: 异常分类
+                    loss_C_part, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
+
+                    # ========== 两阶段训练范式 ==========
                     if is_stage_1:
                         batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                        loss_C_part = torch.tensor(0.0, device=device)
                     else:
                         batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
 
-                    if is_stage_1:
-                        loss01 = torch.tensor(0.0, device=device)
-
-                    batch_loss_bce += loss01.item()
-                    batch_loss_mse += loss02.item()
+                    batch_loss_bce += loss_C_part.item()
+                    batch_loss_mse += loss_B_part.item()
+                    batch_loss_interp += loss_A_part.item()
                     batch_loss_cl += (0.1 * loss_cl).item()
                     batch_loss_e += batch_loss_e_part.item()
 
-                    loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
-                    loss1 = loss1 + loss01
+                    # 三任务损失累加
+                    loss2 = loss2 + (alpha_recon * loss_B_part) + (alpha_interp * loss_A_part) + 0.1 * loss_cl + batch_loss_e_part
+                    loss1 = loss1 + loss_C_part
                     logits_list.append(logit)
-```
 
-在 split 累加完成后，加入 Task A 的 loss：
+                logits = torch.cat(logits_list, dim=1)
 
-```python
-                # 加入 Task A 的损失（不除以 num_splits，因为只计算了一次）
-                loss2 = loss2 + (alpha_interp * loss_A)
+                num_splits = len(data_splits)
                 if num_splits > 0:
                     loss1 = loss1 / num_splits
-                    loss2 = loss2 / num_splits  # Task A 的 loss 也被平均了
+                    loss2 = loss2 / num_splits
                     batch_loss_bce /= num_splits
                     batch_loss_mse /= num_splits
+                    batch_loss_interp /= num_splits
                     batch_loss_cl /= num_splits
                     batch_loss_e /= num_splits
 ```
@@ -496,23 +548,41 @@ git commit -m "feat: collate_fn 只对 normal_time_series 做掩码，异常序�
             normal_ts = batch['normal_time_series']
 ```
 
+验证循环的 split_data 调用也需要传入 `normal_ts`：
+
+```python
+                data_splits = model.split_data(
+                    images, time_series, att_mask, labels,
+                    normal_ts=normal_ts
+                )
+```
+
+循环内部解包新增 `normal_ts_part`：
+
+```python
+                for data_part in data_splits:
+                    img_part, ts_part, att_mask_part, label_part = data_part[:4]
+                    normal_ts_part = data_part[4]
+```
+
 将所有 `model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)` 替换为：
 
 ```python
 model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
 ```
 
-对于验证的 split 分支，同样需要切分 `normal_ts`。
+注意：验证循环不需要 Task A（不训练插值），所以 `mask_normal_ts` 和 `normal_mask` 不需要传入 split_data，但返回值结构仍然包含它们（为 None），需要用 `data_part[:4]` 解包。
 
 **Step 7: 修改 multivariate 训练循环（第 1528-1639 行）**
 
 与 univariate 训练循环完全相同的模式：
 1. batch 解包加入 `normal_ts`, `mask_normal_ts`, `normal_mask`
 2. 新增 `alpha_interp` 超参数
-3. Task A 独立前向
-4. `weighted_reconstruction_loss` → `denoising_reconstruction_loss`，目标改为 `normal_ts`
-5. 三任务损失组合
-6. 更新日志
+3. split_data 调用传入 `normal_ts`, `mask_normal_ts`, `normal_mask`
+4. **Task A 在 split 循环内部执行**（与 Task B/C 对称，防止超长序列 OOM）
+5. `weighted_reconstruction_loss` → `denoising_reconstruction_loss`，目标改为 `normal_ts`
+6. 三任务损失组合
+7. 更新日志
 
 **Step 8: Commit**
 
