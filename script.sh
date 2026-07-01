@@ -30,6 +30,6 @@ export CUBLAS_WORKSPACE_CONFIG=':4096:8'
     --num_workers 4 \
     --use_vectorized_fold \
     --dynamic_batch \
-    --val_ratio 0.05 \
+    --val_ratio 0.1 \
     --val_mode split \
     --seed 64
