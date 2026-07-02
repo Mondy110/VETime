@@ -467,14 +467,15 @@ def train_univariate(args):
         # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
         is_stage_1 = epoch < args.stage1_epochs
         if is_stage_1:
-            print(f"[Stage 1] Epoch {epoch+1}/{epochs}: 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+            print(f"[Stage 1] Epoch {epoch+1}/{epochs}: 插值(A)+降噪重建(B)预训练 (异常分类损失已切断)")
         else:
-            print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
+            print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 三任务联合训练 插值(A)+降噪重建(B)+异常分类(C)")
 
         model.train()
         total_loss = 0
         total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
         total_loss_mse = 0  # 重建损失 (MSE)
+        total_loss_interp = 0  # 插值损失 (Task A)
         total_loss_cl = 0   # 对比学习损失
         total_loss_e = 0    # 门控平衡损失 (Expert Balance)
         all_probs, all_preds, all_labels = [], [], []
@@ -484,56 +485,65 @@ def train_univariate(args):
             labels = batch["labels"]
             images = batch["image"]  # (B, C, H, W)
             time_series, att_mask = batch['time_series'], batch['attention_mask']
-            mask = batch['mask']
+            normal_ts = batch['normal_time_series']
+            mask_normal_ts = batch['mask_normal_ts']
+            normal_mask = batch['normal_mask']
             period = batch['period']
             p_value = batch['padding_value']
 
             # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
-            alpha_recon = 0.05  
+            alpha_recon = 0.05
+            # Task A 插值权重（新增超参数，需要调参）
+            alpha_interp = 0.1  
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(
+                    images, time_series, att_mask, labels,
+                    normal_ts=normal_ts, mask_normal_ts=mask_normal_ts, normal_mask=normal_mask
+                )
                 loss1 = 0
                 loss2 = 0
                 batch_loss_bce = 0
                 batch_loss_mse = 0
+                batch_loss_interp = 0
                 batch_loss_cl = 0
                 batch_loss_e = 0
                 logits_list = []
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part = data_part[:4]
+                    normal_ts_part, mask_normal_ts_part, normal_mask_part = data_part[4], data_part[5], data_part[6]
+
+                    # === Task A: 纯1D插值（在 split 内部，与 B/C 对称，防止超长序列 OOM）===
+                    local_emb_A_part = model.forward_task_a(mask_normal_ts_part, att_mask_part)
+                    loss_A_part = model.interpolation_loss(local_emb_A_part, normal_ts_part, normal_mask_part)
+
+                    # === Task B & C: 多模态路径 ===
                     images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
-                    loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
-                    
-                    # 这是我们要缩放的纯重构损失
-                    loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
+                    # Task B: 降噪重建
+                    loss_B_part, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
 
-                    # ========== 两阶段训练范式：门控负载均衡损失 ==========
-                    # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
-                    # 阶段2: 恢复双分支计算
+                    # Task C: 异常分类
+                    loss_C_part, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
+
+                    # ========== 两阶段训练范式 ==========
                     if is_stage_1:
                         batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                        loss_C_part = torch.tensor(0.0, device=device)
                     else:
                         batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
 
-                    # ========== 两阶段训练范式：异常分类损失 ==========
-                    # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
-                    # 阶段2: 恢复正常的异常分类损失
-                    if is_stage_1:
-                        loss01 = torch.tensor(0.0, device=device)
-
-                    # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
-                    batch_loss_bce += loss01.item()
-                    batch_loss_mse += loss02.item() 
+                    batch_loss_bce += loss_C_part.item()
+                    batch_loss_mse += loss_B_part.item()
+                    batch_loss_interp += loss_A_part.item()
                     batch_loss_cl += (0.1 * loss_cl).item()
                     batch_loss_e += batch_loss_e_part.item()
 
-                    # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
-                    loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
-                    loss1 = loss1 + loss01
+                    # 三任务损失累加
+                    loss2 = loss2 + (alpha_recon * loss_B_part) + (alpha_interp * loss_A_part) + 0.1 * loss_cl + batch_loss_e_part
+                    loss1 = loss1 + loss_C_part
                     logits_list.append(logit)
 
                 logits = torch.cat(logits_list, dim=1)
@@ -544,39 +554,40 @@ def train_univariate(args):
                     loss2 = loss2 / num_splits
                     batch_loss_bce /= num_splits
                     batch_loss_mse /= num_splits
+                    batch_loss_interp /= num_splits
                     batch_loss_cl /= num_splits
                     batch_loss_e /= num_splits
 
             else:
+                # === Task A: 纯1D插值（极快，无图像开销）===
+                local_emb_A = model.forward_task_a(mask_normal_ts, att_mask)
+                loss_A = model.interpolation_loss(local_emb_A, normal_ts, normal_mask)
+
+                # === Task B & C: 多模态路径 ===
                 images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, time_series, att_mask, init_img_size, labels)
 
-                loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
+                # Task B: 降噪重建 — 全局 MSE vs normal_time_series
+                loss_B, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts, att_mask)
 
-                # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
-                loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
+                # Task C: 异常分类
+                loss_C, logits = model.anomaly_detection_loss(local_embeddings1, labels)
 
-                # ========== 两阶段训练范式：门控负载均衡损失 ==========
-                # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
-                # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
+                # ========== 两阶段训练范式 ==========
                 if is_stage_1:
+                    loss_C = torch.tensor(0.0, device=device)
                     loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
                 else:
                     loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
 
-                # ========== 两阶段训练范式：异常分类损失 ==========
-                # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
-                # 阶段2: 恢复正常的异常分类损失
-                if is_stage_1:
-                    loss1 = torch.tensor(0.0, device=device)
-                
-                # 【核心修改】只对 loss_recon 乘以缩放系数
-                loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
+                # 三任务损失组合
+                loss2 = (alpha_recon * loss_B) + (alpha_interp * loss_A) + loss_e_tensor + 0.1 * loss_cl
 
                 # 提取纯数值用于打 log
-                batch_loss_bce = loss1.item()
-                batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
+                batch_loss_bce = loss_C.item()
+                batch_loss_mse = loss_B.item()
+                batch_loss_interp = loss_A.item()
                 batch_loss_cl = (0.1 * loss_cl).item()
                 batch_loss_e = loss_e_tensor.item()
 
@@ -606,17 +617,18 @@ def train_univariate(args):
             total_loss += batch_loss
             total_loss_bce += batch_loss_bce
             total_loss_mse += batch_loss_mse
+            total_loss_interp += batch_loss_interp
             total_loss_cl += batch_loss_cl
             total_loss_e += batch_loss_e
-            progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+            progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "Interp": f"{batch_loss_interp:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
 
             # ========== TensorBoard 深度监控 ==========
-            # 任务1: 记录 batch 级别的损失和学习率
             if global_step > 0:
                 accelerator.log({
                     "Loss/Total": batch_loss,
                     "Loss/BCE_Anomaly": batch_loss_bce,
-                    "Loss/MSE_Recon": batch_loss_mse,
+                    "Loss/MSE_Denoise": batch_loss_mse,
+                    "Loss/Interp_TaskA": batch_loss_interp,
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
@@ -659,8 +671,8 @@ def train_univariate(args):
 
             # 清理变量
             del images_folded, logits, loss1, probs, preds, labels, loss2
-            del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
-            del images, time_series, att_mask, init_img_size
+            del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, period, p_value
+            del images, time_series, att_mask, init_img_size, normal_ts, mask_normal_ts, normal_mask
 
         # epoch 结束时 flush 剩余梯度
         if args.dynamic_batch and accumulated_samples > 0:
@@ -859,16 +871,19 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
             labels = batch["labels"]
             images = batch["image"]
             time_series, att_mask = batch['time_series'], batch['attention_mask']
+            normal_ts = batch['normal_time_series']
             period = batch['period']
             p_value = batch['padding_value']
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(
+                    images, time_series, att_mask, labels, normal_ts=normal_ts)
                 loss1_total = 0
                 loss2_total = 0
 
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part = data_part[:4]
+                    normal_ts_part = data_part[4]
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
@@ -876,8 +891,8 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                         images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
                     loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
-                    loss02, _ = model.weighted_reconstruction_loss(
-                        local_embeddings2, ts_part, att_mask_part, label_part)
+                    loss02, _ = model.denoising_reconstruction_loss(
+                        local_embeddings2, normal_ts_part, att_mask_part)
 
                     loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
@@ -891,8 +906,8 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                     images_folded, time_series, att_mask, init_img_size, labels)
 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
-                loss2, _ = model.weighted_reconstruction_loss(
-                    local_embeddings2, time_series, att_mask, labels)
+                loss2, _ = model.denoising_reconstruction_loss(
+                    local_embeddings2, normal_ts, att_mask)
                 loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
@@ -1115,16 +1130,19 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
             labels = batch["labels"]
             images = batch["image"]
             time_series, att_mask = batch['time_series'], batch['attention_mask']
+            normal_ts = batch['normal_time_series']
             period = batch['period']
             p_value = batch['padding_value']
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(
+                    images, time_series, att_mask, labels, normal_ts=normal_ts)
                 loss1_total = 0
                 loss2_total = 0
 
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part = data_part[:4]
+                    normal_ts_part = data_part[4]
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
@@ -1132,8 +1150,8 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                         images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
                     loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
-                    loss02, _ = model.weighted_reconstruction_loss(
-                        local_embeddings2, ts_part, att_mask_part, label_part)
+                    loss02, _ = model.denoising_reconstruction_loss(
+                        local_embeddings2, normal_ts_part, att_mask_part)
 
                     loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     loss1_total = loss1_total + loss01
@@ -1147,8 +1165,8 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                     images_folded, time_series, att_mask, init_img_size, labels)
 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
-                loss2, _ = model.weighted_reconstruction_loss(
-                    local_embeddings2, time_series, att_mask, labels)
+                loss2, _ = model.denoising_reconstruction_loss(
+                    local_embeddings2, normal_ts, att_mask)
                 loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
@@ -1505,9 +1523,9 @@ def train_multivariate(args, config: Dict[str, Any]):
             # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
             is_stage_1 = epoch < args.stage1_epochs
             if is_stage_1:
-                print(f"[Stage 1] Epoch {epoch+1}/{epochs} (dim={current_dim}): 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+                print(f"[Stage 1] Epoch {epoch+1}/{epochs} (dim={current_dim}): 插值(A)+降噪重建(B)预训练 (异常分类损失已切断)")
             else:
-                print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
+                print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 三任务联合训练 插值(A)+降噪重建(B)+异常分类(C)")
 
             # 显存监控
             if torch.cuda.is_available():
@@ -1518,6 +1536,7 @@ def train_multivariate(args, config: Dict[str, Any]):
             total_loss = 0
             total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
             total_loss_mse = 0  # 重建损失 (MSE)
+            total_loss_interp = 0  # 插值损失 (Task A)
             total_loss_cl = 0   # 对比学习损失
             total_loss_e = 0    # 门控平衡损失 (Expert Balance)
             all_probs, all_preds, all_labels = [], [], []
@@ -1529,55 +1548,62 @@ def train_multivariate(args, config: Dict[str, Any]):
                 labels = batch["labels"]
                 images = batch["image"]
                 time_series, att_mask = batch['time_series'], batch['attention_mask']
-                mask = batch['mask']
+                normal_ts = batch['normal_time_series']
+                mask_normal_ts = batch['mask_normal_ts']
+                normal_mask = batch['normal_mask']
                 period = batch['period']
                 p_value = batch['padding_value']
-                # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
-                alpha_recon = 0.05  
+                alpha_recon = 0.05
+                alpha_interp = 0.1
 
                 if labels.shape[1] > model.MAX_L:
-                    data_splits = model.split_data(images, time_series, att_mask, labels)
+                    data_splits = model.split_data(
+                        images, time_series, att_mask, labels,
+                        normal_ts=normal_ts, mask_normal_ts=mask_normal_ts, normal_mask=normal_mask
+                    )
                     loss1 = 0
                     loss2 = 0
                     batch_loss_bce = 0
                     batch_loss_mse = 0
+                    batch_loss_interp = 0
                     batch_loss_cl = 0
                     batch_loss_e = 0
                     logits_list = []
                     for data_part in data_splits:
-                        img_part, ts_part, att_mask_part, label_part = data_part
+                        img_part, ts_part, att_mask_part, label_part = data_part[:4]
+                        normal_ts_part, mask_normal_ts_part, normal_mask_part = data_part[4], data_part[5], data_part[6]
+
+                        # === Task A: 纯1D插值（在 split 内部，与 B/C 对称，防止超长序列 OOM）===
+                        local_emb_A_part = model.forward_task_a(mask_normal_ts_part, att_mask_part)
+                        loss_A_part = model.interpolation_loss(local_emb_A_part, normal_ts_part, normal_mask_part)
+
+                        # === Task B & C: 多模态路径 ===
                         images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
                         local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
 
-                        loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
-                        
-                        # 这是我们要缩放的纯重构损失
-                        loss02, rec = model.weighted_reconstruction_loss(local_embeddings2, ts_part, att_mask_part, label_part)
+                        # Task B: 降噪重建
+                        loss_B_part, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts_part, att_mask_part)
 
-                        # ========== 两阶段训练范式：门控负载均衡损失 ==========
-                        # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
-                        # 阶段2: 恢复双分支计算
+                        # Task C: 异常分类
+                        loss_C_part, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
+
+                        # ========== 两阶段训练范式 ==========
                         if is_stage_1:
                             batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                            loss_C_part = torch.tensor(0.0, device=device)
                         else:
                             batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
 
-                        # ========== 两阶段训练范式：异常分类损失 ==========
-                        # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
-                        # 阶段2: 恢复正常的异常分类损失
-                        if is_stage_1:
-                            loss01 = torch.tensor(0.0, device=device)
-
-                        # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
-                        batch_loss_bce += loss01.item()
-                        batch_loss_mse += loss02.item() 
+                        batch_loss_bce += loss_C_part.item()
+                        batch_loss_mse += loss_B_part.item()
+                        batch_loss_interp += loss_A_part.item()
                         batch_loss_cl += (0.1 * loss_cl).item()
                         batch_loss_e += batch_loss_e_part.item()
 
-                        # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
-                        loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
-                        loss1 = loss1 + loss01
+                        # 三任务损失累加
+                        loss2 = loss2 + (alpha_recon * loss_B_part) + (alpha_interp * loss_A_part) + 0.1 * loss_cl + batch_loss_e_part
+                        loss1 = loss1 + loss_C_part
                         logits_list.append(logit)
 
                     logits = torch.cat(logits_list, dim=1)
@@ -1588,39 +1614,40 @@ def train_multivariate(args, config: Dict[str, Any]):
                         loss2 = loss2 / num_splits
                         batch_loss_bce /= num_splits
                         batch_loss_mse /= num_splits
+                        batch_loss_interp /= num_splits
                         batch_loss_cl /= num_splits
                         batch_loss_e /= num_splits
 
                 else:
+                    # === Task A: 纯1D插值（极快，无图像开销）===
+                    local_emb_A = model.forward_task_a(mask_normal_ts, att_mask)
+                    loss_A = model.interpolation_loss(local_emb_A, normal_ts, normal_mask)
+
+                    # === Task B & C: 多模态路径 ===
                     images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, time_series, att_mask, init_img_size, labels)
 
-                    loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
+                    # Task B: 降噪重建
+                    loss_B, rec = model.denoising_reconstruction_loss(local_embeddings2, normal_ts, att_mask)
 
-                    # 为了代码清晰，原有的 loss2 重命名为 loss_recon，代表纯重构损失
-                    loss_recon, rec = model.weighted_reconstruction_loss(local_embeddings2, time_series, att_mask, labels)
+                    # Task C: 异常分类
+                    loss_C, logits = model.anomaly_detection_loss(local_embeddings1, labels)
 
-                    # ========== 两阶段训练范式：门控负载均衡损失 ==========
-                    # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
-                    # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
+                    # ========== 两阶段训练范式 ==========
                     if is_stage_1:
+                        loss_C = torch.tensor(0.0, device=device)
                         loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
                     else:
                         loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
 
-                    # ========== 两阶段训练范式：异常分类损失 ==========
-                    # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
-                    # 阶段2: 恢复正常的异常分类损失
-                    if is_stage_1:
-                        loss1 = torch.tensor(0.0, device=device)
-                    
-                    # 【核心修改】只对 loss_recon 乘以缩放系数
-                    loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
+                    # 三任务损失组合
+                    loss2 = (alpha_recon * loss_B) + (alpha_interp * loss_A) + loss_e_tensor + 0.1 * loss_cl
 
                     # 提取纯数值用于打 log
-                    batch_loss_bce = loss1.item()
-                    batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
+                    batch_loss_bce = loss_C.item()
+                    batch_loss_mse = loss_B.item()
+                    batch_loss_interp = loss_A.item()
                     batch_loss_cl = (0.1 * loss_cl).item()
                     batch_loss_e = loss_e_tensor.item()
 
@@ -1650,17 +1677,18 @@ def train_multivariate(args, config: Dict[str, Any]):
                 total_loss += batch_loss
                 total_loss_bce += batch_loss_bce
                 total_loss_mse += batch_loss_mse
+                total_loss_interp += batch_loss_interp
                 total_loss_cl += batch_loss_cl
                 total_loss_e += batch_loss_e
-                progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+                progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "Interp": f"{batch_loss_interp:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
 
                 # ========== TensorBoard 深度监控 ==========
-                # 任务1: 记录 batch 级别的损失和学习率
                 if global_step > 0:
                     accelerator.log({
                         "Loss/Total": batch_loss,
                         "Loss/BCE_Anomaly": batch_loss_bce,
-                        "Loss/MSE_Recon": batch_loss_mse,
+                        "Loss/MSE_Denoise": batch_loss_mse,
+                        "Loss/Interp_TaskA": batch_loss_interp,
                         "Loss/CL_Contrastive": batch_loss_cl,
                         "Loss/Balance": batch_loss_e,
                         "Train/LR": optimizer.param_groups[0]['lr'],
@@ -1708,8 +1736,8 @@ def train_multivariate(args, config: Dict[str, Any]):
                     del labels
 
                 del images_folded, logits, loss1, loss2
-                del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
-                del images, time_series, att_mask, init_img_size
+                del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, period, p_value
+                del images, time_series, att_mask, init_img_size, normal_ts, mask_normal_ts, normal_mask
 
                 # 定期显存监控
                 if global_step % 100 == 0 and torch.cuda.is_available():

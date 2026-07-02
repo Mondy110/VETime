@@ -249,15 +249,16 @@ def collate_fn(
     for i, length in enumerate(sequence_lengths):
         attention_mask[i, length:] = False
 
-    mask_time_series, mask = create_random_mask(padded_time_series, attention_mask, patch_size)
-    normal_time_series_tensors, mask = create_random_mask(normal_time_series_tensors, attention_mask, patch_size)
+    # Task A: 只对正常序列做掩码（插值任务）
+    # Task B/C: 异常序列保持原样（不掩码）
+    mask_normal_ts, normal_mask = create_random_mask(normal_time_series_tensors, attention_mask, patch_size)
 
     return {
         'time_series': padded_time_series,
         'normal_time_series': normal_time_series_tensors,
-        'mask_time_series': mask_time_series,
+        'mask_normal_ts': mask_normal_ts,
+        'normal_mask': normal_mask,
         'image': image_inputs,
-        'mask': mask,
         'labels': padded_labels,
         'attention_mask': attention_mask,
         'period': period,

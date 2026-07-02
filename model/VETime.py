@@ -42,6 +42,7 @@ class VETIME(TS_Model):
         self.projection_layer = self.ts_encoder.ts_encoder.projection_layer
         self.reconstruction_head = ts_model.reconstruction_head
         self.anomaly_head = ts_model.anomaly_head
+        self.interpolation_head = ts_model.interpolation_head
         self.d_proj=ts_model.d_proj
 
         # fusion setting
@@ -67,6 +68,11 @@ class VETIME(TS_Model):
                 hidden_states, time_series, att_mask, init_img_size, labels
             )
 
+    def forward_task_a(self, mask_normal_ts, att_mask):
+        """Task A: 纯1D时序插值 — 轻量旁路，绝不触发 Vision Encoder / VTS_Alignment / MMoE"""
+        _, local_embeddings, _ = self.ts_encoder(mask_normal_ts, att_mask)
+        return local_embeddings
+
     def _forward_impl(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
                       att_mask: Optional[torch.Tensor] = None, init_img_size=None, labels=None):
         """实际的 forward 实现"""
@@ -87,8 +93,9 @@ class VETIME(TS_Model):
         I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
-        # 两路任务干净并行：task 1 -> anomaly head(local_emb1), task 0 -> reconstruction head(local_emb2)
-        # 任务映射保持与原实现一致（原 mask=None 分支 = task 1 = anomaly）。
+        # 两路任务：task 1 -> anomaly head(local_emb1), task 0 -> denoising reconstruction head(local_emb2)
+        # task 0 语义：降噪重建 — 把融合了图文特征的隐变量拉回正常时序空间
+        # task 1 语义：异常分类 — 点级别二分类
         mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
         mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
         # 路由权重以 dict 单独保存（不再 m_w1+m_w2 破坏概率分布），供 load_balance_loss 各自平衡
@@ -140,7 +147,7 @@ class VETIME(TS_Model):
 
         # Part 3: MoE + projection (使用 checkpoint)
         def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
-            # 两路任务干净并行：task 1 -> anomaly, task 0 -> reconstruction（与 _forward_impl 一致）
+            # 两路任务干净并行：task 1 -> anomaly, task 0 -> denoising reconstruction（与 _forward_impl 一致）
             mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
             mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
 
@@ -188,41 +195,42 @@ class VETIME(TS_Model):
             self.ts_encoder.ts_encoder.gradient_checkpointing_disable()
         print("[INFO] Gradient checkpointing disabled")
 
-    def split_data(self,images, time_series, att_mask, labels):
+    def split_data(self,images, time_series, att_mask, labels,
+                   normal_ts=None, mask_normal_ts=None, normal_mask=None):
         """
         Split batched time-series data into chunks of length <= max_len along the time dimension (dim=1).
-        
+
         Args:
-            images:       [B, T, ...]
-            time_series:  [B, T, F]
-            att_mask:     [B, T]
-            labels:       [B, T] or [B, T, 1]
-            max_len:      int, maximum sequence length per chunk
+            images:          [B, C, H, T]
+            time_series:     [B, T, F]
+            att_mask:        [B, T]
+            labels:          [B, T] or [B, T, 1]
+            normal_ts:       [B, T, F] 可选，Task A 的正常序列目标
+            mask_normal_ts:  [B, T, F] 可选，Task A 的掩码后正常序列输入
+            normal_mask:     [B, T] 可选，Task A 的掩码位置
 
         Returns:
-            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk), ...]
+            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk,
+                              normal_ts_chunk, mask_normal_ts_chunk, normal_mask_chunk), ...]
         """
-        B, T,_ = time_series.shape
+        B, T, _ = time_series.shape
         if T != labels.shape[1]:
             raise ValueError("Data and labels must have the same length in the first dimension.")
-        
+
         if T % self.patch_size != 0:
             raise ValueError(f"Total length T={T} is not divisible by patch_size={self.patch_size}.")
-        
+
         if self.MAX_L < self.patch_size:
             raise ValueError(f"MAX_length ({self.MAX_L}) must be >= patch_size ({self.patch_size}).")
 
         # Work in "patch units"
         num_patches = T // self.patch_size
-        max_patches_per_chunk = self.MAX_L // self.patch_size  # floor division
+        max_patches_per_chunk = self.MAX_L // self.patch_size
 
         if max_patches_per_chunk == 0:
             raise ValueError("MAX_length is too small to fit even one patch.")
 
-        # Minimum number of chunks needed
         min_splits = (num_patches + max_patches_per_chunk - 1) // max_patches_per_chunk
-
-        # Now distribute num_patches into min_splits chunks as evenly as possible
         base_patches = num_patches // min_splits
         remainder = num_patches % min_splits
 
@@ -231,17 +239,20 @@ class VETIME(TS_Model):
 
         for i in range(min_splits):
             patches_in_this_chunk = base_patches + (1 if i < remainder else 0)
-            chunk_length = patches_in_this_chunk * self.patch_size  # back to time steps
+            chunk_length = patches_in_this_chunk * self.patch_size
             end_time = start_time + chunk_length
 
-            
-            # Slice all tensors along time dimension (dim=1)
-            img_chunk = images[:, :,:,start_time:end_time]          # [B, L, ...]
-            ts_chunk = time_series[:, start_time:end_time,:]      # [B, L, F]
-            mask_chunk = att_mask[:, start_time:end_time]       # [B, L]
-            label_chunk = labels[:, start_time:end_time]        # [B, L] or [B, L, 1]
-            
-            chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk))
+            img_chunk = images[:, :, :, start_time:end_time]
+            ts_chunk = time_series[:, start_time:end_time, :]
+            mask_chunk = att_mask[:, start_time:end_time]
+            label_chunk = labels[:, start_time:end_time]
+
+            normal_ts_chunk = normal_ts[:, start_time:end_time, :] if normal_ts is not None else None
+            mask_normal_ts_chunk = mask_normal_ts[:, start_time:end_time, :] if mask_normal_ts is not None else None
+            normal_mask_chunk = normal_mask[:, start_time:end_time] if normal_mask is not None else None
+
+            chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk,
+                           normal_ts_chunk, mask_normal_ts_chunk, normal_mask_chunk))
             start_time = end_time
         return chunks
 

@@ -26,7 +26,7 @@ def ts2image_Test(
     T_sqrt: bool = False,
     img_size: int = 224,
     make_RGB: bool = True,
-    decomp_method: str = 'srd',
+    decomp_method: str = 'ma',
     max_iter: int = 1,
     robust_sigma: float = 3.0,
     compress_ratio: float = 0.1
@@ -101,7 +101,7 @@ def ts2image_1d(
     patch_size: int,
     h_size: int = 1,
     make_RGB: bool = True,
-    decomp_method: str = 'srd',
+    decomp_method: str = 'ma',
     max_iter: int = 1,
     robust_sigma: float = 3.0,
     compress_ratio: float = 0.1

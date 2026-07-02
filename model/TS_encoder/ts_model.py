@@ -47,6 +47,20 @@ class TS_Model(nn.Module):
             nn.Linear(self.d_proj // 2, 2)  # binary classification
         )
 
+        # Interpolation head for Task A (unimodal interpolation on normal sequences)
+        self.interpolation_head = nn.Sequential(
+            nn.LayerNorm(self.d_proj),
+            nn.Linear(self.d_proj, self.d_proj * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(self.d_proj * 4),
+            nn.Linear(self.d_proj * 4, self.d_proj * 4),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.LayerNorm(self.d_proj * 4),
+            nn.Linear(self.d_proj * 4, 1)
+        )
+
     def forward(self,time_series: torch.Tensor, mask: Optional[torch.Tensor] = None):
         
         patch_embeddings,local_embeddings,full_mask=self.ts_encoder(time_series,mask)
@@ -71,55 +85,71 @@ class TS_Model(nn.Module):
         error = (reconstructed - original_time_series).abs()
         return reconstruction_loss,error
     
-    def weighted_reconstruction_loss(
+    def denoising_reconstruction_loss(
         self,
         local_embeddings: torch.Tensor,
-        original_time_series: torch.Tensor,
-        mask: torch.Tensor,
-        labels: torch.Tensor,
+        normal_time_series: torch.Tensor,
+        att_mask: torch.Tensor,
     ):
         """
-        Compute weighted reconstruction loss with optional mask weakening,
-        and return the self-similarity matrix of reconstructed features.
+        Task B: 降噪重建损失 — 全局 MSE。
+
+        输入是异常序列的 embedding，目标是正常序列。
+        强迫模型把异常尖峰"压平"回正常态。
+        只排除 padding 位置，无 mask/label 过滤。
 
         Args:
-            local_embeddings: [B, seq_len, d_proj]
-            original_time_series: [B, seq_len, 1] or [B, seq_len, C]
-            mask: [B, seq_len], bool or float (1 = masked)
-            mask_weight: weight for masked positions (e.g., 0.5 to weaken)
+            local_embeddings: [B, seq_len, num_features, d_proj]
+            normal_time_series: [B, seq_len, num_features] 正常时序目标
+            att_mask: [B, seq_len] bool，True=有效位置
 
         Returns:
-            total_loss: scalar loss
-            error: absolute error per position [B, seq_len, C]
-            sim_matrix: self-similarity matrix of reconstructed embeddings [B, seq_len, seq_len]
+            loss: scalar MSE loss
+            reconstructed: [B, seq_len, num_features] 重建结果
         """
-        batch_size, seq_len, num_f = original_time_series.shape
-        device = original_time_series.device
-        # Ensure mask is boolean
-        if not mask.dtype == torch.bool:
-            mask = mask > 0.5  # threshold if float mask
+        reconstructed = self.reconstruction_head(local_embeddings).squeeze(-1)  # [B, seq_len, num_features]
 
-        # Reconstruct time series from embeddings
-        reconstructed = self.reconstruction_head(local_embeddings).squeeze(-1)  # [B, seq_len, C]
-        
+        # 只在有效位置计算（排除 padding）
+        if not att_mask.dtype == torch.bool:
+            att_mask = att_mask.bool()
+        valid = att_mask  # [B, seq_len]
 
-        effective_mask = mask.clone()  # [B, L]
-        if labels is not None:
-            labels = labels.bool()  # [B, L]
-            effective_mask = effective_mask & (~labels)
+        # 扩展 valid 到 num_features 维度
+        num_features = normal_time_series.shape[-1] if normal_time_series.dim() == 3 else 1
+        valid_expanded = valid.unsqueeze(-1).expand(-1, -1, num_features)  # [B, seq_len, num_features]
 
-        flat_mask = effective_mask.view(-1)
-
-       
-        reconstruction_loss = F.mse_loss(
-            reconstructed.reshape(-1, num_f)[flat_mask],
-            original_time_series.reshape(-1, num_f)[flat_mask],
+        loss = F.mse_loss(
+            reconstructed[valid_expanded],
+            normal_time_series[valid_expanded],
         )
 
-        emb_norm = F.normalize(local_embeddings.flatten(2), p=2, dim=-1)  # [B, seq_len, d_proj]
-        # sim_matrix = torch.bmm(emb_norm, emb_norm.transpose(1, 2))  # [B, seq_len, seq_len]
+        return loss, reconstructed
 
-        return reconstruction_loss, reconstructed
+    def interpolation_loss(self, local_embeddings, normal_time_series, mask):
+        """
+        Task A: 插值损失 — 只在被掩码位置计算 MSE。
+
+        Args:
+            local_embeddings: [B, seq_len, num_features, d_proj]
+            normal_time_series: [B, seq_len, num_features] 原始正常时序
+            mask: [B, seq_len] bool，True=被掩码的位置
+
+        Returns:
+            loss: scalar MSE loss on masked positions
+        """
+        pred = self.interpolation_head(local_embeddings).squeeze(-1)  # [B, seq_len, num_features]
+
+        if not mask.dtype == torch.bool:
+            mask = mask.bool()
+
+        num_features = normal_time_series.shape[-1] if normal_time_series.dim() == 3 else 1
+        mask_expanded = mask.unsqueeze(-1).expand(-1, -1, num_features)
+
+        loss = F.mse_loss(
+            pred[mask_expanded],
+            normal_time_series[mask_expanded],
+        )
+        return loss
     
     def anomaly_detection_loss(self,
                                local_embeddings: torch.Tensor,
