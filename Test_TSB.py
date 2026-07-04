@@ -446,7 +446,7 @@ def TSB_test_parallel_postprocess(
     data_setting=DATA_INIT_SETTING,
     dataset_setting=PASS_LIST,
     use_list=None,
-    num_workers=24,
+    num_workers=None,
     verbose=True
 ):
     # 如果没有提供 use_list，使用全局的 USE_LIST
@@ -475,7 +475,14 @@ def TSB_test_parallel_postprocess(
 
     results = []
     ctx = mp.get_context('spawn')
-    safe_workers = min(num_workers, mp.cpu_count() - 2)
+    # 动态 worker: 未指定时取 cpu_count - 2 (留 2 核给系统/主进程)
+    cpu_cnt = mp.cpu_count()
+    if num_workers is None:
+        safe_workers = max(1, cpu_cnt - 2)
+    else:
+        safe_workers = min(num_workers, max(1, cpu_cnt - 2))
+    if verbose:
+        print(f"[INFO] CPU cores: {cpu_cnt}, using {safe_workers} workers for post-processing")
     with ProcessPoolExecutor(max_workers=safe_workers, mp_context=ctx) as executor:
         futures = [executor.submit(_process_single_result_file, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
@@ -587,8 +594,8 @@ if __name__ == '__main__':
                         , help='VETime_weight')
     parser.add_argument('--vision_name', type=str, default='mae_visualize_base.pth'
                         , help='vision_weight')
-    parser.add_argument('--num_workers', type=int, default=10
-                        , help='Number of workers for parallel processing')
+    parser.add_argument('--num_workers', type=int, default=None
+                        , help='Number of workers for parallel processing (default: dynamic, cpu_count-2)')
 
     args_test = parser.parse_args()
 

@@ -355,8 +355,11 @@ class basic_metricor():
 
 
     def metric_Affiliation(self, label, score, preds=None):
-        from .affiliation.generics import convert_vector_to_events
+        from .affiliation.generics import convert_vector_to_events, _len_wo_nan, _sum_wo_nan
         from .affiliation.metrics import pr_from_events
+        from .affiliation._affiliation_zone import get_all_E_gt_func, affiliation_partition
+        from .affiliation._single_ground_truth_event import (
+            affiliation_precision_proba, affiliation_recall_proba)
 
         # Ensure proper data types to avoid float/integer issues
         label = np.asarray(label, dtype=int)
@@ -368,33 +371,35 @@ class basic_metricor():
         if preds is None:
             # print("Calculating afiliation metrics using score thresholds.")
             p_values = np.linspace(0, 1, 1500)
-            # print(f"Using {thresholds} thresholds for affiliation metrics.")
+            # v4: 一次性向量化计算所有阈值, 避免循环内重复 np.quantile
+            thresholds = np.quantile(score, p_values)
+            Trange = (0, len(score))
+            # v1: E_gt 仅依赖 events_gt 和 Trange, 提到循环外计算一次
+            E_gt = get_all_E_gt_func(events_gt, Trange)
             Affiliation_scores = []
             Affiliation_Precision_scores = []
             Affiliation_Recall_scores = []
-            # print("Score values", score)
 
-            for p in tqdm(p_values, total=(len(p_values)), desc="Calculating Affiliation Metrics"):
-                threshold = np.quantile(score, p)
+            for threshold in tqdm(thresholds, total=len(thresholds), desc="Calculating Affiliation Metrics"):
                 preds_loop = (score > threshold).astype(int)
-
                 events_pred = convert_vector_to_events(preds_loop)
-                # events_gt is already calculated
-                Trange = (0, len(preds_loop))
 
-                affiliation_metrics = pr_from_events(events_pred, events_gt, Trange)
+                # 复用预计算的 E_gt, 跳过 pr_from_events 内部重复构建
+                aff_partition = affiliation_partition(events_pred, E_gt)
+                p_precision = [affiliation_precision_proba(Is, J, E)
+                               for Is, J, E in zip(aff_partition, events_gt, E_gt)]
+                p_recall = [affiliation_recall_proba(Is, J, E)
+                            for Is, J, E in zip(aff_partition, events_gt, E_gt)]
 
-                Affiliation_Precision = affiliation_metrics['Affiliation_Precision']
-                Affiliation_Recall = affiliation_metrics['Affiliation_Recall']
+                n_prec = _len_wo_nan(p_precision)
+                Affiliation_Precision = _sum_wo_nan(p_precision) / n_prec if n_prec > 0 else p_precision[0]
+                Affiliation_Recall = sum(p_recall) / len(p_recall)
                 # --- FIX 1: Prevent division by zero ---
                 denominator = Affiliation_Precision + Affiliation_Recall
                 if denominator > 0:
                     Affiliation_F = 2 * Affiliation_Precision * Affiliation_Recall / (denominator + self.eps)
                 else:
                     Affiliation_F = 0.0
-                # # Use a local variable for the F1 score in the loop
-                # Affiliation_F = 2 * Affiliation_Precision * Affiliation_Recall / (
-                #             Affiliation_Precision + Affiliation_Recall + self.eps)
 
                 Affiliation_scores.append(Affiliation_F)
                 Affiliation_Precision_scores.append(Affiliation_Precision)
@@ -481,7 +486,7 @@ class basic_metricor():
     #
     #     return result
 
-    def metric_F1_T(self, labels: torch.Tensor, scores: torch.Tensor, use_parallel=True, 
+    def metric_F1_T(self, labels: torch.Tensor, scores: torch.Tensor, use_parallel=False,
                     parallel_method='chunked', chunk_size=10, max_workers=8):
         """
         Computes the F1 score with optional parallel processing.
@@ -489,7 +494,10 @@ class basic_metricor():
         Args:
             labels: Ground truth labels
             scores: Anomaly scores
-            use_parallel: Whether to use parallel processing (default: True)
+            use_parallel: Whether to use parallel processing (default: False).
+                          Note: ts_precision_and_recall 是纯 Python + torch 操作, 不释放 GIL,
+                          ThreadPoolExecutor 并行等价于串行 + 线程切换开销, 实测比串行慢 1.3-4.9x。
+                          且在 Test_TSB 的 24 进程并行下, 嵌套 8 线程会导致 GIL 争抢风暴。
             parallel_method: Type of parallel processing ('standard' or 'chunked')
             chunk_size: Size of chunks for chunked parallel processing
             max_workers: Maximum number of worker threads
