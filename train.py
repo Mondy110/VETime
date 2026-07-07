@@ -121,6 +121,44 @@ def create_model(args, num_features: int, vision_model, config_v, use_gradient_c
     return model, ts_model
 
 
+def freeze_for_cls_warmup(model, accelerator):
+    """冻结除异常分类相关参数外的所有参数，用于分类头平稳预热。
+
+    可训练参数:
+      - anomaly_head.*            (分类 MLP)
+      - mm_w.task_proj.1.T.*      (分类时序专家投影)
+      - mm_w.task_proj.1.I.*      (分类图像专家投影)
+      - mm_w.task_proj.1.M.*      (分类混合专家投影)
+      - mm_w.Router.*             (任务路由，task_embedding 按任务隔离)
+
+    其余全部冻结（视觉编码器、时序编码器、LoRA、重构头、重构专家、共享 mlp_m、fusion 等）。
+    返回 saved_requires_grad 字典，用于后续恢复。
+    """
+    unwrapped = accelerator.unwrap_model(model)
+    classification_patterns = ['anomaly_head', 'mm_w.task_proj.1.', 'mm_w.Router.']
+    saved_requires_grad = {}
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in unwrapped.named_parameters():
+        saved_requires_grad[name] = param.requires_grad
+        if not any(pattern in name for pattern in classification_patterns):
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen_count += 1
+        else:
+            trainable_count += 1
+    print(f"[Cls Warmup] 冻结 {frozen_count} 个参数组，保留 {trainable_count} 个分类相关参数组可训练")
+    return saved_requires_grad
+
+
+def restore_requires_grad(model, accelerator, saved_requires_grad):
+    """恢复参数的 requires_grad 状态（分类预热结束后调用）。"""
+    unwrapped = accelerator.unwrap_model(model)
+    for name, param in unwrapped.named_parameters():
+        if name in saved_requires_grad:
+            param.requires_grad = saved_requires_grad[name]
+
+
 def train_univariate(args):
     """
     单变量训练：完全保留原有训练逻辑
@@ -471,6 +509,21 @@ def train_univariate(args):
         else:
             print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
 
+        # ========== 分类预热（Classification Warmup）==========
+        # Stage 2 首个 epoch：前 cls_warmup_ratio 比例的 batch 仅训练分类相关参数
+        # 让分类网络先平稳初始化，避免突然引入分类梯度造成巨大震荡
+        is_cls_warmup_epoch = (not is_stage_1) and (epoch == args.stage1_epochs) and (args.cls_warmup_ratio > 0)
+        cls_warmup_active = False
+        saved_requires_grad = None
+        cls_warmup_batches = 0
+        if is_cls_warmup_epoch:
+            cls_warmup_batches = max(1, int(len(train_loader) * args.cls_warmup_ratio))
+            saved_requires_grad = freeze_for_cls_warmup(model, accelerator)
+            cls_warmup_active = True
+            print(f"[Cls Warmup] Epoch {epoch+1}: 前 {cls_warmup_batches}/{len(train_loader)} 个 batch 仅训练分类网络 (ratio={args.cls_warmup_ratio})")
+            print(f"  可训练: anomaly_head, mm_w.task_proj.1.{{T,I,M}}, mm_w.Router")
+            print(f"  已冻结: 视觉编码器、时序编码器(含LoRA)、重构头、重构专家、共享mlp_m、fusion 等")
+
         model.train()
         total_loss = 0
         total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
@@ -480,7 +533,15 @@ def train_univariate(args):
         all_probs, all_preds, all_labels = [], [], []
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]", disable=not accelerator.is_local_main_process)
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
+
+            # ========== 分类预热解冻检查 ==========
+            if cls_warmup_active and batch_idx == cls_warmup_batches:
+                restore_requires_grad(model, accelerator, saved_requires_grad)
+                optimizer.zero_grad()
+                cls_warmup_active = False
+                progress_bar.set_description(f"Epoch {epoch+1}[Train]")
+                print(f"\n[Cls Warmup] 分类预热完成 (batch {batch_idx}/{len(train_loader)})，已解冻所有参数，恢复多任务联合训练")
             labels = batch["labels"]
             images = batch["image"]  # VETime 时域图像 (B, C, H, W)
             images_vico = batch.get("image_vico", None)  # ViCO 频域图像 (B, 3, 224, 224)
@@ -626,6 +687,8 @@ def train_univariate(args):
             total_loss_cl += batch_loss_cl
             total_loss_e += batch_loss_e
             progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+            if cls_warmup_active and batch_idx < cls_warmup_batches:
+                progress_bar.set_description(f"Epoch {epoch+1}[Train|CLS_Warmup]")
 
             # ========== TensorBoard 深度监控 ==========
             # 任务1: 记录 batch 级别的损失和学习率
@@ -662,6 +725,13 @@ def train_univariate(args):
             optimizer.zero_grad()
             global_step += 1
             accumulated_samples = 0
+
+        # 分类预热安全保障：若预热因 batch 数不足未能中途解冻，在此强制恢复
+        if cls_warmup_active:
+            restore_requires_grad(model, accelerator, saved_requires_grad)
+            optimizer.zero_grad()
+            cls_warmup_active = False
+            print(f"[Cls Warmup] Epoch {epoch+1} 结束，强制解冻所有参数（预热覆盖整个 epoch）")
 
         if len(all_probs) > 0:
             # 将收集到的小部分数据拼接起来
@@ -1903,6 +1973,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_epochs', type=int, default=25, help='Epochs number (paper: 25)')
     parser.add_argument('--stage1_epochs', type=int, default=1,
                         help='纯重建预训练的 epoch 数量（两阶段训练：前 stage1_epochs 个 epoch 仅训练重建任务，切断异常分类损失）')
+    parser.add_argument('--cls_warmup_ratio', type=float, default=0.5,
+                        help='分类预热比例：Stage 2 首个 epoch 中，前 cls_warmup_ratio 比例的 batch 仅训练分类相关参数，其余冻结。设为 0 跳过预热')
     parser.add_argument('--early_stop_patience', type=int, default=4, help='Early stopping patience (paper: 4)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Ratio of training data used for validation split')
     parser.add_argument('--val_mode', type=str, default='tsb', choices=['tsb', 'split'],
