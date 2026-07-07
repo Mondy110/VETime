@@ -247,3 +247,76 @@ class M_moe(nn.Module):
             F_M_p * m_w[..., 2:3]
         )
         return c_fusion, m_w
+
+
+class VisualCrossAttention(nn.Module):
+    """
+    纯交叉注意力融合模块：用 VETime 时域特征 (Q) 查询 ViCO 频域特征 (K, V)。
+
+    废除刚性对角假设，让时间域 Query 自适应决定关注哪些频域 patch。
+    Attention Matrix 形状 [B, N_TS, 196]，表示每个时间点与所有频域 patch 的软对齐。
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
+        """
+        Args:
+            d_model: 特征维度
+            num_heads: 多头注意力头数
+            dropout: Dropout 概率
+            ffn_ratio: FFN 扩展比例（默认 4 倍）
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        # 纯交叉注意力：无对角偏置，无位置编码
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            kdim=d_model,
+            vdim=d_model,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Post-norm + 残差结构
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # FFN: Linear -> GELU -> Dropout -> Linear
+        ffn_hidden = int(d_model * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, d_model)
+        )
+
+    def forward(self, Q_visual: torch.Tensor, K_V_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            Q_visual: 时域 Query 特征 [B, N_TS, d]
+            K_V_tokens: 频域 Key/Value tokens [B, 196, d]
+
+        Returns:
+            fused_visual: 融合后的时域特征 [B, N_TS, d]
+        """
+        # 纯交叉注意力：query=Q_visual, key=K_V_tokens, value=K_V_tokens
+        # need_weights=False 启用 Flash Attention
+        attn_out, _ = self.cross_attn(
+            query=Q_visual,
+            key=K_V_tokens,
+            value=K_V_tokens,
+            need_weights=False
+        )
+
+        # 残差 + Post-norm
+        x = Q_visual + self.dropout(attn_out)
+        x = self.norm1(x)
+
+        # FFN + 残差 + Post-norm
+        x = x + self.dropout(self.ffn(x))
+        fused_visual = self.norm2(x)
+
+        return fused_visual
