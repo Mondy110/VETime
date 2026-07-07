@@ -482,14 +482,15 @@ def train_univariate(args):
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]", disable=not accelerator.is_local_main_process)
         for batch in progress_bar:
             labels = batch["labels"]
-            images = batch["image"]  # (B, C, H, W)
+            images = batch["image"]  # VETime 时域图像 (B, C, H, W)
+            images_vico = batch.get("image_vico", None)  # ViCO 频域图像 (B, 3, 224, 224)
             time_series, att_mask = batch['time_series'], batch['attention_mask']
             mask = batch['mask']
             period = batch['period']
             p_value = batch['padding_value']
 
             # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
-            alpha_recon = 0.05  
+            alpha_recon = 0.05
 
             if labels.shape[1] > model.MAX_L:
                 data_splits = model.split_data(images, time_series, att_mask, labels)
@@ -504,7 +505,15 @@ def train_univariate(args):
                     img_part, ts_part, att_mask_part, label_part = data_part
                     images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
-                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
+                    # ViCO 图像不需要 split，固定 224x224，直接传整个 batch 的
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                        hidden_states=images_folded,
+                        hidden_states_vico=images_vico,
+                        time_series=ts_part,
+                        att_mask=att_mask_part,
+                        init_img_size=init_img_size,
+                        labels=label_part
+                    )
 
                     loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
                     
@@ -550,7 +559,15 @@ def train_univariate(args):
             else:
                 images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
-                local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, time_series, att_mask, init_img_size, labels)
+                # 双分支 forward：传入 ViCO 频域图像
+                local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                    hidden_states=images_folded,
+                    hidden_states_vico=images_vico,
+                    time_series=time_series,
+                    att_mask=att_mask,
+                    init_img_size=init_img_size,
+                    labels=labels
+                )
 
                 loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
 
@@ -622,30 +639,6 @@ def train_univariate(args):
                     "Train/LR": optimizer.param_groups[0]['lr'],
                 }, step=global_step)
 
-            # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
-            if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
-                writer = accelerator.get_tracker("tensorboard").writer
-                unwrapped_model = accelerator.unwrap_model(model)
-
-                # 记录参数和梯度直方图
-                for name, param in unwrapped_model.named_parameters():
-                    if param.requires_grad:
-                        # 记录权重
-                        writer.add_histogram(f"Parameters/{name}", param.data, global_step)
-                        # 记录梯度（如果有）
-                        if param.grad is not None:
-                            writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
-
-                # 记录硬件资源利用率
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                    writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
-                    writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
-
-                # 记录系统 RAM
-                ram_used = psutil.virtual_memory().used / (1024 ** 3)
-                writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
             probs = torch.softmax(logits, dim=-1)[:, :, 1]
             preds = (probs > 0.5).float()
@@ -858,6 +851,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
         for batch in val_loader:
             labels = batch["labels"]
             images = batch["image"]
+            images_vico = batch.get("image_vico", None)  # ViCO 频域图像
             time_series, att_mask = batch['time_series'], batch['attention_mask']
             period = batch['period']
             p_value = batch['padding_value']
@@ -872,8 +866,14 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
+                    # 双分支 forward
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                        images_folded, ts_part, att_mask_part, init_img_size, label_part)
+                        hidden_states=images_folded,
+                        hidden_states_vico=images_vico,
+                        time_series=ts_part,
+                        att_mask=att_mask_part,
+                        init_img_size=init_img_size,
+                        labels=label_part)
 
                     loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
                     loss02, _ = model.weighted_reconstruction_loss(
@@ -887,8 +887,14 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                 images_folded, init_img_size = model.vit_encoder.fold_image(
                     images, period, p_value, **data_setting)
 
+                # 双分支 forward
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                    images_folded, time_series, att_mask, init_img_size, labels)
+                    hidden_states=images_folded,
+                    hidden_states_vico=images_vico,
+                    time_series=time_series,
+                    att_mask=att_mask,
+                    init_img_size=init_img_size,
+                    labels=labels)
 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
@@ -1114,6 +1120,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
         for batch in val_loader:
             labels = batch["labels"]
             images = batch["image"]
+            images_vico = batch.get("image_vico", None)  # ViCO 频域图像
             time_series, att_mask = batch['time_series'], batch['attention_mask']
             period = batch['period']
             p_value = batch['padding_value']
@@ -1128,8 +1135,14 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
+                    # 双分支 forward
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                        images_folded, ts_part, att_mask_part, init_img_size, label_part)
+                        hidden_states=images_folded,
+                        hidden_states_vico=images_vico,
+                        time_series=ts_part,
+                        att_mask=att_mask_part,
+                        init_img_size=init_img_size,
+                        labels=label_part)
 
                     loss01, _ = model.anomaly_detection_loss(local_embeddings1, label_part)
                     loss02, _ = model.weighted_reconstruction_loss(
@@ -1143,8 +1156,14 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                 images_folded, init_img_size = model.vit_encoder.fold_image(
                     images, period, p_value, **data_setting)
 
+                # 双分支 forward
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
-                    images_folded, time_series, att_mask, init_img_size, labels)
+                    hidden_states=images_folded,
+                    hidden_states_vico=images_vico,
+                    time_series=time_series,
+                    att_mask=att_mask,
+                    init_img_size=init_img_size,
+                    labels=labels)
 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
@@ -1527,13 +1546,14 @@ def train_multivariate(args, config: Dict[str, Any]):
 
             for batch in progress_bar:
                 labels = batch["labels"]
-                images = batch["image"]
+                images = batch["image"]  # VETime 时域图像
+                images_vico = batch.get("image_vico", None)  # ViCO 频域图像
                 time_series, att_mask = batch['time_series'], batch['attention_mask']
                 mask = batch['mask']
                 period = batch['period']
                 p_value = batch['padding_value']
                 # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
-                alpha_recon = 0.05  
+                alpha_recon = 0.05
 
                 if labels.shape[1] > model.MAX_L:
                     data_splits = model.split_data(images, time_series, att_mask, labels)
@@ -1548,7 +1568,15 @@ def train_multivariate(args, config: Dict[str, Any]):
                         img_part, ts_part, att_mask_part, label_part = data_part
                         images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
-                        local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, ts_part, att_mask_part, init_img_size, label_part)
+                        # 双分支 forward
+                        local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                            hidden_states=images_folded,
+                            hidden_states_vico=images_vico,
+                            time_series=ts_part,
+                            att_mask=att_mask_part,
+                            init_img_size=init_img_size,
+                            labels=label_part
+                        )
 
                         loss01, logit = model.anomaly_detection_loss(local_embeddings1, label_part)
                         
@@ -1594,7 +1622,15 @@ def train_multivariate(args, config: Dict[str, Any]):
                 else:
                     images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
-                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(images_folded, time_series, att_mask, init_img_size, labels)
+                    # 双分支 forward
+                    local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
+                        hidden_states=images_folded,
+                        hidden_states_vico=images_vico,
+                        time_series=time_series,
+                        att_mask=att_mask,
+                        init_img_size=init_img_size,
+                        labels=labels
+                    )
 
                     loss1, logits = model.anomaly_detection_loss(local_embeddings1, labels)
 
@@ -1666,30 +1702,6 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Train/LR": optimizer.param_groups[0]['lr'],
                     }, step=global_step)
 
-                # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
-                if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
-                    writer = accelerator.get_tracker("tensorboard").writer
-                    unwrapped_model = accelerator.unwrap_model(model)
-
-                    # 记录参数和梯度直方图
-                    for name, param in unwrapped_model.named_parameters():
-                        if param.requires_grad:
-                            # 记录权重
-                            writer.add_histogram(f"Parameters/{name}", param.data, global_step)
-                            # 记录梯度（如果有）
-                            if param.grad is not None:
-                                writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
-
-                    # 记录硬件资源利用率
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                        writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
-                        writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
-
-                    # 记录系统 RAM
-                    ram_used = psutil.virtual_memory().used / (1024 ** 3)
-                    writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
                 # 只在需要时计算 probs/preds，避免不必要的显存占用
                 if global_step % 10 == 0:
