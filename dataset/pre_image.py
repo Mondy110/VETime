@@ -16,8 +16,8 @@ import torch
 import math
 from typing import Tuple, Union, List, Optional
 from statsmodels.tsa.stattools import acf
-from scipy.signal import argrelextrema
-from scipy.ndimage import median_filter
+from scipy.signal import argrelextrema, stft
+from scipy.ndimage import median_filter, zoom
 
 
 def ts2image_Test(
@@ -602,3 +602,286 @@ def robust_iterative_decompose(
     s_pure = _seasonal(x_cur - t_pure)
     residual = x - t_pure - s_pure
     return t_pure, s_pure, residual
+
+
+# =============================================================================
+# ViCO Frequency-Domain Rendering Functions
+# =============================================================================
+
+def _normalise_01_np(arr: np.ndarray) -> np.ndarray:
+    """
+    Normalize numpy array to [0, 1] range.
+
+    This function performs min-max normalization to scale array values to the
+    [0, 1] interval. It handles both 2D and 3D arrays by flattening for
+    normalization and reshaping back to original shape.
+
+    Args:
+        arr: Input array of any shape. Values are normalized across all elements.
+
+    Returns:
+        normalized: Array of same shape as input with values in [0, 1].
+                    Returns zero array if input range is negligible.
+    """
+    flat = arr.ravel()
+    vmin = flat.min()
+    vmax = flat.max()
+    return (arr - vmin) / (vmax - vmin + 1e-8)
+
+
+def _stft_spectrogram_np(
+    x: np.ndarray,
+    win_len: int = 64,
+    hop_len: int = 16,
+    n_fft: int = 128
+) -> np.ndarray:
+    """
+    Compute log-magnitude STFT spectrogram using scipy.signal.stft.
+
+    This function computes the Short-Time Fourier Transform and returns the
+    log-magnitude spectrogram. It handles multivariate input by averaging
+    across channels.
+
+    Args:
+        x: Input time series of shape (L, C) or (L,), where L is sequence
+           length and C is number of channels.
+        win_len: Window length for STFT. Default: 64.
+        hop_len: Hop length between successive windows. Default: 16.
+        n_fft: Number of FFT points. Default: 128.
+
+    Returns:
+        spec: Log-magnitude spectrogram of shape (F, T), where F is the
+              number of frequency bins and T is the number of time frames.
+              Values are log-scaled magnitudes: log(1 + magnitude).
+    """
+    if x.ndim == 1:
+        x = x[:, np.newaxis]
+    L, C = x.shape
+
+    # Compute STFT for each channel and average
+    specs = []
+    for c in range(C):
+        f, t, Zxx = stft(
+            x[:, c],
+            fs=1.0,
+            window='hann',
+            nperseg=win_len,
+            noverlap=win_len - hop_len,
+            nfft=n_fft,
+            boundary=None,
+            padded=False
+        )
+        magnitude = np.abs(Zxx)
+        log_mag = np.log1p(magnitude)
+        specs.append(log_mag)
+
+    # Average across channels
+    spec = np.mean(specs, axis=0)
+    return spec
+
+
+def _heatmap_period_fold_np(
+    x: np.ndarray,
+    periodicity: int,
+    height: int,
+    width: int
+) -> np.ndarray:
+    """
+    Create period-folded heatmap visualization from time series.
+
+    This function reshapes the time series into a 2D matrix where each row
+    corresponds to one period, then resizes to target dimensions. This
+    visualization reveals periodic patterns in the data.
+
+    Args:
+        x: Input normalized time series of shape (L, C) or (L,), where L is
+           sequence length and C is number of channels.
+        periodicity: Period length for folding. The time series is reshaped
+                     into segments of this length.
+        height: Target height of output image.
+        width: Target width of output image.
+
+    Returns:
+        heatmap: Period-folded heatmap of shape (height, width), normalized
+                 to [0, 1]. Values are averaged across channels.
+    """
+    if x.ndim == 1:
+        x = x[:, np.newaxis]
+    L, C = x.shape
+
+    # Left-pad to make length divisible by period
+    pad_left = (periodicity - L % periodicity) % periodicity
+    x_padded = np.pad(x.T, ((0, 0), (pad_left, 0)), mode='edge')
+
+    total = x_padded.shape[1]
+    num_segments = total // periodicity
+
+    if num_segments == 0:
+        num_segments = 1
+
+    # Reshape to (C, period, num_segments)
+    x_folded = x_padded[:, :num_segments * periodicity].reshape(C, periodicity, num_segments)
+
+    # Resize to target dimensions
+    zoom_factors = (height / periodicity, width / num_segments)
+
+    # Average across channels
+    heatmap = x_folded.mean(axis=0)
+
+    # Use scipy.ndimage.zoom for bicubic-like interpolation
+    heatmap_resized = zoom(heatmap, zoom_factors, order=1)
+
+    return _normalise_01_np(heatmap_resized)
+
+
+def _gradient_map_np(
+    x: np.ndarray,
+    periodicity: int,
+    height: int,
+    width: int
+) -> np.ndarray:
+    """
+    Create gradient map with period folding from time series.
+
+    This function computes the first-order differences (gradient) of the
+    time series, then folds by period and visualizes as a 2D map. This
+    highlights rate-of-change patterns across periods.
+
+    Args:
+        x: Input normalized time series of shape (L, C) or (L,), where L is
+           sequence length and C is number of channels.
+        periodicity: Period length for folding.
+        height: Target height of output image.
+        width: Target width of output image.
+
+    Returns:
+        gradient_map: Gradient map of shape (height, width), normalized to
+                      [0, 1]. Values are absolute gradients averaged across
+                      channels.
+    """
+    if x.ndim == 1:
+        x = x[:, np.newaxis]
+    L, C = x.shape
+
+    # Compute gradient (first-order differences)
+    grad = np.zeros_like(x)
+    grad[1:, :] = x[1:, :] - x[:-1, :]
+
+    # Left-pad to make length divisible by period
+    pad_left = (periodicity - L % periodicity) % periodicity
+    grad_padded = np.pad(grad.T, ((0, 0), (pad_left, 0)), mode='constant', constant_values=0)
+
+    total = grad_padded.shape[1]
+    num_segments = total // periodicity
+
+    if num_segments == 0:
+        num_segments = 1
+
+    # Reshape to (C, period, num_segments)
+    grad_folded = grad_padded[:, :num_segments * periodicity].reshape(C, periodicity, num_segments)
+
+    # Take absolute values
+    grad_folded = np.abs(grad_folded)
+
+    # Average across channels
+    gradient_map = grad_folded.mean(axis=0)
+
+    # Resize to target dimensions
+    zoom_factors = (height / periodicity, width / num_segments)
+    gradient_map_resized = zoom(gradient_map, zoom_factors, order=1)
+
+    return _normalise_01_np(gradient_map_resized)
+
+
+def vico_render_timeseries(
+    x: Union[np.ndarray, torch.Tensor],
+    periodicity: int,
+    img_size: int = 224,
+    norm_const: float = 0.4,
+    stft_win: int = 64,
+    stft_hop: int = 16,
+    stft_fft: int = 128
+) -> np.ndarray:
+    """
+    Render time series into tri-view RGB image (ViCO-style frequency domain rendering).
+
+    This function generates a 3-channel RGB image from time series data, where:
+    - R channel: STFT spectrogram (frequency domain representation)
+    - G channel: Period-folded heatmap (time domain value visualization)
+    - B channel: Gradient map (rate-of-change visualization)
+
+    This rendering approach preserves both temporal and frequency information,
+    making it suitable for vision-based time series analysis.
+
+    Args:
+        x: Input time series of shape (L, C) or (L,), where L is sequence length
+           and C is number of channels. Can be numpy array or torch tensor.
+        periodicity: Dominant period for heatmap and gradient folding. Use
+                     find_period() to detect if unknown.
+        img_size: Target image size. Output will be (3, img_size, img_size).
+                  Default: 224.
+        norm_const: Normalization constant for z-score normalization.
+                    Values are divided by (std / norm_const). Default: 0.4.
+        stft_win: Window length for STFT spectrogram. Default: 64.
+        stft_hop: Hop length for STFT spectrogram. Default: 16.
+        stft_fft: FFT size for STFT spectrogram. Default: 128.
+
+    Returns:
+        image: RGB image array of shape (3, img_size, img_size), dtype uint8.
+               Values are in range [0, 255]. The three channels are:
+               - Channel 0 (R): STFT spectrogram
+               - Channel 1 (G): Period-folded heatmap
+               - Channel 2 (B): Gradient map
+
+    Example:
+        >>> import numpy as np
+        >>> ts = np.random.randn(1000, 2)  # 1000 timesteps, 2 channels
+        >>> period = 24  # or use find_period(ts)
+        >>> img = vico_render_timeseries(ts, periodicity=period)
+        >>> img.shape
+        (3, 224, 224)
+        >>> img.dtype
+        dtype('uint8')
+    """
+    # Convert torch tensor to numpy if needed
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+
+    if x.ndim == 1:
+        x = x[:, np.newaxis]
+
+    L, C = x.shape
+
+    # Normalize the time series (z-score with norm_const scaling)
+    mean = x.mean(axis=0, keepdims=True)
+    x_centered = x - mean
+    std = x_centered.std(axis=0, keepdims=True) + 1e-5
+    x_norm = x_centered / (std / norm_const)
+
+    # Cap STFT parameters to valid range
+    n_fft_cap = max(8, min(L - 1, 2 ** int(np.floor(np.log2(L)))))
+    n_fft_eff = max(8, min(stft_fft, n_fft_cap))
+    win_eff = max(8, min(stft_win, n_fft_eff))
+    hop_eff = max(1, min(stft_hop, win_eff))
+
+    # Compute three views
+    spec = _stft_spectrogram_np(x_norm, win_len=win_eff, hop_len=hop_eff, n_fft=n_fft_eff)
+
+    # Resize spectrogram to target size
+    spec_h, spec_w = spec.shape
+    zoom_h = img_size / spec_h
+    zoom_w = img_size / spec_w
+    spec_resized = zoom(spec, (zoom_h, zoom_w), order=1)
+    spec_normalized = _normalise_01_np(spec_resized)
+
+    # Compute heatmap and gradient map
+    heat = _heatmap_period_fold_np(x_norm, periodicity, img_size, img_size)
+    grad = _gradient_map_np(x_norm, periodicity, img_size, img_size)
+
+    # Stack into RGB image (C, H, W)
+    image = np.stack([spec_normalized, heat, grad], axis=0)
+
+    # Convert to uint8 [0, 255]
+    image = (image * 255).clip(0, 255).astype(np.uint8)
+
+    return image
