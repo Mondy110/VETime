@@ -16,7 +16,7 @@ import pickle
 from torch.utils.data import Dataset, Sampler
 import random
 
-from dataset.pre_image import ts2image_1d
+from dataset.pre_image import ts2image_1d, vico_render_timeseries
 
 
 class AnomalyDataset(Dataset):
@@ -113,22 +113,26 @@ class AnomalyDataset(Dataset):
 
     def generate_image(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Generate image representations for time series samples.
+        Generate dual-branch image representations for time series samples.
 
-        This function converts each time series in the data list to an image
-        using ts2image_1d. The image width is determined by the sequence length
-        and patch_size, rounded up to the nearest multiple of patch_size.
+        This function converts each time series in the data list to two images:
+        1. VETime image: Time-domain rendering using ts2image_1d
+        2. ViCO image: Frequency-domain rendering using vico_render_timeseries
+
+        The image width is determined by the sequence length and patch_size,
+        rounded up to the nearest multiple of patch_size.
 
         Args:
             data: List of sample dictionaries. Each dictionary should contain
-                  at least 'time_series' key. The image, period, and padding
+                  at least 'time_series' key. The images, period, and padding
                   value will be added in-place.
 
         Returns:
             List[Dict[str, Any]]: The same data list with added keys:
-                - 'image': Generated image array of shape (3, C*h_size, width)
+                - 'image_vetime': VETime time-domain image (3, C*h_size, width)
+                - 'image_vico': ViCO frequency-domain image (3, 224, 224)
                 - 'period': Detected period (integer)
-                - 'padding_value': Padding values for the image
+                - 'padding_value': Padding values for VETime image
 
         Note:
             This function modifies the input data list in-place and also
@@ -137,13 +141,30 @@ class AnomalyDataset(Dataset):
         # 串行处理（更稳定，避免多进程内存问题）
         for idx, data0 in enumerate(data):
             target_length = ((len(data0['time_series']) + self.patch_size - 1) // self.patch_size) * self.patch_size
-            img, period, padding_value = ts2image_1d(data0['time_series'], target_length, self.patch_size)
-            data[idx]['image'] = img
+
+            # === VETime 时域渲染 (现有) ===
+            img_vetime, period, padding_value = ts2image_1d(
+                data0['time_series'], target_length, self.patch_size
+            )
+
+            # === ViCO 频域渲染 (新增) ===
+            img_vico = vico_render_timeseries(
+                data0['time_series'], period, img_size=224
+            )
+
+            # 存储两分支图像
+            data[idx]['image_vetime'] = img_vetime  # [3, C*h_size, width]
+            data[idx]['image_vico'] = img_vico      # [3, 224, 224]
             data[idx]['period'] = period
             data[idx]['padding_value'] = padding_value
+
+            # 删除旧的 'image' 键（避免混淆）
+            if 'image' in data[idx]:
+                del data[idx]['image']
+
         return data
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict, int, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict, int, torch.Tensor]:
         """
         Get a single sample from the dataset.
 
@@ -154,21 +175,24 @@ class AnomalyDataset(Dataset):
             A tuple containing:
                 - time_series: Time series data as float32 tensor (L, C)
                 - normal_time_series: Normal reference time series (L, C)
-                - image: Image representation as float32 tensor (3, H, W)
+                - image_vetime: VETime time-domain image as float32 tensor (3, H, W)
+                - image_vico: ViCO frequency-domain image as float32 tensor (3, 224, 224)
                 - labels: Anomaly labels as long tensor (L,)
                 - attribute: Metadata dictionary
                 - period: Detected period (int)
                 - padding_value: Padding values as float32 tensor (3, C, 1)
         """
         sample = self.data[idx]
-        img_tensor = torch.tensor(sample['image'], dtype=torch.float32)
+        # 双分支图像
+        img_vetime_tensor = torch.tensor(sample['image_vetime'], dtype=torch.float32)
+        img_vico_tensor = torch.tensor(sample['image_vico'], dtype=torch.float32)
         time_series = torch.tensor(sample['time_series'], dtype=torch.float32)
         normal_time_series = torch.tensor(sample['normal_time_series'], dtype=torch.float32)
         labels = torch.tensor(sample['labels'], dtype=torch.long)
         attribute = sample['attribute']
         period = sample['period']
         padding_value = torch.tensor(sample['padding_value'], dtype=torch.float32)
-        return time_series, normal_time_series, img_tensor, labels, attribute, period, padding_value
+        return time_series, normal_time_series, img_vetime_tensor, img_vico_tensor, labels, attribute, period, padding_value
 
 
 def collate_fn(
@@ -176,19 +200,20 @@ def collate_fn(
     patch_size: int
 ) -> Dict[str, Union[torch.Tensor, List, Tuple]]:
     """
-    Collate function for batching anomaly detection samples.
+    Collate function for batching anomaly detection samples with dual-branch images.
 
     This function processes a batch of samples from AnomalyDataset and:
     1. Concatenates all time series and computes global mean/std for normalization
     2. Pads all sequences to the same length (multiple of patch_size)
     3. Generates attention masks for valid sequence positions
     4. Applies random masking for self-supervised learning
-    5. Pads images to match the target width
+    5. Pads VETime images to match the target width
+    6. Stacks ViCO images (already fixed 224x224 size)
 
     Args:
         batch: List of samples from AnomalyDataset.__getitem__. Each sample is
-               a tuple of (time_series, normal_time_series, img_tensor, labels,
-               attribute, period, padding_value).
+               a tuple of (time_series, normal_time_series, img_vetime, img_vico,
+               labels, attribute, period, padding_value).
         patch_size: Size of patches for masking and padding alignment.
 
     Returns:
@@ -196,7 +221,8 @@ def collate_fn(
             - 'time_series': Padded time series tensor (B, L_max, C)
             - 'normal_time_series': Padded normal reference tensor (B, L_max, C)
             - 'mask_time_series': Time series with random patches masked (B, L_max, C)
-            - 'image': Padded image tensor (B, 3, H, W_max)
+            - 'image': Padded VETime time-domain image tensor (B, 3, H, W_max)
+            - 'image_vico': ViCO frequency-domain image tensor (B, 3, 224, 224)
             - 'mask': Boolean mask indicating masked positions (B, L_max)
             - 'labels': Padded label tensor (B, L_max) with -1 for padding
             - 'attention_mask': Boolean mask for valid positions (B, L_max)
@@ -207,9 +233,11 @@ def collate_fn(
         - Time series are normalized using batch-wide statistics
         - Labels are padded with -1 (ignored in loss computation)
         - Random masking applies mask_ratio=0.3 to valid sequence regions only
+        - VETime images are padded with adaptive padding values
+        - ViCO images are already 224x224, just stacked
     """
-    time_series_list, normal_time_series_list, img_tensor, labels_list, attribute_list, period, padding_value = zip(*batch)
-    
+    time_series_list, normal_time_series_list, img_vetime_list, img_vico_list, labels_list, attribute_list, period, padding_value = zip(*batch)
+
     if time_series_list[0].ndim == 1:
         time_series_tensors = [ts.unsqueeze(-1) for ts in time_series_list]
         normal_time_series_tensors = [nts.unsqueeze(-1) for nts in normal_time_series_list]
@@ -241,7 +269,12 @@ def collate_fn(
     normal_time_series_tensors = padding_to_target_length(normal_time_series_tensors, 0.0)
     padded_labels = padding_to_target_length(labels, -1)
 
-    image_inputs = image_right_padding(img_tensor, target_length, padding_value)
+    # VETime 分支: 需要自适应 padding
+    image_inputs_vetime = image_right_padding(img_vetime_list, target_length, padding_value)
+
+    # ViCO 分支: 已经是固定 224x224，直接 stack
+    image_inputs_vico = torch.stack(img_vico_list)  # (B, 3, 224, 224)
+
     sequence_lengths = [ts.size(0) for ts in time_series_tensors]
     B, max_seq_len, num_features = padded_time_series.shape
     attention_mask = torch.ones(B, max_seq_len, dtype=torch.bool)
@@ -256,7 +289,8 @@ def collate_fn(
         'time_series': padded_time_series,
         'normal_time_series': normal_time_series_tensors,
         'mask_time_series': mask_time_series,
-        'image': image_inputs,
+        'image': image_inputs_vetime,  # VETime 时域图像 (保持旧 key 名便于兼容)
+        'image_vico': image_inputs_vico,  # ViCO 频域图像
         'mask': mask,
         'labels': padded_labels,
         'attention_mask': attention_mask,
