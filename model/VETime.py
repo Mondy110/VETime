@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from loss.loss import win_Contrastive_Loss
 from model.TS_encoder.ts_encoder import TimeSeriesEncoder
 from model.TS_encoder.ts_model import TS_Model
-from model.VTS_module import V_Attention, VTS_Alignment, M_moe
+from model.VTS_module import V_Attention, VTS_Alignment, M_moe, VisualCrossAttention
 
 
 class VETIME(TS_Model):
@@ -35,6 +35,18 @@ class VETIME(TS_Model):
         self.pos_emb_v = nn.Parameter(torch.zeros(1, self.MAX_L, v_dim))
         nn.init.normal_(self.pos_emb_v, std=0.02)
         self.I_att = V_Attention(t_dim)
+
+        # === 视觉时频双分支 ===
+        # 交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征
+        self.visual_cross_attn = VisualCrossAttention(t_dim, num_heads=8, dropout=0.1)
+
+        # ViCO 分支的 MLP（与 VETime 分支结构一致）
+        self.mlp_vico = nn.Sequential(
+            nn.Linear(v_dim, t_dim2),
+            nn.GELU(),
+            nn.Linear(t_dim2, t_dim),
+            nn.LayerNorm(t_dim),
+        )
 
         # ts setting
         self.ts_encoder = ts_model
@@ -79,12 +91,22 @@ class VETIME(TS_Model):
 
         multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
 
-        image_features,_=self.vit_encoder(hidden_states)
-        I_embeddings = self.vit_encoder.unfold_image(image_features,init_img_size)
-        I_embeddings =self.mlp_i(I_embeddings+ multivariate_pos_emb)
-        I_embeddings0=self.I_att(I_embeddings, patch_mask)
+        # === 分支 A: VETime 时域 (现有流程) ===
+        image_features_vetime, _ = self.vit_encoder(hidden_states)
+        I_embeddings_vetime = self.vit_encoder.unfold_image(image_features_vetime, init_img_size)
+        I_embeddings_vetime = self.mlp_i(I_embeddings_vetime + multivariate_pos_emb)
+        Q_visual = self.I_att(I_embeddings_vetime, patch_mask)  # [B, N_TS, t_dim]
 
-        I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
+        # === 分支 B: ViCO 频域 (placeholder，Task 4 将替换为真实 ViCO 图像) ===
+        # 当前使用 VETime 的原始 patch tokens 作为 K_V placeholder
+        K_V_tokens = image_features_vetime[:, 1:, :]  # [B, 196, v_dim]
+        K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
+
+        # === 交叉注意力融合 ===
+        I_embeddings0 = self.visual_cross_attn(Q_visual, K_V_tokens_proj)  # [B, N_TS, t_dim]
+
+        # 后续流程保持不变：fusion → MoE → 任务头
+        I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
         # 两路任务干净并行：task 1 -> anomaly head(local_emb1), task 0 -> reconstruction head(local_emb2)
