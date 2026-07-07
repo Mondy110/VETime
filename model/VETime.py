@@ -66,21 +66,30 @@ class VETIME(TS_Model):
         if self.use_gradient_checkpointing:
             self._enable_gradient_checkpointing()
 
-    def forward(self, hidden_states: torch.Tensor,time_series: torch.Tensor, # grid_thw: torch.Tensor,size,
-                att_mask: Optional[torch.Tensor] = None,init_img_size=None,labels=None):
+    def forward(self, hidden_states: torch.Tensor,
+                time_series: torch.Tensor,
+                att_mask: Optional[torch.Tensor] = None,
+                init_img_size=None,
+                hidden_states_vico: Optional[torch.Tensor] = None,
+                init_img_size_vico=None,
+                labels=None):
 
         # 使用 gradient checkpointing 包装整个 forward 的核心计算
         if self.use_gradient_checkpointing and self.training:
             return self._forward_with_checkpointing(
-                hidden_states, time_series, att_mask, init_img_size, labels
+                hidden_states, time_series, att_mask, init_img_size,
+                hidden_states_vico, init_img_size_vico, labels
             )
         else:
             return self._forward_impl(
-                hidden_states, time_series, att_mask, init_img_size, labels
+                hidden_states, time_series, att_mask, init_img_size,
+                hidden_states_vico, init_img_size_vico, labels
             )
 
     def _forward_impl(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
-                      att_mask: Optional[torch.Tensor] = None, init_img_size=None, labels=None):
+                      att_mask: Optional[torch.Tensor] = None, init_img_size=None,
+                      hidden_states_vico: Optional[torch.Tensor] = None,
+                      init_img_size_vico=None, labels=None):
         """实际的 forward 实现"""
         TS_embeddings0,local_embeddings0,patch_mask=self.ts_encoder(time_series,att_mask)
         B, seq_len, num_features = time_series.size()
@@ -97,9 +106,14 @@ class VETIME(TS_Model):
         I_embeddings_vetime = self.mlp_i(I_embeddings_vetime + multivariate_pos_emb)
         Q_visual = self.I_att(I_embeddings_vetime, patch_mask)  # [B, N_TS, t_dim]
 
-        # === 分支 B: ViCO 频域 (placeholder，Task 4 将替换为真实 ViCO 图像) ===
-        # 当前使用 VETime 的原始 patch tokens 作为 K_V placeholder
-        K_V_tokens = image_features_vetime[:, 1:, :]  # [B, 196, v_dim]
+        # === 分支 B: ViCO 频域 (使用真实 ViCO 图像) ===
+        if hidden_states_vico is not None:
+            # 使用传入的真实 ViCO 图像通过共享 MAE encoder 提取频域 tokens
+            image_features_vico, _ = self.vit_encoder(hidden_states_vico)
+            K_V_tokens = image_features_vico[:, 1:, :]  # [B, 196, v_dim] 原始 patch tokens
+        else:
+            # 兼容旧代码：无 ViCO 输入时使用 VETime 图像的 patch tokens 作为 fallback
+            K_V_tokens = image_features_vetime[:, 1:, :]  # [B, 196, v_dim]
         K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
 
         # === 交叉注意力融合 ===
@@ -129,7 +143,8 @@ class VETIME(TS_Model):
         return local_embeddings1,m_w,loss_sc,local_embeddings2
 
     def _forward_with_checkpointing(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
-                                    att_mask: Optional[torch.Tensor], init_img_size, labels):
+                                    att_mask: Optional[torch.Tensor], init_img_size,
+                                    hidden_states_vico: Optional[torch.Tensor], init_img_size_vico, labels):
         """使用 gradient checkpointing 的 forward"""
         from torch.utils.checkpoint import checkpoint
 
@@ -140,22 +155,34 @@ class VETIME(TS_Model):
         TS_embeddings0, local_embeddings0, patch_mask = self.ts_encoder(time_series, att_mask)
 
         # Part 2: Vision encoder + fusion (使用 checkpoint)
-        def vision_fusion_forward(hidden_states, patch_mask, init_img_size, TS_embeddings0, num_features):
+        def vision_fusion_forward(hidden_states, hidden_states_vico, patch_mask, init_img_size, TS_embeddings0, num_features):
             patch_num = patch_mask.size(1) // num_features
             temporal_pos_emb = self.pos_emb_v[:, :patch_num, :]
             multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
 
-            image_features, _ = self.vit_encoder(hidden_states)
-            I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
-            I_embeddings = self.mlp_i(I_embeddings + multivariate_pos_emb)
-            I_embeddings0 = self.I_att(I_embeddings, patch_mask)
+            # 分支 A: VETime 时域
+            image_features_vetime, _ = self.vit_encoder(hidden_states)
+            I_embeddings_vetime = self.vit_encoder.unfold_image(image_features_vetime, init_img_size)
+            I_embeddings_vetime = self.mlp_i(I_embeddings_vetime + multivariate_pos_emb)
+            Q_visual = self.I_att(I_embeddings_vetime, patch_mask)
+
+            # 分支 B: ViCO 频域
+            if hidden_states_vico is not None:
+                image_features_vico, _ = self.vit_encoder(hidden_states_vico)
+                K_V_tokens = image_features_vico[:, 1:, :]
+            else:
+                K_V_tokens = image_features_vetime[:, 1:, :]
+            K_V_tokens_proj = self.mlp_vico(K_V_tokens)
+
+            # 交叉注意力融合
+            I_embeddings0 = self.visual_cross_attn(Q_visual, K_V_tokens_proj)
 
             I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
             return I_embeddings, TS_embeddings, I_embeddings0
 
         I_embeddings, TS_embeddings, I_embeddings0 = checkpoint(
             vision_fusion_forward,
-            hidden_states, patch_mask, init_img_size, TS_embeddings0, num_features
+            hidden_states, hidden_states_vico, patch_mask, init_img_size, TS_embeddings0, num_features
         )
 
         loss_sc = self.compute_cl(I_embeddings, TS_embeddings, labels, num_features)
