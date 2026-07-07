@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 
 class V_Attention(nn.Module):
@@ -320,3 +321,95 @@ class VisualCrossAttention(nn.Module):
         fused_visual = self.norm2(x)
 
         return fused_visual
+
+
+class GatedTimeFrequencyFusion(nn.Module):
+    """
+    门控残差交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征。
+
+    核心改进：
+    - 可学习的门控参数 alpha（初始化为 0.0），实现安全热启动
+    - 训练初期自动回退到纯 VETime，随训练逐渐激活频域信息
+    - 废除刚性对角假设，让时间域 Query 自适应决定关注哪些频域 patch
+
+    Attention Matrix 形状 [B, N_TS, 196]，表示每个时间点与所有频域 patch 的软对齐。
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
+        """
+        Args:
+            d_model: 特征维度
+            num_heads: 多头注意力头数
+            dropout: Dropout 概率
+            ffn_ratio: FFN 扩展比例（默认 4 倍）
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        # 纯交叉注意力：无对角偏置，无位置编码
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            kdim=d_model,
+            vdim=d_model,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm1 = nn.LayerNorm(d_model)
+
+        # 可学习的门控参数，初始化为 0.0 实现稳定热启动
+        # 训练初期网络自然回退到纯 VETime，随训练逐渐激活频域信息
+        self.alpha = nn.Parameter(torch.tensor([0.0]))
+
+        # FFN: Linear -> GELU -> Dropout -> Linear
+        ffn_hidden = int(d_model * ffn_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_hidden, d_model)
+        )
+        self.layer_norm2 = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        Q_VETime: torch.Tensor,
+        K_ViCO: torch.Tensor,
+        V_ViCO: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            Q_VETime: 时域对齐的视觉特征 [B, N_TS, d]
+                      (经过 PTA unfold + mlp_i + I_att)
+            K_ViCO:   频域原始 2D patch tokens [B, 196, d]
+                      (ViCO 分支 MAE 输出，未对齐)
+            V_ViCO:   频域原始 2D patch tokens [B, 196, d]
+                      (与 K_ViCO 相同)
+            key_padding_mask: Optional mask for ViCO tokens [B, 196]
+
+        Returns:
+            F_out: 融合后的时域特征 [B, N_TS, d]
+        """
+        # 不对称交叉注意力: [B, N_TS, d] x [B, 196, d] -> [B, N_TS, d]
+        F_cross, _ = self.cross_attn(
+            query=Q_VETime,
+            key=K_ViCO,
+            value=V_ViCO,
+            key_padding_mask=key_padding_mask,
+            need_weights=False  # 启用 Flash Attention
+        )
+
+        # 门控残差连接到 VETime 时序主干
+        # alpha=0 时完全回退到 Q_VETime，alpha=1 时等权重融合
+        F_mid = Q_VETime + self.alpha * self.dropout(F_cross)
+        F_mid = self.layer_norm1(F_mid)
+
+        # 非线性 FFN语义精炼
+        F_out = F_mid + self.ffn(F_mid)
+        F_out = self.layer_norm2(F_out)
+
+        return F_out

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from loss.loss import win_Contrastive_Loss
 from model.TS_encoder.ts_encoder import TimeSeriesEncoder
 from model.TS_encoder.ts_model import TS_Model
-from model.VTS_module import V_Attention, VTS_Alignment, M_moe, VisualCrossAttention
+from model.VTS_module import V_Attention, VTS_Alignment, M_moe, VisualCrossAttention, GatedTimeFrequencyFusion
 
 
 class VETIME(TS_Model):
@@ -37,8 +37,9 @@ class VETIME(TS_Model):
         self.I_att = V_Attention(t_dim)
 
         # === 视觉时频双分支 ===
-        # 交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征
-        self.visual_cross_attn = VisualCrossAttention(t_dim, num_heads=8, dropout=0.1)
+        # 门控残差交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征
+        # 可学习 alpha 参数（初始化 0.0）实现稳定热启动，训练初期自动回退到纯 VETime
+        self.visual_cross_attn = GatedTimeFrequencyFusion(t_dim, num_heads=8, dropout=0.1)
 
         # ViCO 分支的 MLP（与 VETime 分支结构一致）
         self.mlp_vico = nn.Sequential(
@@ -117,7 +118,12 @@ class VETIME(TS_Model):
         K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
 
         # === 交叉注意力融合 ===
-        I_embeddings0 = self.visual_cross_attn(Q_visual, K_V_tokens_proj)  # [B, N_TS, t_dim]
+        # GatedTimeFrequencyFusion: Q_VETime 查询 K_V_ViCO
+        I_embeddings0 = self.visual_cross_attn(
+            Q_VETime=Q_visual,
+            K_ViCO=K_V_tokens_proj,
+            V_ViCO=K_V_tokens_proj
+        )  # [B, N_TS, t_dim]
 
         # 后续流程保持不变：fusion → MoE → 任务头
         I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
@@ -175,7 +181,11 @@ class VETIME(TS_Model):
             K_V_tokens_proj = self.mlp_vico(K_V_tokens)
 
             # 交叉注意力融合
-            I_embeddings0 = self.visual_cross_attn(Q_visual, K_V_tokens_proj)
+            I_embeddings0 = self.visual_cross_attn(
+                Q_VETime=Q_visual,
+                K_ViCO=K_V_tokens_proj,
+                V_ViCO=K_V_tokens_proj
+            )
 
             I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
             return I_embeddings, TS_embeddings, I_embeddings0
