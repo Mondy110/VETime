@@ -18,6 +18,7 @@ preprocessing time series anomaly detection data. It supports:
 from src.datasets.anomaly_dataset import AnomalyDataset
 from src.datasets.collate import collate_fn, DynamicLengthBatchSampler, image_right_padding
 from src.datasets.masking import create_random_mask
+from src.datasets.pre_image import ts2image_1d, ts2image_Test, vico_render_timeseries
 
 __all__ = [
     'AnomalyDataset',
@@ -25,4 +26,7 @@ __all__ = [
     'DynamicLengthBatchSampler',
     'image_right_padding',
     'create_random_mask',
+    'ts2image_1d',
+    'ts2image_Test',
+    'vico_render_timeseries',
 ]
