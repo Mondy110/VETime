@@ -38,8 +38,6 @@ from datetime import datetime
 from model.VETime import VETIME
 from Test_TSB import EarlyStopping
 from functools import partial
-import psutil  # 硬件资源监控
-
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
@@ -184,9 +182,11 @@ def train_univariate(args):
         else:
             args.file_list = sorted(os.listdir(args.dataset_dir))
 
+    gradient_accumulation_steps = max(1, args.effective_batch_size // args.batch_size)
+    
     accelerator = Accelerator(
         mixed_precision="bf16",
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         log_with="tensorboard",
         project_dir="./output/logs"
     )
@@ -690,9 +690,9 @@ def train_univariate(args):
             if cls_warmup_active and batch_idx < cls_warmup_batches:
                 progress_bar.set_description(f"Epoch {epoch+1}[Train|CLS_Warmup]")
 
-            # ========== TensorBoard 深度监控 ==========
-            # 任务1: 记录 batch 级别的损失和学习率
+            # ========== TensorBoard 监控 ==========
             if global_step > 0:
+                unwrapped = accelerator.unwrap_model(model)
                 accelerator.log({
                     "Loss/Total": batch_loss,
                     "Loss/BCE_Anomaly": batch_loss_bce,
@@ -700,6 +700,7 @@ def train_univariate(args):
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
+                    "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
                 }, step=global_step)
 
 
@@ -762,12 +763,14 @@ def train_univariate(args):
         avg_loss_cl = total_loss_cl / len(train_loader)
         avg_loss_e = total_loss_e / len(train_loader)
 
+        unwrapped = accelerator.unwrap_model(model)
         accelerator.log({
             "epoch_train_loss": avg_train_loss,
             "epoch_loss_bce": avg_loss_bce,
             "epoch_loss_mse": avg_loss_mse,
             "epoch_loss_cl": avg_loss_cl,
             "epoch_loss_e": avg_loss_e,
+            "epoch_alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
         }, step=epoch)
 
         print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
@@ -1598,12 +1601,6 @@ def train_multivariate(args, config: Dict[str, Any]):
             else:
                 print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
 
-            # 显存监控
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"[显存监控] Epoch {epoch+1} 开始: 已分配 {allocated:.2f} GB, 已保留 {reserved:.2f} GB")
-
             total_loss = 0
             total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
             total_loss_mse = 0  # 重建损失 (MSE)
@@ -1760,9 +1757,9 @@ def train_multivariate(args, config: Dict[str, Any]):
                 total_loss_e += batch_loss_e
                 progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
 
-                # ========== TensorBoard 深度监控 ==========
-                # 任务1: 记录 batch 级别的损失和学习率
+                # ========== TensorBoard 监控 ==========
                 if global_step > 0:
+                    unwrapped = accelerator.unwrap_model(model)
                     accelerator.log({
                         "Loss/Total": batch_loss,
                         "Loss/BCE_Anomaly": batch_loss_bce,
@@ -1770,6 +1767,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Loss/CL_Contrastive": batch_loss_cl,
                         "Loss/Balance": batch_loss_e,
                         "Train/LR": optimizer.param_groups[0]['lr'],
+                        "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
                     }, step=global_step)
 
 
@@ -1792,13 +1790,6 @@ def train_multivariate(args, config: Dict[str, Any]):
                 del images_folded, logits, loss1, loss2
                 del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
                 del images, time_series, att_mask, init_img_size
-
-                # 定期显存监控
-                if global_step % 100 == 0 and torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / 1024**3
-                    if allocated > 20:  # 超过 20GB 时警告并清理
-                        print(f"\n[警告] 显存使用过高: {allocated:.2f} GB，正在清理...")
-                        torch.cuda.empty_cache()
 
             # epoch 结束时 flush 剩余梯度
             if args.dynamic_batch and accumulated_samples > 0:
@@ -1827,12 +1818,14 @@ def train_multivariate(args, config: Dict[str, Any]):
             avg_loss_cl = total_loss_cl / len(train_loader)
             avg_loss_e = total_loss_e / len(train_loader)
 
+            unwrapped = accelerator.unwrap_model(model)
             accelerator.log({
                 "epoch_train_loss": avg_train_loss,
                 "epoch_loss_bce": avg_loss_bce,
                 "epoch_loss_mse": avg_loss_mse,
                 "epoch_loss_cl": avg_loss_cl,
                 "epoch_loss_e": avg_loss_e,
+                "epoch_alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
             }, step=epoch)
 
             print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
@@ -1913,6 +1906,209 @@ def train_multivariate(args, config: Dict[str, Any]):
     return {"status": "completed", "datasets": len(datasets)}
 
 
+def train_univariate_hydra(cfg):
+    """新入口：基于 src/ 的训练流程，使用 Hydra 配置。
+
+    与 train_univariate 完全独立的入口函数，使用 src.engines.trainer.Trainer
+    执行两阶段课程训练循环。原始 train_univariate 不受影响。
+
+    Args:
+        cfg: OmegaConf DictConfig，由 Hydra 装饰器注入或手动构建。
+    """
+    from src.utils.seed import seed_everything
+    from src.utils.logger import get_logger as get_src_logger
+    from src.engines.trainer import Trainer
+    from src.models.vision_encoder.v_encoder import V_model
+    from src.models.ts_encoder.config import TimeSeriesConfig
+    from src.models.ts_encoder.ts_model import TS_Model
+    from src.models.vetime import VETIME
+    from src.datasets.anomaly_dataset import AnomalyDataset
+    from src.datasets.collate import collate_fn, DynamicLengthBatchSampler
+    from omegaconf import OmegaConf
+
+    log = get_src_logger(__name__)
+    seed_everything(cfg.seed)
+
+    # ---- Accelerator ----
+    gradient_accumulation_steps = max(1, cfg.data.effective_batch_size // cfg.data.batch_size)
+    accelerator = Accelerator(
+        mixed_precision=cfg.mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        log_with="tensorboard",
+        project_dir="./output/logs",
+    )
+    log.info(f"Using {accelerator.num_processes} "
+             f"{'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
+
+    # ---- Vision Encoder ----
+    log.info(f"加载 Vision Encoder: {cfg.model.vision_name}")
+    vision_model = V_model(
+        cfg.model.vision_name,
+        MAX_L=cfg.data.max_seq_length,
+        unpatch=True,
+        finetune_type='none',
+        use_vectorized_fold=cfg.model.use_vectorized_fold,
+    )
+    config_v = vision_model.config
+    patch_size = config_v['patch_size'] if isinstance(config_v, dict) else config_v.patch_size
+    log.info(f"Vision Encoder 加载完成: patch_size={patch_size}, hidden_size={vision_model.hidden_size}")
+
+    # ---- TS Encoder ----
+    config_t = TimeSeriesConfig(
+        **OmegaConf.to_container(OmegaConf.load("configs/model/vetime.yaml"), resolve=True)
+    )
+    if cfg.model.ts_finetune_type == 'lora':
+        config_t.use_lora = True
+        log.info(f"TS Encoder 微调类型: LoRA (r={config_t.lora_r}, alpha={config_t.lora_alpha})")
+    else:
+        config_t.use_lora = False
+        log.info("TS Encoder 微调类型: 完全冻结")
+
+    ts_model = TS_Model(config_t)
+    if cfg.paths.ts_path:
+        log.info(f"加载 TS Encoder 权重: {cfg.paths.ts_path}")
+        state_ts_dict = torch.load(cfg.paths.ts_path, map_location='cpu')['model_state_dict']
+
+        if cfg.model.ts_finetune_type == 'lora':
+            new_state_dict = {}
+            for key, value in state_ts_dict.items():
+                if any(x in key for x in ['q_proj.weight', 'k_proj.weight', 'v_proj.weight',
+                                           'out_proj.weight', 'gate_proj.weight', 'gate_proj.bias',
+                                           'up_proj.weight', 'up_proj.bias', 'down_proj.weight',
+                                           'down_proj.bias']):
+                    parts = key.rsplit('.', 1)
+                    new_key = f"{parts[0]}.original_linear.{parts[1]}"
+                    new_state_dict[new_key] = value
+                else:
+                    new_state_dict[key] = value
+            ts_model.load_state_dict(new_state_dict, strict=False)
+        else:
+            ts_model.load_state_dict(state_ts_dict, strict=False)
+        log.info("TS Encoder 权重加载完成")
+
+    # Freeze 模式：选择性冻结
+    if cfg.model.ts_finetune_type == 'freeze':
+        for name, param in ts_model.named_parameters():
+            if any(key in name for key in ['transformer_encoder', 'embedding_layer', 'rope_embedder']):
+                param.requires_grad = False
+
+    # ---- VETIME Model ----
+    model = VETIME(config_v, vision_model, config_t, ts_model, cfg.model.model_name)
+    if hasattr(cfg.paths, 'vetime_path') and cfg.paths.vetime_path:
+        log.info(f"加载 VETime 完整权重: {cfg.paths.vetime_path}")
+        state_dict = torch.load(cfg.paths.vetime_path, map_location='cpu')
+        model.load_state_dict(state_dict)
+        log.info("VETime 权重加载完成")
+
+    del vision_model, ts_model
+
+    # ---- 参数统计 ----
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"模型参数: 总计 {total_params:,}, 可训练 {trainable_params:,} "
+             f"({100*trainable_params/total_params:.2f}%)")
+
+    # ---- DataSetting ----
+    data_setting = {"img_size": 224, "T_sqrt": False}
+    collatefn = partial(collate_fn, patch_size=patch_size)
+    g = torch.Generator()
+    g.manual_seed(cfg.seed)
+
+    # ---- DataLoader ----
+    val_loader = None
+    val_mode = getattr(cfg.data, 'val_mode', 'tsb')
+    dynamic_batch = getattr(cfg.data, 'dynamic_batch', False)
+
+    if val_mode == 'split':
+        train_ratio = 1.0 - cfg.data.val_ratio
+        train_dataset = AnomalyDataset(cfg.paths.dataset_path, patch_size=patch_size,
+                                       split="train", train_ratio=train_ratio, seed=cfg.seed)
+        val_dataset = AnomalyDataset(cfg.paths.dataset_path, patch_size=patch_size,
+                                     split="test", train_ratio=train_ratio, seed=cfg.seed)
+        log.info(f"验证模式: split, 训练集 {len(train_dataset)} 样本, "
+                 f"验证集 {len(val_dataset)} 样本 (val_ratio={cfg.data.val_ratio})")
+
+        if dynamic_batch:
+            train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
+            val_lengths = [len(val_dataset.data[i]['time_series']) for i in range(len(val_dataset))]
+            max_tokens = cfg.data.batch_size * max(train_lengths)
+
+            train_sampler = DynamicLengthBatchSampler(
+                train_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=cfg.data.batch_size,
+                max_batch_size=getattr(cfg.data, 'max_batch_size', 256),
+                padding_ratio=getattr(cfg.data, 'padding_ratio', 1.5),
+                drop_last=True, effective_batch_size=cfg.data.batch_size,
+                shuffle_each_epoch=getattr(cfg.data, 'shuffle_bucket', False), seed=cfg.seed,
+            )
+            val_sampler = DynamicLengthBatchSampler(
+                val_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=cfg.data.batch_size,
+                max_batch_size=getattr(cfg.data, 'max_batch_size', 256),
+                padding_ratio=getattr(cfg.data, 'padding_ratio', 1.5),
+                drop_last=False, effective_batch_size=0,
+            )
+            log.info(f"动态 Batch Size: {train_sampler.get_batch_info()}")
+            accelerator.gradient_accumulation_steps = 1
+
+            from src.utils.seed import seed_worker
+            train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                      collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                      pin_memory=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker)
+            val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
+                                    collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                    pin_memory=True, persistent_workers=True,
+                                    worker_init_fn=seed_worker)
+        else:
+            from src.utils.seed import seed_worker
+            train_loader = DataLoader(train_dataset, batch_size=cfg.data.batch_size,
+                                      collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker, generator=g)
+            val_loader = DataLoader(val_dataset, batch_size=cfg.data.batch_size,
+                                    collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                    pin_memory=True, drop_last=False, persistent_workers=True,
+                                    worker_init_fn=seed_worker, generator=g)
+    else:
+        train_dataset = AnomalyDataset(cfg.paths.dataset_path, patch_size=patch_size, split="train")
+        log.info(f"验证模式: tsb, 训练集 {len(train_dataset)} 样本")
+
+        if dynamic_batch:
+            train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
+            max_tokens = cfg.data.batch_size * max(train_lengths)
+
+            train_sampler = DynamicLengthBatchSampler(
+                train_lengths, max_tokens_per_batch=max_tokens,
+                min_batch_size=cfg.data.batch_size,
+                max_batch_size=getattr(cfg.data, 'max_batch_size', 256),
+                padding_ratio=getattr(cfg.data, 'padding_ratio', 1.5),
+                drop_last=True, effective_batch_size=cfg.data.batch_size,
+                shuffle_each_epoch=getattr(cfg.data, 'shuffle_bucket', False), seed=cfg.seed,
+            )
+            log.info(f"动态 Batch Size: {train_sampler.get_batch_info()}")
+
+            accumulation_steps = train_sampler.get_accumulation_steps()
+            accelerator.gradient_accumulation_steps = accumulation_steps
+
+            from src.utils.seed import seed_worker
+            train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
+                                      collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                      pin_memory=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker)
+        else:
+            from src.utils.seed import seed_worker
+            train_loader = DataLoader(train_dataset, batch_size=cfg.data.batch_size,
+                                      collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      worker_init_fn=seed_worker, generator=g)
+
+    # ---- Trainer ----
+    trainer = Trainer(cfg, model, train_loader, val_loader, accelerator,
+                      data_setting, patch_size)
+    return trainer.run()
+
+
 def main(args):
     """
     主入口：根据配置选择训练模式
@@ -1957,8 +2153,8 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=64, help='Random seed')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (paper: 32)')
     parser.add_argument('--num_workers', type=int, default=5, help='Number of data loader workers')
-    parser.add_argument('--effective_batch_size', type=int, default=128,
-                        help='梯度累积的目标有效 batch size，每累积这么多样本就反向传播一次 (默认: 128)')
+    parser.add_argument('--effective_batch_size', type=int, default=256,
+                        help='梯度累积的目标有效 batch size，每累积这么多样本就反向传播一次 (默认: 256)')
     parser.add_argument('--dynamic_batch', action='store_true', default=False,
                         help='启用动态 batch size，短样本时自动增大 batch 以充分利用 GPU')
     parser.add_argument('--max_batch_size', type=int, default=256,
