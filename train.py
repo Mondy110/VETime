@@ -184,14 +184,18 @@ def train_univariate(args):
         else:
             args.file_list = sorted(os.listdir(args.dataset_dir))
 
+    # 计算梯度累积步数：确保每次更新的样本数 = effective_batch_size
+    gradient_accumulation_steps = max(1, args.effective_batch_size // args.batch_size)
+
     accelerator = Accelerator(
         mixed_precision="bf16",
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         log_with="tensorboard",
         project_dir="./output/logs"
     )
 
     logger.info(f"Using {accelerator.num_processes} {'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
+    print(f"[INFO] 梯度累积: {gradient_accumulation_steps} 步 (batch_size={args.batch_size} × 累积步数 = {args.batch_size * gradient_accumulation_steps} 样本/更新)")
 
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
     print(f"[INFO] 正在加载 Vision Encoder (MAE) 权重: checkpoints/weight_v/{args.vision_name}")
