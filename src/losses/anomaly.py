@@ -3,18 +3,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def anomaly_detection_loss(local_embeddings, labels, focal_gamma=2.0, w_anomaly=1.2, w_normal=0.8):
+def anomaly_detection_loss(local_embeddings, labels, anomaly_head=None,
+                           focal_gamma=2.0, w_anomaly=1.2, w_normal=0.8):
     """Masked Focal Loss for anomaly detection.
 
     Standalone function extracted from TS_Model.anomaly_detection_loss.
-    Uses the anomaly_head passed separately or constructed externally.
+
+    When anomaly_head is provided, applies the projection head to local_embeddings
+    (matching the model's method behavior). When None, expects local_embeddings
+    to already be logits of shape [B, seq_len, 2].
 
     - Per-timestep focal loss on valid (non-padding) positions only
     - Decoupled + normalised class weights to keep loss scale stable
 
     Args:
-        local_embeddings: [B, seq_len, num_features, d_proj] embeddings from model
+        local_embeddings: [B, seq_len, num_features, d_proj] embeddings from model,
+                          or [B, seq_len, 2] logits if anomaly_head is None
         labels: [B, seq_len] integer labels (-1=padding, 0=normal, 1=anomaly)
+        anomaly_head: nn.Module for projecting embeddings to 2-class logits (optional)
         focal_gamma: Focal loss gamma parameter (default: 2.0)
         w_anomaly: Weight for anomaly class (default: 1.2)
         w_normal: Weight for normal class (default: 0.8)
@@ -23,29 +29,19 @@ def anomaly_detection_loss(local_embeddings, labels, focal_gamma=2.0, w_anomaly=
         anomaly_loss: scalar loss tensor
         logits: [B, seq_len, 2] classification logits
     """
-    # This function expects local_embeddings and labels
-    # The anomaly_head projection is applied inside the model's method;
-    # here we take the logits directly if already projected, or compute them.
-    # For standalone use, local_embeddings should already be the output of anomaly_head.
-    # But since the model's method applies anomaly_head internally,
-    # this standalone version accepts pre-computed logits.
-
-    # If local_embeddings is 4D (from model output), it needs to go through anomaly_head
-    # which is model-specific. So this standalone function takes logits directly
-    # as the first argument when used externally.
-    # For maximum compatibility with the model's method signature,
-    # we check if the input looks like logits (3D with last dim = 2).
-    if local_embeddings.dim() == 3 and local_embeddings.size(-1) == 2:
-        # Already logits
-        logits = local_embeddings
+    if anomaly_head is not None:
+        # Apply anomaly_head projection + average across num_features
+        # (matches TS_Model.anomaly_detection_loss behavior)
+        logits = anomaly_head(local_embeddings)  # [B, seq_len, num_features, 2]
+        logits = logits.mean(dim=-2)              # [B, seq_len, 2]
     else:
-        # Need anomaly_head projection - but this standalone function doesn't have it.
-        # The model's method should be used instead.
-        raise ValueError(
-            "Standalone anomaly_detection_loss expects pre-computed logits "
-            "(shape [B, seq_len, 2]). Use model.anomaly_detection_loss() for "
-            "raw embeddings, or apply anomaly_head first."
-        )
+        # Expect pre-computed logits
+        if local_embeddings.dim() != 3 or local_embeddings.size(-1) != 2:
+            raise ValueError(
+                f"When anomaly_head is None, local_embeddings must be logits "
+                f"of shape [B, seq_len, 2], got {local_embeddings.shape}"
+            )
+        logits = local_embeddings
 
     # Mask out padding timesteps (labels == -1)
     attention_mask = (labels != -1)  # [B, seq_len]

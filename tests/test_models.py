@@ -29,17 +29,48 @@ def test_load_balance_loss():
     assert abs(loss.item() - 1.0) < 0.01, f"Expected ~1.0 for uniform, got {loss.item()}"
 
 def test_anomaly_detection_loss_output():
-    """验证 anomaly_detection_loss 输出格式。"""
+    """验证 anomaly_detection_loss 接受预计算 logits 时的输出格式。"""
     import torch
     from src.losses.anomaly import anomaly_detection_loss
     B, L, d = 2, 32, 256
-    # Standalone function expects pre-computed logits [B, L, 2]
+    # Without anomaly_head: pass pre-computed logits [B, L, 2]
     logits = torch.randn(B, L, 2)
     labels = torch.zeros(B, L, dtype=torch.long)
-    labels[0, 5:10] = 1  # 标记一些异常点
+    labels[0, 5:10] = 1
     loss, out_logits = anomaly_detection_loss(logits, labels)
     assert loss.dim() == 0, f"Loss should be scalar, got shape {loss.shape}"
     assert out_logits.shape == (B, L, 2), f"Expected logits (B,L,2), got {out_logits.shape}"
+
+def test_anomaly_detection_loss_with_head():
+    """验证 anomaly_detection_loss 接受 anomaly_head 时的输出格式。"""
+    import torch
+    import torch.nn as nn
+    from src.losses.anomaly import anomaly_detection_loss
+    B, L, d_proj = 2, 32, 256
+    num_features = 1
+    # 构造简单的 anomaly_head: d_proj -> d_proj//2 -> GELU -> 2
+    head = nn.Sequential(
+        nn.Linear(d_proj, d_proj // 2),
+        nn.GELU(),
+        nn.Linear(d_proj // 2, 2),
+    )
+    # 模拟模型输出: [B, seq_len, num_features, d_proj]
+    embeddings = torch.randn(B, L, num_features, d_proj)
+    labels = torch.zeros(B, L, dtype=torch.long)
+    labels[0, 5:10] = 1
+    loss, out_logits = anomaly_detection_loss(embeddings, labels, anomaly_head=head)
+    assert loss.dim() == 0, f"Loss should be scalar, got shape {loss.shape}"
+    assert out_logits.shape == (B, L, 2), f"Expected logits (B,L,2), got {out_logits.shape}"
+
+def test_anomaly_detection_loss_rejects_raw_embeddings():
+    """验证 anomaly_detection_loss 在无 anomaly_head 时拒绝 4D 输入。"""
+    import torch
+    from src.losses.anomaly import anomaly_detection_loss
+    B, L, d_proj = 2, 32, 256
+    embeddings = torch.randn(B, L, 1, d_proj)
+    labels = torch.zeros(B, L, dtype=torch.long)
+    with pytest.raises(ValueError, match="anomaly_head is None"):
+        anomaly_detection_loss(embeddings, labels)
 
 def test_weighted_reconstruction_loss():
     """验证 weighted_reconstruction_loss 输出格式。"""
