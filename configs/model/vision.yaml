@@ -1,0 +1,6 @@
+# ==================== 视觉编码器配置 ====================
+max_seq_length: 5000                # 最大序列长度
+unpatch: true                       # 是否使用 unpatch 模式
+finetune_type: none                 # 微调类型（none=完全冻结）
+use_vectorized_fold: true           # 是否使用向量化 fold_image
+img_size: 224                       # 输入图像尺寸

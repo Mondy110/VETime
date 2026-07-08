@@ -1,0 +1,15 @@
+# ==================== VETIME 时序编码器配置 ====================
+d_model: 512                        # Transformer 隐藏维度
+d_proj: 256                         # 投影维度
+patch_size: 16                      # Patch 大小
+num_layers: 8                       # Transformer 层数
+num_heads: 8                        # 注意力头数
+d_ff_dropout: 0.1                   # FFN dropout 率
+max_total_tokens: 8192              # 最大 token 数
+num_query_tokens: 1                 # 查询 token 数
+use_rope: true                      # 是否使用旋转位置编码
+activation: gelu                    # 激活函数
+num_features: 1                     # 输入特征数
+use_lora: true                      # 是否使用 LoRA 微调
+lora_r: 8                           # LoRA 秩
+lora_alpha: 16                      # LoRA alpha

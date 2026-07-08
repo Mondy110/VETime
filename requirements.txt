@@ -25,6 +25,10 @@ tensorboard>=2.13.0
 peft>=0.4.0
 jaxtyping>=0.2.0
 
+# Configuration management
+hydra-core>=1.3
+omegaconf>=2.3
+
 # Optional: for visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0

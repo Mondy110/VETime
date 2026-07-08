@@ -60,3 +60,25 @@ def test_save_checkpoint_no_directory():
         save_checkpoint(data, path)
         loaded = load_checkpoint(path)
         assert loaded["epoch"] == 1
+
+
+# ==================== 配置文件加载测试 ====================
+from omegaconf import OmegaConf
+
+def test_base_config_loads():
+    cfg = OmegaConf.load("configs/base.yaml")
+    assert cfg.seed == 2024
+    assert cfg.training.stage1_epochs == 1
+    assert cfg.loss.alpha_recon == 0.05
+    assert cfg.data.batch_size == 32
+
+def test_vetime_config_loads():
+    cfg = OmegaConf.load("configs/model/vetime.yaml")
+    assert cfg.d_model == 512
+    assert cfg.use_lora is True
+    assert cfg.lora_r == 8
+
+def test_vision_config_loads():
+    cfg = OmegaConf.load("configs/model/vision.yaml")
+    assert cfg.img_size == 224
+    assert cfg.finetune_type == "none"
