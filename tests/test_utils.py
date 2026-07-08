@@ -1,4 +1,5 @@
 import os
+import pytest
 import torch
 import numpy as np
 import random
@@ -45,3 +46,17 @@ def test_save_load_checkpoint_roundtrip():
         assert loaded["epoch"] == 5
         assert abs(loaded["loss"] - 0.123) < 1e-6
         assert loaded["tags"] == ["a", "b"]
+
+def test_load_checkpoint_missing_file():
+    from src.utils.checkpoint import load_checkpoint
+    with pytest.raises(FileNotFoundError):
+        load_checkpoint("/nonexistent/path/checkpoint.pt")
+
+def test_save_checkpoint_no_directory():
+    from src.utils.checkpoint import save_checkpoint, load_checkpoint
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model.pt")  # 纯文件名，无子目录
+        data = {"epoch": 1}
+        save_checkpoint(data, path)
+        loaded = load_checkpoint(path)
+        assert loaded["epoch"] == 1
