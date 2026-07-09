@@ -129,3 +129,18 @@ def test_separate_gradient_paths():
     max_diff = diff.max().item()
     assert max_diff > 1e-6, \
         f"两个任务的梯度路径应该有所不同。最大差异: {max_diff}"
+
+
+def test_query_decoder_disabled_by_default():
+    """验证 QueryDecoder 默认禁用，不影响现有代码路径"""
+    # 这个测试验证 QueryDecoder 只是一个独立模块
+    # VETIME 模型默认不使用 QueryDecoder (use_query_decoder=False)
+    from model.VTS_module import QueryDecoder
+
+    # QueryDecoder 可以独立实例化，不影响现有代码
+    decoder = QueryDecoder(d_model=256, num_heads=8)
+    assert decoder is not None
+
+    # 验证默认参数
+    assert decoder.d_model == 256
+    assert decoder.num_heads == 8

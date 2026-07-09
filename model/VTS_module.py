@@ -353,13 +353,15 @@ class QueryDecoder(nn.Module):
             query=Q_rec,
             key=K,
             value=V,
-            key_padding_mask=~kv_mask if kv_mask is not None else None
+            key_padding_mask=~kv_mask if kv_mask is not None else None,
+            need_weights=False
         )
         F_cls_attn, _ = self.cross_attn_cls(
             query=Q_cls,
             key=K,
             value=V,
-            key_padding_mask=~kv_mask if kv_mask is not None else None
+            key_padding_mask=~kv_mask if kv_mask is not None else None,
+            need_weights=False
         )
 
         # 6. 残差连接 + LayerNorm
