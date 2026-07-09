@@ -579,10 +579,14 @@ def train_univariate(args):
                     # ========== 两阶段训练范式：门控负载均衡损失 ==========
                     # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
                     # 阶段2: 恢复双分支计算
-                    if is_stage_1:
-                        batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                    # QueryDecoder 模式下 m_w 为 None，无需负载均衡损失
+                    if m_w is not None:
+                        if is_stage_1:
+                            batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                        else:
+                            batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     else:
-                        batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                        batch_loss_e_part = 0.0
 
                     # ========== 两阶段训练范式：异常分类损失 ==========
                     # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
@@ -625,10 +629,14 @@ def train_univariate(args):
                 # ========== 两阶段训练范式：门控负载均衡损失 ==========
                 # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
                 # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
-                if is_stage_1:
-                    loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                # QueryDecoder 模式下 m_w 为 None，无需负载均衡损失
+                if m_w is not None:
+                    if is_stage_1:
+                        loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                    else:
+                        loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                 else:
-                    loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    loss_e_tensor = torch.tensor(0.0, device=time_series.device)
 
                 # ========== 两阶段训练范式：异常分类损失 ==========
                 # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
@@ -953,7 +961,8 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    lb_loss = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) if m_w is not None else 0.0
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + lb_loss
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -967,7 +976,8 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
+                lb_loss = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) if m_w is not None else 0.0
+                loss2 = loss2 + lb_loss + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -1209,7 +1219,8 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                     loss02, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, ts_part, att_mask_part, label_part)
 
-                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                    lb_loss = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) if m_w is not None else 0.0
+                    loss2_total = loss2_total + loss02 + 0.1 * loss_cl + lb_loss
                     loss1_total = loss1_total + loss01
 
                 batch_loss = loss1_total.item() + loss2_total.item()
@@ -1223,7 +1234,8 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                 loss1, _ = model.anomaly_detection_loss(local_embeddings1, labels)
                 loss2, _ = model.weighted_reconstruction_loss(
                     local_embeddings2, time_series, att_mask, labels)
-                loss2 = loss2 + 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) + 0.1 * loss_cl
+                lb_loss = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])) if m_w is not None else 0.0
+                loss2 = loss2 + lb_loss + 0.1 * loss_cl
 
                 batch_loss = loss1.item() + loss2.item()
 
@@ -1632,10 +1644,14 @@ def train_multivariate(args, config: Dict[str, Any]):
                         # ========== 两阶段训练范式：门控负载均衡损失 ==========
                         # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
                         # 阶段2: 恢复双分支计算
-                        if is_stage_1:
-                            batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                        # QueryDecoder 模式下 m_w 为 None，无需负载均衡损失
+                        if m_w is not None:
+                            if is_stage_1:
+                                batch_loss_e_part = 0.01 * load_balance_loss(m_w[0])
+                            else:
+                                batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                         else:
-                            batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                            batch_loss_e_part = 0.0
 
                         # ========== 两阶段训练范式：异常分类损失 ==========
                         # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
@@ -1678,10 +1694,14 @@ def train_multivariate(args, config: Dict[str, Any]):
                     # ========== 两阶段训练范式：门控负载均衡损失 ==========
                     # 阶段1: 仅保留重建任务分支 m_w[0]，切断异常路由 m_w[1]，防止异常路由器为平均分配产生无意义梯度
                     # 阶段2: 恢复双分支计算 (保留 Tensor 格式，为了后续反向传播)
-                    if is_stage_1:
-                        loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                    # QueryDecoder 模式下 m_w 为 None，无需负载均衡损失
+                    if m_w is not None:
+                        if is_stage_1:
+                            loss_e_tensor = 0.01 * load_balance_loss(m_w[0])
+                        else:
+                            loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     else:
-                        loss_e_tensor = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
+                        loss_e_tensor = torch.tensor(0.0, device=device)
 
                     # ========== 两阶段训练范式：异常分类损失 ==========
                     # 阶段1: 强制切断，loss1 归零（脱离异常分类头的梯度）
@@ -1949,7 +1969,7 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=64, help='Random seed')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (paper: 32)')
     parser.add_argument('--num_workers', type=int, default=5, help='Number of data loader workers')
-    parser.add_argument('--effective_batch_size', type=int, default=128,
+    parser.add_argument('--effective_batch_size', type=int, default=256,
                         help='梯度累积的目标有效 batch size，每累积这么多样本就反向传播一次 (默认: 128)')
     parser.add_argument('--dynamic_batch', action='store_true', default=False,
                         help='启用动态 batch size，短样本时自动增大 batch 以充分利用 GPU')
