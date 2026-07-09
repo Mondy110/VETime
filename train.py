@@ -126,16 +126,26 @@ def freeze_for_cls_warmup(model, accelerator):
 
     可训练参数:
       - anomaly_head.*            (分类 MLP)
-      - mm_w.task_proj.1.T.*      (分类时序专家投影)
-      - mm_w.task_proj.1.I.*      (分类图像专家投影)
-      - mm_w.task_proj.1.M.*      (分类混合专家投影)
-      - mm_w.Router.*             (任务路由，task_embedding 按任务隔离)
+      - mm_w.task_proj.1.T.*      (分类时序专家投影) - M_moe 模式
+      - mm_w.task_proj.1.I.*      (分类图像专家投影) - M_moe 模式
+      - mm_w.task_proj.1.M.*      (分类混合专家投影) - M_moe 模式
+      - mm_w.Router.*             (任务路由，task_embedding 按任务隔离) - M_moe 模式
+      - query_decoder.*           (QueryDecoder 全部参数) - QueryDecoder 模式
+      - fusion_proj.*             (融合投影层) - QueryDecoder 模式
 
     其余全部冻结（视觉编码器、时序编码器、LoRA、重构头、重构专家、共享 mlp_m、fusion 等）。
     返回 saved_requires_grad 字典，用于后续恢复。
     """
     unwrapped = accelerator.unwrap_model(model)
-    classification_patterns = ['anomaly_head', 'mm_w.task_proj.1.', 'mm_w.Router.']
+
+    # 根据模式选择可训练参数模式
+    if hasattr(model, 'use_query_decoder') and model.use_query_decoder:
+        # QueryDecoder 模式：训练分类相关 + query_decoder
+        classification_patterns = ['anomaly_head', 'query_decoder.', 'fusion_proj.']
+    else:
+        # M_moe 模式：训练分类相关专家投影
+        classification_patterns = ['anomaly_head', 'mm_w.task_proj.1.', 'mm_w.Router.']
+
     saved_requires_grad = {}
     frozen_count = 0
     trainable_count = 0
@@ -516,7 +526,11 @@ def train_univariate(args):
         # ========== 分类预热（Classification Warmup）==========
         # Stage 2 首个 epoch：前 cls_warmup_ratio 比例的 batch 仅训练分类相关参数
         # 让分类网络先平稳初始化，避免突然引入分类梯度造成巨大震荡
-        is_cls_warmup_epoch = (not is_stage_1) and (epoch == args.stage1_epochs) and (args.cls_warmup_ratio > 0)
+        # QueryDecoder 模式：两个任务通过独立 Query 解耦，不需要分类预热
+        use_cls_warmup = (not is_stage_1) and (epoch == args.stage1_epochs) and (args.cls_warmup_ratio > 0)
+        if hasattr(model, 'use_query_decoder') and model.use_query_decoder:
+            use_cls_warmup = False  # QueryDecoder 模式跳过分类预热
+        is_cls_warmup_epoch = use_cls_warmup
         cls_warmup_active = False
         saved_requires_grad = None
         cls_warmup_batches = 0
