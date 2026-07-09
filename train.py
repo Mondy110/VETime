@@ -596,9 +596,9 @@ def train_univariate(args):
 
                     # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
                     batch_loss_bce += loss01.item()
-                    batch_loss_mse += loss02.item() 
+                    batch_loss_mse += loss02.item()
                     batch_loss_cl += (0.1 * loss_cl).item()
-                    batch_loss_e += batch_loss_e_part.item()
+                    batch_loss_e += batch_loss_e_part if isinstance(batch_loss_e_part, float) else batch_loss_e_part.item()
 
                     # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
                     loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
@@ -651,7 +651,7 @@ def train_univariate(args):
                 batch_loss_bce = loss1.item()
                 batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
                 batch_loss_cl = (0.1 * loss_cl).item()
-                batch_loss_e = loss_e_tensor.item()
+                batch_loss_e = loss_e_tensor.item() if hasattr(loss_e_tensor, 'item') else 0.0
 
             # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
             accelerator.backward(loss1 + loss2)
@@ -1661,9 +1661,9 @@ def train_multivariate(args, config: Dict[str, Any]):
 
                         # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
                         batch_loss_bce += loss01.item()
-                        batch_loss_mse += loss02.item() 
+                        batch_loss_mse += loss02.item()
                         batch_loss_cl += (0.1 * loss_cl).item()
-                        batch_loss_e += batch_loss_e_part.item()
+                        batch_loss_e += batch_loss_e_part if isinstance(batch_loss_e_part, float) else batch_loss_e_part.item()
 
                         # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
                         loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
@@ -1716,7 +1716,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                     batch_loss_bce = loss1.item()
                     batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
                     batch_loss_cl = (0.1 * loss_cl).item()
-                    batch_loss_e = loss_e_tensor.item()
+                    batch_loss_e = loss_e_tensor.item() if hasattr(loss_e_tensor, 'item') else 0.0
 
                 # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
                 accelerator.backward(loss1 + loss2)
