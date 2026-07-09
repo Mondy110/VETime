@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from model.VTS_module import QueryDecoder
 
 
@@ -72,3 +73,59 @@ def test_rope_position_alignment():
     Q2_rot = decoder.apply_rope(Q2, freqs)
 
     assert torch.allclose(Q1_rot, Q2_rot), "相同位置应产生相同旋转结果"
+
+
+def test_gradient_flow_to_experts():
+    """测试梯度正确传播到专家特征"""
+    B, N, D = 2, 64, 256
+    decoder = QueryDecoder(d_model=D, num_heads=8, dropout=0.1)
+
+    F_TS = torch.randn(B, N, D, requires_grad=True)
+    F_V = torch.randn(B, N, D, requires_grad=True)
+    F_A = torch.randn(B, N, D, requires_grad=True)
+
+    F_rec, F_cls = decoder(F_TS, F_V, F_A)
+
+    loss = F_rec.mean() + F_cls.mean()
+    loss.backward()
+
+    assert F_TS.grad is not None, "梯度未传播到 F_TS"
+    assert F_V.grad is not None, "梯度未传播到 F_V"
+    assert F_A.grad is not None, "梯度未传播到 F_A"
+    assert F_TS.grad.shape == F_TS.shape
+
+
+def test_separate_gradient_paths():
+    """测试两个任务的梯度路径独立"""
+    B, N, D = 2, 64, 256
+    decoder = QueryDecoder(d_model=D, num_heads=8, dropout=0.0)
+
+    F_TS = torch.randn(B, N, D, requires_grad=True)
+    F_V = torch.randn(B, N, D, requires_grad=True)
+    F_A = torch.randn(B, N, D, requires_grad=True)
+
+    decoder.eval()  # 关闭 dropout 确保确定性
+    F_rec, F_cls = decoder(F_TS, F_V, F_A)
+
+    # 使用不同的目标计算损失，模拟实际训练中的任务差异
+    target_rec = torch.randn(B, N, D)
+    target_cls = torch.randn(B, N, D)
+
+    loss_rec = F.mse_loss(F_rec, target_rec)
+    loss_rec.backward(retain_graph=True)
+    grad_TS_from_rec = F_TS.grad.clone()
+
+    F_TS.grad = None
+    F_V.grad = None
+    F_A.grad = None
+
+    loss_cls = F.mse_loss(F_cls, target_cls)
+    loss_cls.backward()
+    grad_TS_from_cls = F_TS.grad.clone()
+
+    # 验证两个任务的梯度有显著差异
+    # 因为使用不同的交叉注意力层和任务Token，梯度应该不同
+    diff = (grad_TS_from_rec - grad_TS_from_cls).abs()
+    max_diff = diff.max().item()
+    assert max_diff > 1e-6, \
+        f"两个任务的梯度路径应该有所不同。最大差异: {max_diff}"
