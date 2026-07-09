@@ -50,6 +50,23 @@ class VETIME(TS_Model):
         # loss setting
         self.cl_loss=win_Contrastive_Loss(t_dim,temperature=0.1)
 
+        # 新增：Query-based 解码器（可选）
+        self.query_decoder = None
+        self.fusion_proj = None
+        self.use_query_decoder = kwargs.get('use_query_decoder', False)
+
+        if self.use_query_decoder:
+            from model.VTS_module import QueryDecoder
+            self.query_decoder = QueryDecoder(
+                d_model=t_dim,
+                num_heads=8,
+                dropout=0.1
+            )
+            self.fusion_proj = nn.Sequential(
+                nn.Linear(t_dim * 2, t_dim),
+                nn.LayerNorm(t_dim)
+            )
+
         # Enable gradient checkpointing for memory efficiency
         if self.use_gradient_checkpointing:
             self._enable_gradient_checkpointing()
@@ -86,6 +103,37 @@ class VETIME(TS_Model):
 
         I_embeddings,TS_embeddings = self.fusion(I_embeddings0,TS_embeddings0,patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
+
+        # === 新增：Query-based 解码路径 ===
+        if self.use_query_decoder and self.query_decoder is not None:
+            # 生成三个专家特征
+            F_TS = TS_embeddings0  # (B, N, D) 时间专家
+            F_V = I_embeddings      # (B, N, D) 视觉专家
+
+            # 融合专家特征
+            mix_out0_for_proj = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+            F_A = self.fusion_proj(mix_out0_for_proj)  # (B, N, D)
+
+            # Query-based 解码
+            F_rec, F_cls = self.query_decoder(F_TS, F_V, F_A, patch_mask)
+
+            # 任务头投影 - 分类分支
+            patch_proj = self.projection_layer(F_cls)
+            local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            # 任务头投影 - 重构分支
+            patch_proj2 = self.projection_layer(F_rec)
+            local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            # 新路径无路由权重
+            m_w = None
+
+            return local_embeddings1, m_w, loss_sc, local_embeddings2
+
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
         # 两路任务干净并行：task 1 -> anomaly head(local_emb1), task 0 -> reconstruction head(local_emb2)
         # 任务映射保持与原实现一致（原 mask=None 分支 = task 1 = anomaly）。
@@ -102,7 +150,7 @@ class VETIME(TS_Model):
         patch_proj2 = self.projection_layer(mix_out_r)
         local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
         local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()  # (B, num_patches, patch_size, num_features, d_proj)
-        local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B,
+        local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
 
         return local_embeddings1,m_w,loss_sc,local_embeddings2
 
