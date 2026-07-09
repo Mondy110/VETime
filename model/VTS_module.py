@@ -247,3 +247,127 @@ class M_moe(nn.Module):
             F_M_p * m_w[..., 2:3]
         )
         return c_fusion, m_w
+
+
+from model.TS_encoder.encoding_utils import RotaryEmbedding
+
+
+class QueryDecoder(nn.Module):
+    """基于 Query 的隐式路由解码器。
+
+    通过任务专属 Query 从专家存储库中提取最相关特征，
+    实现梯度驱动的隐空间自发分化。
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+
+        # 任务 Token（可学习参数）
+        self.task_token_rec = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.task_token_cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.normal_(self.task_token_rec, std=0.02)
+        nn.init.normal_(self.task_token_cls, std=0.02)
+
+        # RoPE 位置编码（复用现有）
+        self.rope = RotaryEmbedding(d_model)
+
+        # 交叉注意力层（每个任务独立）
+        self.cross_attn_rec = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.cross_attn_cls = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # LayerNorm
+        self.norm_rec = nn.LayerNorm(d_model)
+        self.norm_cls = nn.LayerNorm(d_model)
+
+        # FFN（增加表达能力）
+        self.ffn_rec = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        self.ffn_cls = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        self.norm_ffn_rec = nn.LayerNorm(d_model)
+        self.norm_ffn_cls = nn.LayerNorm(d_model)
+
+    def apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+        """应用 RoPE 位置编码。"""
+        B, seq_len, embed_dim = x.shape
+        x_ = x.view(B, seq_len, embed_dim // 2, 2)
+        cos = freqs.cos().unsqueeze(0)
+        sin = freqs.sin().unsqueeze(0)
+
+        x_rot = torch.stack([
+            x_[..., 0] * cos - x_[..., 1] * sin,
+            x_[..., 0] * sin + x_[..., 1] * cos,
+        ], dim=-1)
+        return x_rot.view(B, seq_len, embed_dim)
+
+    def forward(
+        self,
+        F_TS: torch.Tensor,
+        F_V: torch.Tensor,
+        F_A: torch.Tensor,
+        patch_mask: torch.Tensor = None
+    ) -> tuple:
+        """前向传播。"""
+        B, N, D = F_TS.shape
+
+        # 1. 构建专家存储库
+        K = V = torch.cat([F_TS, F_V, F_A], dim=1)  # (B, 3N, D)
+
+        # 2. 生成位置编码
+        freqs = self.rope(N)  # (N, D // 2)
+
+        # 3. 生成任务 Query
+        Q_rec_base = self.task_token_rec.expand(B, N, -1)
+        Q_cls_base = self.task_token_cls.expand(B, N, -1)
+
+        Q_rec = self.apply_rope(Q_rec_base, freqs)
+        Q_cls = self.apply_rope(Q_cls_base, freqs)
+
+        # 4. 构建注意力掩码
+        kv_mask = None
+        if patch_mask is not None:
+            kv_mask = patch_mask.repeat(1, 3)
+
+        # 5. 交叉注意力
+        F_rec_attn, _ = self.cross_attn_rec(
+            query=Q_rec,
+            key=K,
+            value=V,
+            key_padding_mask=~kv_mask if kv_mask is not None else None
+        )
+        F_cls_attn, _ = self.cross_attn_cls(
+            query=Q_cls,
+            key=K,
+            value=V,
+            key_padding_mask=~kv_mask if kv_mask is not None else None
+        )
+
+        # 6. 残差连接 + LayerNorm
+        F_rec = self.norm_rec(Q_rec + F_rec_attn)
+        F_cls = self.norm_cls(Q_cls + F_cls_attn)
+
+        # 7. FFN + 残差
+        F_rec = self.norm_ffn_rec(F_rec + self.ffn_rec(F_rec))
+        F_cls = self.norm_ffn_cls(F_cls + self.ffn_cls(F_cls))
+
+        return F_rec, F_cls
