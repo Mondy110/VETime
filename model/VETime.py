@@ -186,6 +186,35 @@ class VETIME(TS_Model):
 
         loss_sc = self.compute_cl(I_embeddings, TS_embeddings, labels, num_features)
 
+        # === Query-based 解码路径 ===
+        if self.use_query_decoder and self.query_decoder is not None:
+            def query_decoder_forward(TS_embeddings0, I_embeddings, TS_embeddings, patch_mask, B, seq_len, num_features):
+                F_TS = TS_embeddings0
+                F_V = I_embeddings
+                mix_out0_for_proj = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+                F_A = self.fusion_proj(mix_out0_for_proj)
+
+                F_rec, F_cls = self.query_decoder(F_TS, F_V, F_A, patch_mask)
+
+                patch_proj = self.projection_layer(F_cls)
+                local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+                patch_proj2 = self.projection_layer(F_rec)
+                local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+                return local_embeddings1, local_embeddings2
+
+            local_embeddings1, local_embeddings2 = checkpoint(
+                query_decoder_forward,
+                TS_embeddings0, I_embeddings, TS_embeddings, patch_mask, B, seq_len, num_features
+            )
+            m_w = None
+            return local_embeddings1, m_w, loss_sc, local_embeddings2
+
         # Part 3: MoE + projection (使用 checkpoint)
         def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
             # 两路任务干净并行：task 1 -> anomaly, task 0 -> reconstruction（与 _forward_impl 一致）
