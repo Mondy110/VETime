@@ -53,10 +53,10 @@ total_loss = rec_loss + cls_loss + loss_sc
 
 ### 核心组件
 
-1. **任务 Token**: 可学习参数 `task_token_rec` 和 `task_token_cls`，初始化标准差为 0.02
-2. **RoPE 位置编码**: 与 TS_encoder 保持一致，确保位置对齐
-3. **交叉注意力层**: 每个任务独立的 MultiheadAttention
-4. **FFN 层**: 增强表达能力，包含 GELU 激活和 Dropout
+1. **任务原型 Token**: 可学习参数 `task_token_rec` 和 `task_token_cls`，初始化标准差为 0.02
+2. **RoPE 位置编码**: 与 TS_encoder 保持一致，投影后应用旋转
+3. **共享交叉注意力层**: Q/K/V 投影 + Flash Attention
+4. **共享 FFN 层**: 两个任务共享，促进隐式正则化
 
 ### 工作流程
 
@@ -65,25 +65,24 @@ total_loss = rec_loss + cls_loss + loss_sc
   |
   v
 构建专家存储库 K = V = cat([F_TS, F_V, F_A])  ->  (B, 3N, D)
+构建任务 Queries Q = cat([task_token_rec, task_token_cls])  ->  (B, 2N, D)
   |
   v
-生成位置编码 freqs = RoPE(N)
+线性投影: Q, K, V = q_proj(Q), k_proj(K), v_proj(V)
   |
   v
-生成任务 Query:
-  Q_rec = apply_rope(task_token_rec, freqs)
-  Q_cls = apply_rope(task_token_cls, freqs)
+块对齐 RoPE:
+  Q_rot = apply_rope(Q, freqs_2N)  # 重构群 + 分类群
+  K_rot = apply_rope(K, freqs_3N)  # 时间专家 + 视觉专家 + 融合专家
   |
   v
-交叉注意力:
-  F_rec_attn = CrossAttn_rec(Q_rec, K, V)
-  F_cls_attn = CrossAttn_cls(Q_cls, K, V)
+Flash Attention: y = F.scaled_dot_product_attention(Q_rot, K_rot, V)
   |
   v
-残差 + LayerNorm + FFN
+输出投影 + LayerNorm + 共享 FFN
   |
   v
-输出: F_rec, F_cls (各 B x N x D)
+任务解耦: F_rec = y[:, :N, :], F_cls = y[:, N:, :]
 ```
 
 ### 与 M_moe 对比
@@ -91,12 +90,42 @@ total_loss = rec_loss + cls_loss + loss_sc
 | 特性 | M_moe | QueryDecoder |
 |------|-------|--------------|
 | 路由机制 | 显式软门控 | 隐式注意力路由 |
-| 任务解耦 | 共享特征 | 任务专属 Query |
-| 梯度流 | 耦合 | 自发分化 |
+| 任务解耦 | 共享特征 + 任务投影 | 任务专属 Query Token |
+| 共享层 | Router 跨任务共享 | Cross-Attention + FFN 共享 |
+| 梯度流 | 通过门控权重耦合 | 通过注意力权重自发分化 |
 | 路由权重 | 返回 m_w 供负载均衡 | 无显式权重 |
-| 参数效率 | 任务共享投影层 | 任务独立注意力层 |
+| 参数效率 | 较高（任务共享 Router） | 极高（单层共享解码器） |
 
 ## 训练建议
+
+### 训练模式选择
+
+QueryDecoder 支持两种训练模式，通过命令行参数 `--query_decoder_training_mode` 选择：
+
+**模式 1: 同时训练 (joint, 推荐)**
+```bash
+python train.py --query_decoder_training_mode joint
+```
+- 从 epoch 0 开始多任务联合训练
+- 两个任务通过独立 Query 自然解耦，RoPE 让任务关注专家库不同位置
+- 梯度驱动隐式路由，自发分化
+
+**模式 2: 分阶段训练 (staged)**
+```bash
+python train.py --query_decoder_training_mode staged --stage1_epochs 1
+```
+- 阶段 1 (epoch < stage1_epochs): 仅训练重构任务
+- 阶段 2 (epoch >= stage1_epochs): 加入分类任务
+- 适用于重构任务需要优先收敛的场景
+
+**对比建议**:
+| 特性 | joint | staged |
+|------|-------|--------|
+| 收敛速度 | 较快 | 较慢 |
+| 任务冲突 | RoPE 自动化解 | 需手动调节 |
+| 适用场景 | 通用（推荐） | 重构优先级极高时 |
+
+### 其他建议
 
 1. **学习率**: 新参数（task_token, cross_attn, ffn）建议使用较小学习率，可通过参数分组实现：
    ```python
@@ -174,16 +203,31 @@ pytest tests/test_query_decoder.py -v
 
 ### RoPE 位置编码
 
-QueryDecoder 使用与 TS_encoder 相同的 RotaryEmbedding 实现，确保位置编码一致性。位置编码应用于任务 Query，使其能够区分不同时间位置。
+QueryDecoder 使用与 TS_encoder 相同的 RotaryEmbedding 实现，关键设计：
 
-### 梯度流特性
+**投影后应用**（与 VETime Encoder 对齐）：
+```python
+# 1. 先进行线性投影
+q = self.q_proj(Q_combined)  # (B, 2N, D)
+k = self.k_proj(K_expert)    # (B, 3N, D)
 
-每个任务拥有独立的交叉注意力层和任务 Token，使得：
-- 重构任务梯度主要影响 `cross_attn_rec` 和 `task_token_rec`
-- 分类任务梯度主要影响 `cross_attn_cls` 和 `task_token_cls`
-- 专家特征（F_TS, F_V, F_A）接收两个任务的梯度叠加，实现自发分化
+# 2. 再应用 RoPE（投影后、分头前）
+q_rot = self.apply_rope(q, freqs_2N)
+k_rot = self.apply_rope(k, freqs_3N)
+```
+
+**块对齐频率**：
+- `freqs_2N = cat([freqs_N, freqs_N])` → 重构群 + 分类群
+- `freqs_3N = cat([freqs_N, freqs_N, freqs_N])` → 时间专家 + 视觉专家 + 融合专家
+
+### Flash Attention 加速
+
+使用 `F.scaled_dot_product_attention` 原生支持 Flash Attention 2：
+- 计算复杂度: O(2N × 3N) = O(6N²)
+- 无需显式计算注意力权重矩阵
+- 显存占用从 O(N²) 降至 O(N)
 
 ### 内存优化
 
 - 支持 gradient checkpointing 以减少显存占用
-- 交叉注意力使用 `need_weights=False` 启用 Flash Attention
+- 共享解码器设计，参数量极低

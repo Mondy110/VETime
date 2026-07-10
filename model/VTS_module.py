@@ -253,123 +253,124 @@ from model.TS_encoder.encoding_utils import RotaryEmbedding
 
 
 class QueryDecoder(nn.Module):
-    """基于 Query 的隐式路由解码器。
+    """极致轻量化的共享任务解码器（修复优化版）。
 
-    通过任务专属 Query 从专家存储库中提取最相关特征，
-    实现梯度驱动的隐空间自发分化。
+    通过在长度轴级联任务 Queries，用单层共享的 Cross-Attention 与 FFN
+    实现双任务在隐空间的自发分化与解耦，并原生支持块对齐 RoPE 与 Flash Attention 加速。
     """
 
     def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
 
-        # 任务 Token（可学习参数）
-        self.task_token_rec = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.task_token_cls = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.normal_(self.task_token_rec, std=0.02)
-        nn.init.normal_(self.task_token_cls, std=0.02)
+        # 1. 任务原型 Token（可学习参数，保持 1x1 极其轻量）
+        self.task_token_rec = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.task_token_cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
         # RoPE 位置编码（复用现有）
         self.rope = RotaryEmbedding(d_model)
 
-        # 交叉注意力层（每个任务独立）
-        self.cross_attn_rec = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.cross_attn_cls = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        # 2. 显式定义交叉注意力的四路投影层，以便在正确的位置插入 RoPE 算子
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.norm_cross = nn.LayerNorm(d_model)
 
-        # LayerNorm
-        self.norm_rec = nn.LayerNorm(d_model)
-        self.norm_cls = nn.LayerNorm(d_model)
-
-        # FFN（增加表达能力）
-        self.ffn_rec = nn.Sequential(
+        # 3. 共享前馈网络 (FFN)
+        self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_model * 4, d_model)
         )
-        self.ffn_cls = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model)
-        )
-        self.norm_ffn_rec = nn.LayerNorm(d_model)
-        self.norm_ffn_cls = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """应用 RoPE 位置编码。"""
+        """应用 RoPE 位置编码。与 VETime 原文投影后、分头前的旋转逻辑完全对齐。"""
         B, seq_len, embed_dim = x.shape
-        x_ = x.view(B, seq_len, embed_dim // 2, 2)
-        cos = freqs.cos().unsqueeze(0)
-        sin = freqs.sin().unsqueeze(0)
+        assert embed_dim == self.d_model, "Embedding dimension mismatch"
+        assert freqs.shape == (seq_len, embed_dim // 2), f"freqs shape mismatch: {freqs.shape}"
 
-        x_rot = torch.stack([
-            x_[..., 0] * cos - x_[..., 1] * sin,
-            x_[..., 0] * sin + x_[..., 1] * cos,
-        ], dim=-1)
+        # 拆分为复数对进行旋转
+        x_ = x.view(B, seq_len, embed_dim // 2, 2)
+        cos = freqs.cos().unsqueeze(0)  # (1, seq_len, embed_dim // 2, 1)
+        sin = freqs.sin().unsqueeze(0)  # (1, seq_len, embed_dim // 2, 1)
+
+        x_rot = torch.stack(
+            [
+                x_[..., 0] * cos - x_[..., 1] * sin,
+                x_[..., 0] * sin + x_[..., 1] * cos,
+            ],
+            dim=-1
+        )
         return x_rot.view(B, seq_len, embed_dim)
 
-    def forward(
-        self,
-        F_TS: torch.Tensor,
-        F_V: torch.Tensor,
-        F_A: torch.Tensor,
-        patch_mask: torch.Tensor = None
-    ) -> tuple:
-        """前向传播。"""
+    def forward(self, F_TS: torch.Tensor, F_V: torch.Tensor, F_A: torch.Tensor, patch_mask: torch.Tensor = None) -> tuple:
         B, N, D = F_TS.shape
 
-        # 1. 构建专家存储库
-        K = V = torch.cat([F_TS, F_V, F_A], dim=1)  # (B, 3N, D)
+        # 1. 专家库级联（长 3N）：保持主网络内部序列长度为 N，规避 Token 爆炸
+        K_expert = torch.cat([F_TS, F_V, F_A], dim=1)  # (B, 3N, D)
+        V_expert = K_expert
 
-        # 2. 生成位置编码
-        freqs = self.rope(N)  # (N, D // 2)
-
-        # 3. 生成任务 Query
+        # 2. 动态构建基础任务矩阵（此时先不加位置信息，保持内容纯净）
         Q_rec_base = self.task_token_rec.expand(B, N, -1)
         Q_cls_base = self.task_token_cls.expand(B, N, -1)
+        Q_combined = torch.cat([Q_rec_base, Q_cls_base], dim=1)  # (B, 2N, D)
 
-        Q_rec = self.apply_rope(Q_rec_base, freqs)
-        Q_cls = self.apply_rope(Q_cls_base, freqs)
+        # 3. 核心修正：执行任务专属线性投影
+        q = self.q_proj(Q_combined)  # (B, 2N, D)
+        k = self.k_proj(K_expert)    # (B, 3N, D)
+        v = self.v_proj(V_expert)    # (B, 3N, D)
 
-        # 4. 构建注意力掩码
-        kv_mask = None
+        # 4. 核心修正：获取并组装"块对齐"的旋转频率 (Block-Aligned RoPE)
+        freqs_N = self.rope(N)  # 基础相对时间轴坐标 (N, D // 2)
+        freqs_2N = torch.cat([freqs_N, freqs_N], dim=0)       # 映射重构群与分类群: (2N, D // 2)
+        freqs_3N = torch.cat([freqs_N, freqs_N, freqs_N], dim=0)  # 映射三个平行专家时空: (3N, D // 2)
+
+        # 在投影之后、拆分多头之前，同步对 Q 和 K 灌入几何旋转特征
+        q_rot = self.apply_rope(q, freqs_2N)
+        k_rot = self.apply_rope(k, freqs_3N)
+
+        # 5. 变形为标准多头注意力张量形状
+        q_rot = q_rot.view(B, 2 * N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 2N, h_d)
+        k_rot = k_rot.view(B, 3 * N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 3N, h_d)
+        v = v.view(B, 3 * N, self.num_heads, self.head_dim).transpose(1, 2)          # (B, H, 3N, h_d)
+
+        # 6. 构造变长填充掩码 (Padding Mask)
+        attn_mask = None
         if patch_mask is not None:
+            # 专家库包含 3 个专家，对应的 Key 掩码需要横向复制 3 遍：(B, 3N)
             kv_mask = patch_mask.repeat(1, 3)
+            # 转换为 PyTorch 软注意力算子标准的布尔广播形状：(B, 1, 1, 3N)
+            # 原文中 True 表示有效，这里通过 unsqueeze 适配标准的掩码消融
+            attn_mask = kv_mask.unsqueeze(1).unsqueeze(2)
 
-        # 5. 交叉注意力
-        F_rec_attn, _ = self.cross_attn_rec(
-            query=Q_rec,
-            key=K,
-            value=V,
-            key_padding_mask=~kv_mask if kv_mask is not None else None,
-            need_weights=False
-        )
-        F_cls_attn, _ = self.cross_attn_cls(
-            query=Q_cls,
-            key=K,
-            value=V,
-            key_padding_mask=~kv_mask if kv_mask is not None else None,
-            need_weights=False
+        # 7. 调用原生的统一缩放点积注意力，全额释放 Flash Attention 2 内核算力
+        # 计算复杂度仅为稳定的线性增长 2N * 3N = 6N^2，在同一个物理熔炉中自发分化
+        y = F.scaled_dot_product_attention(
+            query=q_rot,
+            key=k_rot,
+            value=v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=False
         )
 
-        # 6. 残差连接 + LayerNorm
-        F_rec = self.norm_rec(Q_rec + F_rec_attn)
-        F_cls = self.norm_cls(Q_cls + F_cls_attn)
+        # 8. 恢复序列形状并应用输出投影
+        y = y.transpose(1, 2).contiguous().view(B, 2 * N, D)
+        F_attn = self.out_proj(y)
+        F_combined = self.norm_cross(Q_combined + F_attn)
 
-        # 7. FFN + 残差
-        F_rec = self.norm_ffn_rec(F_rec + self.ffn_rec(F_rec))
-        F_cls = self.norm_ffn_cls(F_cls + self.ffn_cls(F_cls))
+        # 9. 共享 FFN 非线性映射（促成重构任务对分类任务的良性隐式正规化）
+        F_combined = self.norm_ffn(F_combined + self.ffn(F_combined))
 
-        return F_rec, F_cls
+        # 10. 输出端无损剥离（Token-level Decoupling）
+        F_rec_out = F_combined[:, :N, :]  # 截取前 N 个 Token 作为重构专用表征
+        F_cls_out = F_combined[:, N:, :]  # 截取后 N 个 Token 作为点级分类专用表征
+
+        return F_rec_out, F_cls_out

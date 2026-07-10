@@ -235,7 +235,7 @@ def train_univariate(args):
     ts_model = TS_Model(default_config_t)
     if args.ts_path is not None:
         print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
-        state_ts_dict = torch.load(args.ts_path, map_location='cpu')['model_state_dict']
+        state_ts_dict = torch.load(args.ts_path, map_location='cpu', weights_only=False)['model_state_dict']
 
         if args.ts_finetune_type == 'lora':
             # LoRA 模式：需要将预训练权重映射到 LoRALinear 的 original_linear 中
@@ -285,7 +285,7 @@ def train_univariate(args):
     model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
     if args.vetime_path is not None:
         print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
-        state_dict = torch.load(args.vetime_path, map_location='cpu')
+        state_dict = torch.load(args.vetime_path, map_location='cpu', weights_only=False)
         model.load_state_dict(state_dict)
         print(f"[INFO] VETime 权重加载完成（用于继续训练）")
     else:
@@ -462,7 +462,7 @@ def train_univariate(args):
             print(f"[ERROR] Resume checkpoint 不存在: {resume_path}")
         else:
             print(f"[INFO] 正在加载resume checkpoint: {resume_path}")
-            checkpoint = torch.load(resume_path, map_location='cpu')
+            checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
 
             if 'model_state_dict' in checkpoint:
                 # 完整checkpoint格式
@@ -517,11 +517,19 @@ def train_univariate(args):
         # ========== 两阶段训练范式（Two-Stage Training）==========
         # 阶段1 (epoch < stage1_epochs): 纯重建预训练，切断异常分类损失，防止"梯度海啸"淹没分类头
         # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
-        is_stage_1 = epoch < args.stage1_epochs
-        if is_stage_1:
-            print(f"[Stage 1] Epoch {epoch+1}/{epochs}: 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
-        else:
-            print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
+        # QueryDecoder 模式下：'joint' 模式跳过两阶段，'staged' 模式使用两阶段
+        use_two_stage = True
+        if hasattr(model, 'use_query_decoder') and model.use_query_decoder:
+            if args.query_decoder_training_mode == 'joint':
+                use_two_stage = False
+                print(f"[QueryDecoder-Joint] Epoch {epoch+1}/{epochs}: 多任务同时训练 (两任务通过独立 Query 自然解耦)")
+
+        is_stage_1 = use_two_stage and (epoch < args.stage1_epochs)
+        if use_two_stage:
+            if is_stage_1:
+                print(f"[Stage 1] Epoch {epoch+1}/{epochs}: 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+            else:
+                print(f"[Stage 2] Epoch {epoch+1}/{epochs}: 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
 
         # ========== 分类预热（Classification Warmup）==========
         # Stage 2 首个 epoch：前 cls_warmup_ratio 比例的 batch 仅训练分类相关参数
@@ -928,7 +936,7 @@ def train_univariate(args):
         if os.path.exists(best_model_path):
             print(f"\n[INFO] 加载早停保存的最佳模型: {best_model_path}")
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.load_state_dict(torch.load(best_model_path, map_location='cpu'))
+            unwrapped_model.load_state_dict(torch.load(best_model_path, map_location='cpu', weights_only=False))
 
     loss_all = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
     print(f"Final TSB validation loss: {loss_all}")
@@ -1093,7 +1101,7 @@ def load_full_checkpoint(
     """
     import re
     print(f"[INFO] 正在加载checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     # 检查是否为完整checkpoint
     if 'model_state_dict' not in checkpoint:
@@ -1175,7 +1183,7 @@ def load_pretrain_weights(pretrain_path: str, model, accelerator):
         accelerator: Accelerator实例
     """
     print(f"[INFO] 正在加载预训练权重: {pretrain_path}")
-    state_dict = torch.load(pretrain_path, map_location='cpu')
+    state_dict = torch.load(pretrain_path, map_location='cpu', weights_only=False)
 
     # 处理可能的格式差异
     if 'model_state_dict' in state_dict:
@@ -1438,7 +1446,7 @@ def train_multivariate(args, config: Dict[str, Any]):
         # ========== 3. 知识延续（strict=False 是灵魂）==========
         if prev_checkpoint_path is not None:
             print(f"[INFO] 加载上一维度 checkpoint: {prev_checkpoint_path}")
-            state_dict = torch.load(prev_checkpoint_path, map_location='cpu')
+            state_dict = torch.load(prev_checkpoint_path, map_location='cpu', weights_only=False)
 
             # 【防御性代码】剥离 DDP 的 'module.' 前缀，适配不同保存格式
             if any(key.startswith('module.') for key in state_dict.keys()):
@@ -1603,11 +1611,19 @@ def train_multivariate(args, config: Dict[str, Any]):
             # ========== 两阶段训练范式（Two-Stage Training）==========
             # 阶段1 (epoch < stage1_epochs): 纯重建预训练，切断异常分类损失，防止"梯度海啸"淹没分类头
             # 阶段2 (epoch >= stage1_epochs): 正常多任务联合训练
-            is_stage_1 = epoch < args.stage1_epochs
-            if is_stage_1:
-                print(f"[Stage 1] Epoch {epoch+1}/{epochs} (dim={current_dim}): 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
-            else:
-                print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
+            # QueryDecoder 模式下：'joint' 模式跳过两阶段，'staged' 模式使用两阶段
+            use_two_stage = True
+            if hasattr(model, 'use_query_decoder') and model.use_query_decoder:
+                if args.query_decoder_training_mode == 'joint':
+                    use_two_stage = False
+                    print(f"[QueryDecoder-Joint] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务同时训练 (两任务通过独立 Query 自然解耦)")
+
+            is_stage_1 = use_two_stage and (epoch < args.stage1_epochs)
+            if use_two_stage:
+                if is_stage_1:
+                    print(f"[Stage 1] Epoch {epoch+1}/{epochs} (dim={current_dim}): 纯重建预训练 (异常分类损失已切断，门控负载均衡仅保留重建分支)")
+                else:
+                    print(f"[Stage 2] Epoch {epoch+1}/{epochs} (dim={current_dim}): 多任务联合训练 (异常分类损失恢复，门控负载均衡恢复双分支)")
 
             # 显存监控
             if torch.cuda.is_available():
@@ -2001,6 +2017,8 @@ if __name__ == "__main__":
                         help='纯重建预训练的 epoch 数量（两阶段训练：前 stage1_epochs 个 epoch 仅训练重建任务，切断异常分类损失）')
     parser.add_argument('--cls_warmup_ratio', type=float, default=0.5,
                         help='分类预热比例：Stage 2 首个 epoch 中，前 cls_warmup_ratio 比例的 batch 仅训练分类相关参数，其余冻结。设为 0 跳过预热')
+    parser.add_argument('--query_decoder_training_mode', type=str, default='joint', choices=['joint', 'staged'],
+                        help="QueryDecoder 训练模式: 'joint'=同时训练两任务(推荐), 'staged'=分阶段训练(先重构后分类)")
     parser.add_argument('--early_stop_patience', type=int, default=4, help='Early stopping patience (paper: 4)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Ratio of training data used for validation split')
     parser.add_argument('--val_mode', type=str, default='tsb', choices=['tsb', 'split'],
