@@ -345,7 +345,8 @@ class GatedTimeFrequencyFusion(nn.Module):
             dropout=dropout,
             batch_first=True
         )
-        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn_dropout = nn.Dropout(dropout)
         self.layer_norm1 = nn.LayerNorm(d_model)
         self.layer_norm2 = nn.LayerNorm(d_model)
         self.norm_kv = nn.LayerNorm(d_model)
@@ -360,7 +361,7 @@ class GatedTimeFrequencyFusion(nn.Module):
         )
 
         # CRITICAL: alpha 作为外部门控，初始化 0.0
-        self.alpha = nn.Parameter(torch.tensor([-6.91]))
+        self.alpha = nn.Parameter(torch.tensor([0.0]))
 
     def forward(
         self,
@@ -404,10 +405,10 @@ class GatedTimeFrequencyFusion(nn.Module):
         # Step C: 外部门控残差
         # ---------------------------------------------------------
         # 计算当前的门控开度 (0 到 1 之间)
-        gate = torch.sigmoid(self.alpha)
+        # gate = torch.sigmoid(self.alpha)
 
         # 核心逻辑：总增量 = (注意力增量 + FFN增量)，经过门控后加回原特征
         total_delta = attn_delta + ffn_delta
-        F_out = Q_VETime + gate * total_delta
+        F_out = Q_VETime + self.alpha * total_delta
 
         return F_out

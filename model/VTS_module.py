@@ -325,46 +325,33 @@ class VisualCrossAttention(nn.Module):
 
 class GatedTimeFrequencyFusion(nn.Module):
     """
-    门控残差交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征。
+    External-Gate 架构：门控参数 alpha 位于模块绝对外层边界。
 
-    核心改进：
-    - 可学习的门控参数 alpha（初始化为 0.0），实现安全热启动
-    - 训练初期自动回退到纯 VETime，随训练逐渐激活频域信息
-    - 废除刚性对角假设，让时间域 Query 自适应决定关注哪些频域 patch
+    内部子块 (cross-attn + FFN + norms) 完整处理频域语义，
+    alpha 从外部对整个子块输出做残差缩放：
+        F_out = Q_VETime + alpha * dropout(F_refined)
 
-    Attention Matrix 形状 [B, N_TS, 196]，表示每个时间点与所有频域 patch 的软对齐。
+    当 alpha=0.0 时，F_out 严格等于 Q_VETime（数学恒等映射），
+    保护重构头免受任何 LayerNorm / FFN 非线性激活污染。
     """
 
     def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
-        """
-        Args:
-            d_model: 特征维度
-            num_heads: 多头注意力头数
-            dropout: Dropout 概率
-            ffn_ratio: FFN 扩展比例（默认 4 倍）
-        """
         super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
 
-        # 纯交叉注意力：无对角偏置，无位置编码
+        # 1. 内部交叉注意力：频域扫描
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
-            kdim=d_model,
-            vdim=d_model,
             dropout=dropout,
             batch_first=True
         )
-
-        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn_dropout = nn.Dropout(dropout)
         self.layer_norm1 = nn.LayerNorm(d_model)
+        self.layer_norm2 = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
 
-        # 可学习的门控参数，初始化为 0.0 实现稳定热启动
-        # 训练初期网络自然回退到纯 VETime，随训练逐渐激活频域信息
-        self.alpha = nn.Parameter(torch.tensor([0.0]))
-
-        # FFN: Linear -> GELU -> Dropout -> Linear
+        # 2. 内部 FFN：精炼跨模态语义
         ffn_hidden = int(d_model * ffn_ratio)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_hidden),
@@ -372,7 +359,9 @@ class GatedTimeFrequencyFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(ffn_hidden, d_model)
         )
-        self.layer_norm2 = nn.LayerNorm(d_model)
+
+        # CRITICAL: alpha 作为外部门控，初始化 0.0
+        self.alpha = nn.Parameter(torch.tensor([0.0]))
 
     def forward(
         self,
@@ -381,35 +370,45 @@ class GatedTimeFrequencyFusion(nn.Module):
         V_ViCO: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Args:
-            Q_VETime: 时域对齐的视觉特征 [B, N_TS, d]
-                      (经过 PTA unfold + mlp_i + I_att)
-            K_ViCO:   频域原始 2D patch tokens [B, 196, d]
-                      (ViCO 分支 MAE 输出，未对齐)
-            V_ViCO:   频域原始 2D patch tokens [B, 196, d]
-                      (与 K_ViCO 相同)
-            key_padding_mask: Optional mask for ViCO tokens [B, 196]
-
-        Returns:
-            F_out: 融合后的时域特征 [B, N_TS, d]
-        """
-        # 不对称交叉注意力: [B, N_TS, d] x [B, 196, d] -> [B, N_TS, d]
-        F_cross, _ = self.cross_attn(
-            query=Q_VETime,
-            key=K_ViCO,
-            value=V_ViCO,
+        # ---------------------------------------------------------
+        # Step A: 内部交叉注意力 (Pre-Norm)
+        # ---------------------------------------------------------
+        # 1. 先归一化 Q
+        normed_Q = self.layer_norm1(Q_VETime)
+        normed_K = self.norm_kv(K_ViCO)
+        normed_V = self.norm_kv(V_ViCO)
+        
+        # 2. 计算 Attention 带来的增量 (注意这里 query 传入的是 normed_Q)
+        attn_out, _ = self.cross_attn(
+            query=normed_Q,
+            key=normed_K,
+            value=normed_V,
             key_padding_mask=key_padding_mask,
-            need_weights=False  # 启用 Flash Attention
+            need_weights=False
         )
+        attn_delta = self.attn_dropout(attn_out)
+        
+        # 3. 计算中间融合状态 (这才是 FFN 应该看的东西)
+        F_mid = Q_VETime + attn_delta 
 
-        # 门控残差连接到 VETime 时序主干
-        # alpha=0 时完全回退到 Q_VETime，alpha=1 时等权重融合
-        F_mid = Q_VETime + self.alpha * self.dropout(F_cross)
-        F_mid = self.layer_norm1(F_mid)
+        # ---------------------------------------------------------
+        # Step B: 内部 FFN 精炼 (Pre-Norm)
+        # ---------------------------------------------------------
+        # 1. 归一化中间状态
+        normed_F_mid = self.layer_norm2(F_mid)
+        
+        # 2. 计算 FFN 带来的增量
+        ffn_out = self.ffn(normed_F_mid)
+        ffn_delta = self.ffn_dropout(ffn_out)
 
-        # 非线性 FFN语义精炼
-        F_out = F_mid + self.ffn(F_mid)
-        F_out = self.layer_norm2(F_out)
+        # ---------------------------------------------------------
+        # Step C: 外部门控残差
+        # ---------------------------------------------------------
+        # 计算当前的门控开度 (0 到 1 之间)
+        # gate = torch.sigmoid(self.alpha)
+        
+        # 核心逻辑：总增量 = (注意力增量 + FFN增量)，经过门控后加回原特征
+        total_delta = attn_delta + ffn_delta
+        F_out = Q_VETime + self.alpha * total_delta
 
         return F_out

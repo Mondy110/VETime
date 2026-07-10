@@ -700,6 +700,7 @@ def train_univariate(args):
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
+                    "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
                     "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
                 }, step=global_step)
 
@@ -1767,6 +1768,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Loss/CL_Contrastive": batch_loss_cl,
                         "Loss/Balance": batch_loss_e,
                         "Train/LR": optimizer.param_groups[0]['lr'],
+                        "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
                         "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
                     }, step=global_step)
 
@@ -2192,8 +2194,21 @@ if __name__ == "__main__":
                         help='从checkpoint继续训练的路径（完整状态恢复）')
     parser.add_argument('--pretrain_from', type=str, default=None,
                         help='预训练权重路径（仅模型权重），用于启动多变量训练')
+    parser.add_argument('--use_hydra', action='store_true',
+                        help='使用 Hydra + src/ 新入口训练（基于 configs/base.yaml）')
 
     args = parser.parse_args()
+
+    # 使用 Hydra 新入口
+    if args.use_hydra:
+        from hydra import compose, initialize_config_dir
+        import os
+        config_dir = os.path.abspath('./configs')
+        with initialize_config_dir(config_dir=config_dir, version_base=None):
+            cfg = compose(config_name='base')
+        train_univariate_hydra(cfg)
+        exit(0)
+
     output_file_path = args.output_file_path.replace('result.json', f'{args.model_name.replace("/", "-")}_result.json')
 
     results = main(args)

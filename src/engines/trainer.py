@@ -108,7 +108,7 @@ class Trainer:
 
         warmup_scheduler = LinearLR(
             self.optimizer,
-            start_factor=cfg.training.scheduler.start_factor,
+            start_factor=0.1,  # 硬编码，与原始 train_univariate 一致
             end_factor=1.0,
             total_iters=warmup_steps,
         )
@@ -446,6 +446,7 @@ class Trainer:
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
+                    "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
                     "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
                 }, step=self.global_step)
 

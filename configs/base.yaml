@@ -1,22 +1,20 @@
 # ==================== 基础配置 ====================
-seed: 2024                          # 随机种子，保证实验可复现
+seed: 64                          # 随机种子，保证实验可复现
 device: cuda                        # 计算设备
 mixed_precision: bf16               # 混合精度模式（bf16/fp16/no）
 
 # ==================== 训练配置 ====================
 training:
   stage1_epochs: 1                  # Stage 1 持续的 epoch 数（仅重构预训练）
-  total_epochs: 30                  # 总 epoch 数
+  total_epochs: 10                  # 总 epoch 数
   cls_warmup_ratio: 0.5             # Stage 2 首个 epoch 的分类预热比例（0=跳过）
 
   optimizer:
     lr: 5e-4                        # 学习率
     weight_decay: 1e-5              # 权重衰减
   scheduler:
-    type: cosine_with_warmup        # 学习率调度器类型
-    warmup_ratio: 0.1               # 预热比例（占总训练步数的比例）
+    type: cosine_with_warmup        # 学习率调度器（硬编码 1 epoch warmup + cosine annealing）
     eta_min: 1e-6                   # 余弦退火最小学习率
-    start_factor: 0.1               # 预热起始因子
   early_stopping:
     patience: 4                     # 早停耐心值
 
@@ -33,25 +31,33 @@ loss:
 data:
   batch_size: 32                    # 批大小
   mask_ratio: 0.3                   # 自监督掩码比例
-  gradient_accumulation_steps: 2    # 梯度累积步数
   max_seq_length: 5000              # 最大序列长度
-  effective_batch_size: 256         # 动态批大小的有效批大小
-  num_workers: 5                    # DataLoader 工作线程数
+  effective_batch_size: 256         # 有效批大小（gradient_accumulation_steps = effective_batch_size // batch_size）
+  num_workers: 4                    # DataLoader 工作线程数
   val_ratio: 0.1                    # 验证集比例
-  val_mode: tsb                     # 验证模式（tsb/split）
+  val_mode: split                   # 验证模式（tsb/split）
   min_seq_length: 100               # 最短序列长度过滤阈值
+  dynamic_batch: false              # 动态批大小（短样本自动增大 batch）
+  max_batch_size: 64                # 动态批最大值（dynamic_batch=true 时生效）
+  padding_ratio: 0.1                # 动态批 padding 比例
+  shuffle_bucket: false             # 是否按长度分桶后 shuffle
 
 # ==================== 模型配置 ====================
 model:
-  model_name: VETime                # 模型名称
-  vision_name: mae_nonparams        # 视觉编码器预训练权重名称
+  model_name: VETime-refactor                # 模型名称
+  vision_name: mae_visualize_base.pth  # 视觉编码器权重文件名
   ts_finetune_type: lora            # 时序编码器微调类型（lora/freeze）
   use_vectorized_fold: true         # 是否使用向量化 fold_image（约150倍加速）
   use_gradient_checkpointing: false  # 是否使用梯度检查点节省显存
 
 # ==================== 路径配置 ====================
 paths:
-  dataset_path: ./dataset/univariate.pkl      # 训练数据集路径
-  dataset_test_dir: ./dataset/TSB-AD          # 测试数据集目录
+  dataset_path: ./dataset/post_150000.pkl  # 训练数据集路径
+  dataset_test_dir: ./dataset/TSB-AD/Datasets/TSB-AD-U         # 测试数据集目录
+  file_list: ./dataset/TSB-AD/Datasets/File_List/TSB-AD-U.cs   # TSB 测试文件列表（null=自动扫描目录）
   ts_path: checkpoints/weight_ts/full_mask_anomaly_head_pretrain_checkpoint_best.pth  # TS Encoder 预训练权重
-  save_dir: ./output                          # 输出目录
+  vision_path: ./checkpoints/weight_v       # 视觉编码器权重目录
+  vetime_path: null                         # VETime 完整权重路径（null=不加载）
+  resume: null                              # 恢复训练的 checkpoint 路径（null=不恢复）
+  save_dir: ./output                        # 输出目录
+  output_file_path: ./output/result.json    # 评估结果输出文件
