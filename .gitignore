@@ -5,3 +5,4 @@ checkpoints
 output/
 runtime_log_VETime.csv
 *.log
+.superpowers

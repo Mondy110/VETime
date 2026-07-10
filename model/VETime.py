@@ -53,7 +53,7 @@ class VETIME(TS_Model):
         # 新增：Query-based 解码器（可选）
         self.query_decoder = None
         self.fusion_proj = None
-        self.use_query_decoder = kwargs.get('use_query_decoder', False)
+        self.use_query_decoder = kwargs.get('use_query_decoder', True)
 
         if self.use_query_decoder:
             from model.VTS_module import QueryDecoder
