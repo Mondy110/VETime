@@ -1995,7 +1995,20 @@ def train_univariate_hydra(cfg):
                 param.requires_grad = False
 
     # ---- VETIME Model ----
-    model = VETIME(config_v, vision_model, config_t, ts_model, cfg.model.model_name)
+    # 解码器模式：use_query_decoder=True 时使用 Query-based 解码器替代 MoE
+    use_query_decoder = getattr(cfg.model, 'use_query_decoder', False)
+    num_query_decoder_layers = getattr(cfg.model, 'num_query_decoder_layers', 1)
+    model = VETIME(
+        config_v, vision_model, config_t, ts_model, cfg.model.model_name,
+        use_query_decoder=use_query_decoder,
+        num_query_decoder_layers=num_query_decoder_layers,
+        use_gradient_checkpointing=cfg.model.use_gradient_checkpointing
+    )
+    if use_query_decoder:
+        layer_info = f"{num_query_decoder_layers}层" if num_query_decoder_layers > 1 else "单层"
+        log.info(f"使用 Query-based 解码器模式（{layer_info}，单阶段训练，无需课程学习）")
+    else:
+        log.info("使用 MoE 解码器模式（二阶段课程训练）")
     if hasattr(cfg.paths, 'vetime_path') and cfg.paths.vetime_path:
         log.info(f"加载 VETime 完整权重: {cfg.paths.vetime_path}")
         state_dict = torch.load(cfg.paths.vetime_path, map_location='cpu')

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from src.losses.contrastive import win_Contrastive_Loss
 from src.models.ts_encoder.ts_encoder import TimeSeriesEncoder
 from src.models.ts_encoder.ts_model import TS_Model
-from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, VisualCrossAttention, GatedTimeFrequencyFusion
+from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, GatedTimeFrequencyFusion
 
 
 class VETIME(TS_Model):
@@ -60,6 +60,36 @@ class VETIME(TS_Model):
         # fusion setting
         self.fusion = VTS_Alignment(v_dim,t_dim)
         self.mm_w = M_moe(t_dim)
+        
+        # 新增：Query-based 解码器（可选）
+        self.query_decoder = None
+        self.fusion_proj = None
+        self.use_query_decoder = kwargs.get('use_query_decoder', False)
+        self.num_query_decoder_layers = kwargs.get('num_query_decoder_layers', 1)  # 1=单层, 2+=多层
+
+        if self.use_query_decoder:
+            if self.num_query_decoder_layers == 1:
+                # 单层 QueryDecoder（原版）
+                from src.models.vts_module import QueryDecoder
+                self.query_decoder = QueryDecoder(
+                    d_model=t_dim,
+                    num_heads=8,
+                    dropout=0.1
+                )
+            else:
+                # 多层 QueryDecoder（迭代 Query，静态专家）
+                from src.models.vts_module import MultiLayerQueryDecoder
+                self.query_decoder = MultiLayerQueryDecoder(
+                    d_model=t_dim,
+                    num_layers=self.num_query_decoder_layers,
+                    num_heads=8,
+                    dropout=0.1
+                )
+            self.fusion_proj = nn.Sequential(
+                nn.LayerNorm(t_dim * 2),
+                nn.Linear(t_dim * 2, t_dim)
+            )
+        
         # loss setting
         self.cl_loss=win_Contrastive_Loss(t_dim,temperature=0.1)
 
@@ -128,6 +158,37 @@ class VETIME(TS_Model):
         # 后续流程保持不变：fusion → MoE → 任务头
         I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
+        
+        # === 新增：Query-based 解码路径 ===
+        if self.use_query_decoder and self.query_decoder is not None:
+            # 生成三个专家特征
+            F_TS = TS_embeddings0  # (B, N, D) 时间专家
+            F_V = I_embeddings      # (B, N, D) 视觉专家
+
+            # 融合专家特征
+            mix_out0_for_proj = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+            F_A = self.fusion_proj(mix_out0_for_proj)  # (B, N, D)
+
+            # Query-based 解码
+            F_rec, F_cls = self.query_decoder(F_TS, F_V, F_A, patch_mask)
+
+            # 任务头投影 - 分类分支
+            patch_proj = self.projection_layer(F_cls)
+            local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            # 任务头投影 - 重构分支
+            patch_proj2 = self.projection_layer(F_rec)
+            local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+            local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+            # 新路径无路由权重
+            m_w = None
+
+            return local_embeddings1, m_w, loss_sc, local_embeddings2
+        
         mix_out0 = torch.cat([TS_embeddings,I_embeddings],dim=-1)
         # 两路任务干净并行：task 1 -> anomaly head(local_emb1), task 0 -> reconstruction head(local_emb2)
         # 任务映射保持与原实现一致（原 mask=None 分支 = task 1 = anomaly）。
@@ -197,33 +258,67 @@ class VETIME(TS_Model):
 
         loss_sc = self.compute_cl(I_embeddings, TS_embeddings, labels, num_features)
 
-        # Part 3: MoE + projection (使用 checkpoint)
-        def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
-            # 两路任务干净并行：task 1 -> anomaly, task 0 -> reconstruction（与 _forward_impl 一致）
-            mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
-            mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
+        # Part 3: 解码器路径（MoE 或 Query Decoder）
+        if self.use_query_decoder and self.query_decoder is not None:
+            # Query Decoder 路径
+            def query_decoder_forward(F_TS, F_V, mix_out0, B, seq_len, num_features):
+                # 融合专家特征
+                F_A = self.fusion_proj(mix_out0)
 
-            patch_proj = self.projection_layer(mix_out_a)
-            local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
-            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
-            local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+                # Query-based 解码
+                F_rec, F_cls = self.query_decoder(F_TS, F_V, F_A, patch_mask)
 
-            patch_proj2 = self.projection_layer(mix_out_r)
-            local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
-            local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
-            local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+                # 任务头投影 - 分类分支
+                patch_proj = self.projection_layer(F_cls)
+                local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
 
-            # 注意：torch.utils.checkpoint 只支持 Tensor / Tensor tuple，不支持 dict。
-            # 因此把 m_w 按 (task0, task1) 固定顺序平铺成 tuple 返回，外部重组为 dict。
-            return local_embeddings1, local_embeddings2, m_w_r, m_w_a
+                # 任务头投影 - 重构分支
+                patch_proj2 = self.projection_layer(F_rec)
+                local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
 
-        mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
-        local_embeddings1, local_embeddings2, m_w_r, m_w_a = checkpoint(
-            moe_projection_forward,
-            mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features
-        )
-        # 重组为 dict，与 _forward_impl 的返回签名保持一致
-        m_w = {0: m_w_r, 1: m_w_a}
+                return local_embeddings1, local_embeddings2
+
+            F_TS = TS_embeddings0
+            F_V = I_embeddings
+            mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+
+            local_embeddings1, local_embeddings2 = checkpoint(
+                query_decoder_forward,
+                F_TS, F_V, mix_out0, B, seq_len, num_features
+            )
+            m_w = None
+        else:
+            # MoE 路径
+            def moe_projection_forward(mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features):
+                # 两路任务干净并行：task 1 -> anomaly, task 0 -> reconstruction（与 _forward_impl 一致）
+                mix_out_a, m_w_a = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=1)
+                mix_out_r, m_w_r = self.mm_w(mix_out0, TS_embeddings0, I_embeddings0, mix_out0, task_id=0)
+
+                patch_proj = self.projection_layer(mix_out_a)
+                local_embeddings = patch_proj.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings1 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+                patch_proj2 = self.projection_layer(mix_out_r)
+                local_embeddings = patch_proj2.view(B, num_features, seq_len//self.patch_size, self.patch_size, self.d_proj)
+                local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4).contiguous()
+                local_embeddings2 = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]
+
+                # 注意：torch.utils.checkpoint 只支持 Tensor / Tensor tuple，不支持 dict。
+                # 因此把 m_w 按 (task0, task1) 固定顺序平铺成 tuple 返回，外部重组为 dict。
+                return local_embeddings1, local_embeddings2, m_w_r, m_w_a
+
+            mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
+            local_embeddings1, local_embeddings2, m_w_r, m_w_a = checkpoint(
+                moe_projection_forward,
+                mix_out0, TS_embeddings0, I_embeddings0, B, seq_len, num_features
+            )
+            # 重组为 dict，与 _forward_impl 的返回签名保持一致
+            m_w = {0: m_w_r, 1: m_w_a}
 
         return local_embeddings1, m_w, loss_sc, local_embeddings2
 
@@ -383,8 +478,10 @@ class VETIME(TS_Model):
             local_embeddings2, time_series, att_mask, labels
         )
 
-        # 专家平衡损失
-        if stage == 1:
+        # 专家平衡损失（Query Decoder 模式下 m_w=None，跳过）
+        if m_w is None:
+            loss_balance = torch.tensor(0.0, device=device)
+        elif stage == 1:
             loss_balance = balance_weight * load_balance_loss(m_w[0])
         else:
             loss_balance = balance_weight * 0.5 * (

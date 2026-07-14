@@ -52,6 +52,11 @@ class Trainer:
         self.dynamic_batch = getattr(cfg.data, 'dynamic_batch', False)
         self.effective_batch_size = cfg.data.effective_batch_size
 
+        # Query Decoder 模式：单阶段训练，无需课程学习
+        self.use_query_decoder = getattr(cfg.model, 'use_query_decoder', False)
+        if self.use_query_decoder:
+            self.stage1_epochs = 0  # 跳过 Stage 1，直接联合训练
+
         # 输出
         self.output = []
         self.name_save = f'./output/{self.model_name}__{self.img_size}_best.pth'
@@ -223,7 +228,12 @@ class Trainer:
         data_setting = self.data_setting
 
         is_stage_1 = epoch < self.stage1_epochs
-        if is_stage_1:
+        if self.use_query_decoder:
+            logger.info(
+                f"[Query Decoder] Epoch {epoch+1}/{self.epochs}: "
+                "单阶段联合训练 (重构 + 分类)"
+            )
+        elif is_stage_1:
             logger.info(
                 f"[Phase 1] Epoch {epoch+1}/{self.epochs}: "
                 "纯重构预训练 (异常分类损失已切断)"
@@ -235,8 +245,10 @@ class Trainer:
             )
 
         # ---- 分类预热 ----
+        # Query Decoder 模式下不需要分类预热（单阶段训练）
         is_cls_warmup_epoch = (
-            (not is_stage_1)
+            (not self.use_query_decoder)
+            and (not is_stage_1)
             and (epoch == self.stage1_epochs)
             and (cfg.training.cls_warmup_ratio > 0)
         )
@@ -325,8 +337,10 @@ class Trainer:
                         local_embeddings2, ts_part, att_mask_part, label_part
                     )
 
-                    # 两阶段训练范式：门控负载均衡损失
-                    if is_stage_1:
+                    # 两阶段训练范式：门控负载均衡损失（Query Decoder 模式下 m_w=None）
+                    if m_w is None:
+                        batch_loss_e_part = torch.tensor(0.0, device=self.device)
+                    elif is_stage_1:
                         batch_loss_e_part = balance_weight * load_balance_loss(m_w[0])
                     else:
                         batch_loss_e_part = balance_weight * 0.5 * (
@@ -378,8 +392,10 @@ class Trainer:
                     local_embeddings2, time_series, att_mask, labels
                 )
 
-                # 两阶段训练范式：门控负载均衡损失
-                if is_stage_1:
+                # 两阶段训练范式：门控负载均衡损失（Query Decoder 模式下 m_w=None）
+                if m_w is None:
+                    loss_e_tensor = torch.tensor(0.0, device=self.device)
+                elif is_stage_1:
                     loss_e_tensor = balance_weight * load_balance_loss(m_w[0])
                 else:
                     loss_e_tensor = balance_weight * 0.5 * (
@@ -595,9 +611,14 @@ class Trainer:
                             local_embeddings2, ts_part, att_mask_part, label_part
                         )
 
-                        loss2_total = loss2_total + loss02 + cl_weight * loss_cl + balance_weight * 0.5 * (
-                            load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])
-                        )
+                        # Query Decoder 模式下 m_w=None，跳过 load_balance_loss
+                        if m_w is None:
+                            loss_balance_val = 0.0
+                        else:
+                            loss_balance_val = balance_weight * 0.5 * (
+                                load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])
+                            )
+                        loss2_total = loss2_total + loss02 + cl_weight * loss_cl + loss_balance_val
                         loss1_total = loss1_total + loss01
 
                     batch_loss = loss1_total.item() + loss2_total.item()
@@ -619,9 +640,14 @@ class Trainer:
                     loss2, _ = model.weighted_reconstruction_loss(
                         local_embeddings2, time_series, att_mask, labels
                     )
-                    loss2 = loss2 + balance_weight * 0.5 * (
-                        load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])
-                    ) + cl_weight * loss_cl
+                    # Query Decoder 模式下 m_w=None，跳过 load_balance_loss
+                    if m_w is None:
+                        loss_balance_val = 0.0
+                    else:
+                        loss_balance_val = balance_weight * 0.5 * (
+                            load_balance_loss(m_w[0]) + load_balance_loss(m_w[1])
+                        )
+                    loss2 = loss2 + loss_balance_val + cl_weight * loss_cl
 
                     batch_loss = loss1.item() + loss2.item()
 

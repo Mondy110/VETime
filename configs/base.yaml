@@ -21,7 +21,7 @@ training:
 # ==================== 损失配置 ====================
 loss:
   alpha_recon: 0.05                 # 重构损失缩放系数，降低重构量级避免淹没分类梯度
-  cl_weight: 0.1                    # 对比学习损失权重
+  cl_weight: 1.0                    # 对比学习损失权重
   balance_weight: 0.01              # MoE 专家负载均衡损失权重
   focal_gamma: 2.0                  # Focal Loss gamma，增大对难样本的关注
   w_anomaly: 1.2                    # 异常点分类权重
@@ -44,11 +44,18 @@ data:
 
 # ==================== 模型配置 ====================
 model:
-  model_name: VETime-refactor                # 模型名称
+  model_name: VETime-query                # 模型名称
   vision_name: mae_visualize_base.pth  # 视觉编码器权重文件名
   ts_finetune_type: lora            # 时序编码器微调类型（lora/freeze）
   use_vectorized_fold: true         # 是否使用向量化 fold_image（约150倍加速）
   use_gradient_checkpointing: false  # 是否使用梯度检查点节省显存
+
+  # ==================== 解码器配置 ====================
+  use_query_decoder: true          # 是否使用 Query-based 解码器（替代 MoE）
+  num_query_decoder_layers: 2      # Query Decoder 层数（1=单层原版, 2+=多层共享参数迭代）
+  # MoE 模式：需要二阶段课程训练（stage1 仅重构，stage2 联合训练）
+  # Query Decoder 模式：单阶段训练，两任务从头同时进行
+  # 多层共享参数：类似 RNN 权重共享，参数量不随层数增长
 
 # ==================== 路径配置 ====================
 paths:
