@@ -22,7 +22,7 @@ def collate_fn(
     patch_size: int
 ) -> Dict[str, Union[torch.Tensor, List, Tuple]]:
     """
-    Collate function for batching anomaly detection samples with dual-branch images.
+    Collate function for batching anomaly detection samples with VETime images.
 
     This function processes a batch of samples from AnomalyDataset and:
     1. Concatenates all time series and computes global mean/std for normalization
@@ -30,11 +30,14 @@ def collate_fn(
     3. Generates attention masks for valid sequence positions
     4. Applies random masking for self-supervised learning
     5. Pads VETime images to match the target width
-    6. Stacks ViCO images (already fixed 224x224 size)
+
+    ViCO frequency-domain images are NOT included here — they are rendered
+    on-the-fly in the training loop via render_vico_batch to ensure correct
+    alignment with chunk-level splits.
 
     Args:
         batch: List of samples from AnomalyDataset.__getitem__. Each sample is
-               a tuple of (time_series, normal_time_series, img_vetime, img_vico,
+               a tuple of (time_series, normal_time_series, img_vetime,
                labels, attribute, period, padding_value).
         patch_size: Size of patches for masking and padding alignment.
 
@@ -44,7 +47,6 @@ def collate_fn(
             - 'normal_time_series': Padded normal reference tensor (B, L_max, C)
             - 'mask_time_series': Time series with random patches masked (B, L_max, C)
             - 'image': Padded VETime time-domain image tensor (B, 3, H, W_max)
-            - 'image_vico': ViCO frequency-domain image tensor (B, 3, 224, 224)
             - 'mask': Boolean mask indicating masked positions (B, L_max)
             - 'labels': Padded label tensor (B, L_max) with -1 for padding
             - 'attention_mask': Boolean mask for valid positions (B, L_max)
@@ -56,9 +58,8 @@ def collate_fn(
         - Labels are padded with -1 (ignored in loss computation)
         - Random masking applies mask_ratio=0.3 to valid sequence regions only
         - VETime images are padded with adaptive padding values
-        - ViCO images are already 224x224, just stacked
     """
-    time_series_list, normal_time_series_list, img_vetime_list, img_vico_list, labels_list, attribute_list, period, padding_value = zip(*batch)
+    time_series_list, normal_time_series_list, img_vetime_list, labels_list, attribute_list, period, padding_value = zip(*batch)
 
     if time_series_list[0].ndim == 1:
         time_series_tensors = [ts.unsqueeze(-1) for ts in time_series_list]
@@ -66,6 +67,9 @@ def collate_fn(
     else:
         time_series_tensors = [ts for ts in time_series_list]
         normal_time_series_tensors = [nts for nts in normal_time_series_list]
+
+    # 保留原始值（未归一化）的副本，供 ViCO 渲染使用
+    raw_time_series_tensors = [ts.clone() for ts in time_series_tensors]
 
     concatenated = torch.cat(time_series_tensors, dim=0)
     mean = concatenated.mean(dim=0, keepdim=True)
@@ -91,11 +95,11 @@ def collate_fn(
     normal_time_series_tensors = padding_to_target_length(normal_time_series_tensors, 0.0)
     padded_labels = padding_to_target_length(labels, -1)
 
+    # ViCO 专用：原始值 padding（不做 z-score），padding 区域用 0 填充
+    padded_time_series_raw = padding_to_target_length(raw_time_series_tensors, 0.0)
+
     # VETime 分支: 需要自适应 padding
     image_inputs_vetime = image_right_padding(img_vetime_list, target_length, padding_value)
-
-    # ViCO 分支: 已经是固定 224x224，直接 stack
-    image_inputs_vico = torch.stack(img_vico_list)  # (B, 3, 224, 224)
 
     sequence_lengths = [ts.size(0) for ts in time_series_tensors]
     B, max_seq_len, num_features = padded_time_series.shape
@@ -109,10 +113,10 @@ def collate_fn(
 
     return {
         'time_series': padded_time_series,
+        'time_series_raw': padded_time_series_raw,  # 未归一化，供 ViCO 渲染
         'normal_time_series': normal_time_series_tensors,
         'mask_time_series': mask_time_series,
         'image': image_inputs_vetime,  # VETime 时域图像 (保持旧 key 名便于兼容)
-        'image_vico': image_inputs_vico,  # ViCO 频域图像
         'mask': mask,
         'labels': padded_labels,
         'attention_mask': attention_mask,

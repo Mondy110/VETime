@@ -32,16 +32,15 @@ def test_collate_fn_output_keys():
         normal_ts = ts.clone()
         # ts2image_1d produces image shape (3, C*h_size, W) with h_size=1 -> (3, 1, W)
         img_vetime = torch.randint(0, 255, (3, C, 200), dtype=torch.float32)
-        img_vico = torch.randint(0, 255, (3, 224, 224), dtype=torch.float32)
         labels = torch.zeros(200, dtype=torch.long)
         attribute = {'key': 'value'}
         period = 10
         # ts2image_1d produces pad_values shape (C, 3) as uint8, cast to float32
         padding_value = torch.zeros(C, 3, dtype=torch.float32)
-        batch.append((ts, normal_ts, img_vetime, img_vico, labels, attribute, period, padding_value))
+        batch.append((ts, normal_ts, img_vetime, labels, attribute, period, padding_value))
     result = collate_fn(batch, patch_size=16)
-    expected_keys = {'time_series', 'normal_time_series', 'mask_time_series',
-                     'image', 'image_vico', 'mask', 'labels', 'attention_mask',
+    expected_keys = {'time_series', 'time_series_raw', 'normal_time_series', 'mask_time_series',
+                     'image', 'mask', 'labels', 'attention_mask',
                      'period', 'padding_value'}
     assert expected_keys.issubset(set(result.keys()))
 

@@ -31,6 +31,7 @@ from loss.loss import load_balance_loss
 from model.TS_encoder.ts_model import TS_Model
 from model.TS_encoder.config import default_config_t
 from dataset.dataloader import AnomalyDataset, collate_fn, DynamicLengthBatchSampler
+from dataset.pre_image import render_vico_batch
 import logging
 from tqdm.auto import tqdm
 import os
@@ -544,8 +545,8 @@ def train_univariate(args):
                 print(f"\n[Cls Warmup] 分类预热完成 (batch {batch_idx}/{len(train_loader)})，已解冻所有参数，恢复多任务联合训练")
             labels = batch["labels"]
             images = batch["image"]  # VETime 时域图像 (B, C, H, W)
-            images_vico = batch.get("image_vico", None)  # ViCO 频域图像 (B, 3, 224, 224)
             time_series, att_mask = batch['time_series'], batch['attention_mask']
+            time_series_raw = batch['time_series_raw']  # 未归一化原始时序，供 ViCO 渲染
             mask = batch['mask']
             period = batch['period']
             p_value = batch['padding_value']
@@ -554,7 +555,7 @@ def train_univariate(args):
             alpha_recon = 0.05
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(images, time_series, att_mask, labels, time_series_raw)
                 loss1 = 0
                 loss2 = 0
                 batch_loss_bce = 0
@@ -563,13 +564,14 @@ def train_univariate(args):
                 batch_loss_e = 0
                 logits_list = []
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part, ts_raw_part = data_part
                     images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
-                    # ViCO 图像不需要 split，固定 224x224，直接传整个 batch 的
+                    # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像（原始值，att_mask 过滤 padding）
+                    images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
-                        hidden_states_vico=images_vico,
+                        hidden_states_vico=images_vico_chunk,
                         time_series=ts_part,
                         att_mask=att_mask_part,
                         init_img_size=init_img_size,
@@ -620,7 +622,8 @@ def train_univariate(args):
             else:
                 images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
-                # 双分支 forward：传入 ViCO 频域图像
+                # 渲染 ViCO 频域图像（原始值，att_mask 过滤 padding）
+                images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                     hidden_states=images_folded,
                     hidden_states_vico=images_vico,
@@ -925,25 +928,26 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
         for batch in val_loader:
             labels = batch["labels"]
             images = batch["image"]
-            images_vico = batch.get("image_vico", None)  # ViCO 频域图像
             time_series, att_mask = batch['time_series'], batch['attention_mask']
+            time_series_raw = batch['time_series_raw']
             period = batch['period']
             p_value = batch['padding_value']
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(images, time_series, att_mask, labels, time_series_raw)
                 loss1_total = 0
                 loss2_total = 0
 
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part, ts_raw_part = data_part
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
-                    # 双分支 forward
+                    # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像
+                    images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
-                        hidden_states_vico=images_vico,
+                        hidden_states_vico=images_vico_chunk,
                         time_series=ts_part,
                         att_mask=att_mask_part,
                         init_img_size=init_img_size,
@@ -961,7 +965,7 @@ def evaluate_multivariate(model, val_loader, accelerator, device, data_setting, 
                 images_folded, init_img_size = model.vit_encoder.fold_image(
                     images, period, p_value, **data_setting)
 
-                # 双分支 forward
+                images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                     hidden_states=images_folded,
                     hidden_states_vico=images_vico,
@@ -1194,25 +1198,26 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
         for batch in val_loader:
             labels = batch["labels"]
             images = batch["image"]
-            images_vico = batch.get("image_vico", None)  # ViCO 频域图像
             time_series, att_mask = batch['time_series'], batch['attention_mask']
+            time_series_raw = batch['time_series_raw']
             period = batch['period']
             p_value = batch['padding_value']
 
             if labels.shape[1] > model.MAX_L:
-                data_splits = model.split_data(images, time_series, att_mask, labels)
+                data_splits = model.split_data(images, time_series, att_mask, labels, time_series_raw)
                 loss1_total = 0
                 loss2_total = 0
 
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_part, label_part = data_part
+                    img_part, ts_part, att_mask_part, label_part, ts_raw_part = data_part
                     images_folded, init_img_size = model.vit_encoder.fold_image(
                         img_part, period, p_value, **data_setting)
 
-                    # 双分支 forward
+                    # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像
+                    images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
-                        hidden_states_vico=images_vico,
+                        hidden_states_vico=images_vico_chunk,
                         time_series=ts_part,
                         att_mask=att_mask_part,
                         init_img_size=init_img_size,
@@ -1230,7 +1235,7 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
                 images_folded, init_img_size = model.vit_encoder.fold_image(
                     images, period, p_value, **data_setting)
 
-                # 双分支 forward
+                images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                     hidden_states=images_folded,
                     hidden_states_vico=images_vico,
@@ -1615,8 +1620,8 @@ def train_multivariate(args, config: Dict[str, Any]):
             for batch in progress_bar:
                 labels = batch["labels"]
                 images = batch["image"]  # VETime 时域图像
-                images_vico = batch.get("image_vico", None)  # ViCO 频域图像
                 time_series, att_mask = batch['time_series'], batch['attention_mask']
+                time_series_raw = batch['time_series_raw']
                 mask = batch['mask']
                 period = batch['period']
                 p_value = batch['padding_value']
@@ -1624,7 +1629,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                 alpha_recon = 0.05
 
                 if labels.shape[1] > model.MAX_L:
-                    data_splits = model.split_data(images, time_series, att_mask, labels)
+                    data_splits = model.split_data(images, time_series, att_mask, labels, time_series_raw)
                     loss1 = 0
                     loss2 = 0
                     batch_loss_bce = 0
@@ -1633,13 +1638,14 @@ def train_multivariate(args, config: Dict[str, Any]):
                     batch_loss_e = 0
                     logits_list = []
                     for data_part in data_splits:
-                        img_part, ts_part, att_mask_part, label_part = data_part
+                        img_part, ts_part, att_mask_part, label_part, ts_raw_part = data_part
                         images_folded, init_img_size = model.vit_encoder.fold_image(img_part, period, p_value, **data_setting)
 
-                        # 双分支 forward
+                        # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像
+                        images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
                         local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                             hidden_states=images_folded,
-                            hidden_states_vico=images_vico,
+                            hidden_states_vico=images_vico_chunk,
                             time_series=ts_part,
                             att_mask=att_mask_part,
                             init_img_size=init_img_size,
@@ -1690,7 +1696,8 @@ def train_multivariate(args, config: Dict[str, Any]):
                 else:
                     images_folded, init_img_size = model.vit_encoder.fold_image(images, period, p_value, **data_setting)
 
-                    # 双分支 forward
+                    # 渲染 ViCO 频域图像（原始值，att_mask 过滤 padding）
+                    images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
                         hidden_states_vico=images_vico,

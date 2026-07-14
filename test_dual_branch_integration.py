@@ -83,7 +83,7 @@ try:
     source = inspect.getsource(vetime_module)
 
     # Check for visual_cross_attn attribute
-    has_vca = 'self.visual_cross_attn = VisualCrossAttention' in source
+    has_vca = 'self.visual_cross_attn = GatedTimeFrequencyFusion' in source
     has_mlp_vico = 'self.mlp_vico = nn.Sequential' in source
     has_hidden_states_vico = 'hidden_states_vico' in source
 
@@ -100,24 +100,14 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
-# Step 4: Test dataloader has dual-branch integration
-print("\n[4/5] Testing dataloader has dual-branch integration...")
+# Step 4: Test dataloader re-exports render_vico_batch
+print("\n[4/5] Testing dataloader re-exports render_vico_batch...")
 try:
-    # Check that dataloader has vico_render_timeseries call
-    import dataset.dataloader as dl_module
-    source = inspect.getsource(dl_module)
-
-    # Check for import (can be on same line with other imports)
-    has_vico_import = 'vico_render_timeseries' in source
-    has_vico_call = 'vico_render_timeseries(' in source
-
-    assert has_vico_import, "Missing vico_render_timeseries in dataloader"
-    assert has_vico_call, "Missing vico_render_timeseries call in dataloader"
-
-    print(f"   ✓ Dataloader references vico_render_timeseries: {has_vico_import}")
-    print(f"   ✓ Dataloader calls vico_render_timeseries: {has_vico_call}")
+    from dataset.dataloader import render_vico_batch
+    assert render_vico_batch is not None
+    print(f"   ✓ Dataloader re-exports render_vico_batch")
 except Exception as e:
-    print(f"   ✗ Dataloader check failed: {e}")
+    print(f"   ✗ Dataloader re-export check failed: {e}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
@@ -125,17 +115,17 @@ except Exception as e:
 # Step 5: Test train.py has dual-branch data flow
 print("\n[5/5] Testing train.py has dual-branch data flow...")
 try:
-    # Check that train.py passes images_vico to model forward
+    # Check that train.py uses render_vico_batch and passes hidden_states_vico
     import train as train_module
     source = inspect.getsource(train_module)
 
-    has_images_vico = 'images_vico' in source
+    has_render_vico_batch = 'render_vico_batch' in source
     has_hidden_states_vico = 'hidden_states_vico' in source
 
-    assert has_images_vico, "Missing images_vico in train.py"
+    assert has_render_vico_batch, "Missing render_vico_batch in train.py"
     assert has_hidden_states_vico, "Missing hidden_states_vico parameter in train.py"
 
-    print(f"   ✓ train.py uses images_vico: {has_images_vico}")
+    print(f"   ✓ train.py uses render_vico_batch: {has_render_vico_batch}")
     print(f"   ✓ train.py passes hidden_states_vico to model: {has_hidden_states_vico}")
 except Exception as e:
     print(f"   ✗ train.py check failed: {e}")
@@ -151,8 +141,8 @@ print("\nDual-branch architecture components verified:")
 print("  1. ✓ ViCO rendering function (vico_render_timeseries)")
 print("  2. ✓ VisualCrossAttention module")
 print("  3. ✓ VETime model with dual-branch components")
-print("  4. ✓ Dataloader with dual-branch image generation")
-print("  5. ✓ train.py with dual-branch data flow")
+print("  4. ✓ Dataloader re-exports render_vico_batch")
+print("  5. ✓ train.py renders ViCO on-the-fly and passes to model")
 print("\nReady for full training with dual-branch enabled.")
 print("\nTo run full training:")
 print("  python train.py --dataset_dir <your_dataset> --use_dual_branch")

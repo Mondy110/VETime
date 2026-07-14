@@ -247,27 +247,32 @@ class VETIME(TS_Model):
             self.ts_encoder.ts_encoder.gradient_checkpointing_disable()
         print("[INFO] Gradient checkpointing disabled")
 
-    def split_data(self,images, time_series, att_mask, labels):
+    def split_data(self,images, time_series, att_mask, labels, time_series_raw=None):
         """
         Split batched time-series data into chunks of length <= max_len along the time dimension (dim=1).
-        
+
         Args:
             images:       [B, T, ...]
             time_series:  [B, T, F]
             att_mask:     [B, T]
             labels:       [B, T] or [B, T, 1]
             max_len:      int, maximum sequence length per chunk
+            time_series_raw: Optional [B, T, F] tensor of un-normalized time series.
+                             If provided, each chunk tuple includes a 5th element
+                             ts_raw_chunk for ViCO rendering.
 
         Returns:
-            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk), ...]
+            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk, ts_raw_chunk), ...]
+                            When time_series_raw is None, ts_raw_chunk is omitted and
+                            tuples have 4 elements (backward compatible).
         """
         B, T,_ = time_series.shape
         if T != labels.shape[1]:
             raise ValueError("Data and labels must have the same length in the first dimension.")
-        
+
         if T % self.patch_size != 0:
             raise ValueError(f"Total length T={T} is not divisible by patch_size={self.patch_size}.")
-        
+
         if self.MAX_L < self.patch_size:
             raise ValueError(f"MAX_length ({self.MAX_L}) must be >= patch_size ({self.patch_size}).")
 
@@ -293,14 +298,18 @@ class VETIME(TS_Model):
             chunk_length = patches_in_this_chunk * self.patch_size  # back to time steps
             end_time = start_time + chunk_length
 
-            
+
             # Slice all tensors along time dimension (dim=1)
             img_chunk = images[:, :,:,start_time:end_time]          # [B, L, ...]
             ts_chunk = time_series[:, start_time:end_time,:]      # [B, L, F]
             mask_chunk = att_mask[:, start_time:end_time]       # [B, L]
             label_chunk = labels[:, start_time:end_time]        # [B, L] or [B, L, 1]
-            
-            chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk))
+
+            if time_series_raw is not None:
+                ts_raw_chunk = time_series_raw[:, start_time:end_time, :]
+                chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk, ts_raw_chunk))
+            else:
+                chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk))
             start_time = end_time
         return chunks
 

@@ -364,8 +364,94 @@ def find_period(
     
     top_k = min(top_k, len(valid_lags))
     estimated_period = int(valid_lags[top_k - 1])
-    
+
     return estimated_period
+
+
+def find_period_fft(
+    data: Union[np.ndarray, torch.Tensor],
+    min_period: int = 2,
+    max_period_ratio: float = 0.5,
+    default_period: int = 24,
+    magnitude_threshold: float = 0.1,
+) -> int:
+    """
+    Estimate the dominant period of time series using FFT (frequency-domain method).
+
+    This function is designed for ViCO frequency-domain rendering, where the period
+    is used for heatmap/gradient folding. Unlike the ACF-based ``find_period()``
+    used by VETime time-domain images, this method detects periodicity via FFT
+    peak analysis, which is more natural for frequency-domain representations.
+
+    The algorithm:
+    1. Compute FFT magnitude spectrum of the centered time series
+    2. Find the dominant frequency peak (excluding DC and very low frequencies)
+    3. Convert the dominant frequency to a period: period = 1 / f_dominant
+    4. If no clear peak exists, fall back to ``default_period`` (capped by
+       sequence length), matching original ViCO behaviour
+
+    Args:
+        data: Input time series data. Shape (L,) or (L, 1).
+        min_period: Minimum valid period. Periods below this are rejected
+                    as they produce degenerate folding. Default: 2.
+        max_period_ratio: Maximum period as a ratio of sequence length.
+                          Default: 0.5 (period cannot exceed half the sequence).
+        default_period: Fallback period when no dominant frequency is detected.
+                        Mirrors original ViCO's default periodicity of 24.
+                        Default: 24.
+        magnitude_threshold: Minimum relative magnitude (vs. max) for a peak to
+                             be considered dominant. Default: 0.1.
+
+    Returns:
+        Detected period as an integer. Falls back to ``min(default_period, L)``
+        when no clear periodicity is found.
+    """
+    if isinstance(data, torch.Tensor):
+        data = data.detach().cpu().numpy()
+    data = data.squeeze()
+
+    L = len(data)
+    if L < 4:
+        return min(default_period, max(min_period, L))
+
+    # Center the data (remove DC)
+    x = data - data.mean()
+
+    # Compute FFT magnitude spectrum
+    fft_vals = np.fft.rfft(x)
+    magnitudes = np.abs(fft_vals)
+
+    # Frequency resolution: frequencies are k / L for k = 0, 1, ..., L//2
+    # Exclude DC (k=0) and very low frequencies (period > max_period_ratio * L)
+    min_k = max(1, int(np.ceil(1.0 / (max_period_ratio * L))))  # k >= 1/(max_period)
+    max_k = len(magnitudes) - 1  # Nyquist
+
+    if min_k > max_k:
+        return min(default_period, max(min_period, L))
+
+    # Search for dominant peak in valid frequency range
+    valid_mags = magnitudes[min_k:max_k + 1]
+    if len(valid_mags) == 0:
+        return min(default_period, max(min_period, L))
+
+    peak_idx = np.argmax(valid_mags)
+    peak_magnitude = valid_mags[peak_idx]
+    max_magnitude = magnitudes[1:].max()  # max excluding DC
+
+    # Check if the peak is significant enough
+    if max_magnitude < 1e-8 or peak_magnitude < magnitude_threshold * max_magnitude:
+        # No dominant frequency → fall back to default
+        return min(default_period, max(min_period, L))
+
+    # Convert peak frequency index to period
+    dominant_k = peak_idx + min_k
+    period = L / dominant_k
+    period_int = int(round(period))
+
+    # Clamp to valid range
+    period_int = max(min_period, min(period_int, int(max_period_ratio * L)))
+
+    return period_int
 
 
 def moving_average_decompose(
@@ -795,7 +881,7 @@ def _gradient_map_np(
 
 def vico_render_timeseries(
     x: Union[np.ndarray, torch.Tensor],
-    periodicity: int,
+    periodicity: Optional[int] = None,
     img_size: int = 224,
     norm_const: float = 0.4,
     stft_win: int = 64,
@@ -816,8 +902,11 @@ def vico_render_timeseries(
     Args:
         x: Input time series of shape (L, C) or (L,), where L is sequence length
            and C is number of channels. Can be numpy array or torch tensor.
-        periodicity: Dominant period for heatmap and gradient folding. Use
-                     find_period() to detect if unknown.
+        periodicity: Dominant period for heatmap and gradient folding. When None
+                     (default), the period is automatically detected via FFT
+                     using ``find_period_fft()``, which is designed for
+                     frequency-domain rendering and differs from the ACF-based
+                     ``find_period()`` used by VETime time-domain images.
         img_size: Target image size. Output will be (3, img_size, img_size).
                   Default: 224.
         norm_const: Normalization constant for z-score normalization.
@@ -836,8 +925,7 @@ def vico_render_timeseries(
     Example:
         >>> import numpy as np
         >>> ts = np.random.randn(1000, 2)  # 1000 timesteps, 2 channels
-        >>> period = 24  # or use find_period(ts)
-        >>> img = vico_render_timeseries(ts, periodicity=period)
+        >>> img = vico_render_timeseries(ts)  # period auto-detected via FFT
         >>> img.shape
         (3, 224, 224)
         >>> img.dtype
@@ -851,6 +939,14 @@ def vico_render_timeseries(
         x = x[:, np.newaxis]
 
     L, C = x.shape
+
+    # Auto-detect period using FFT if not provided
+    if periodicity is None:
+        periodicity = find_period_fft(x)
+
+    # Fallback: ensure periodicity is valid (mirrors original ViCO's guard)
+    if periodicity <= 0:
+        periodicity = max(1, min(24, L))
 
     # Normalize the time series (z-score with norm_const scaling)
     mean = x.mean(axis=0, keepdims=True)
@@ -885,3 +981,48 @@ def vico_render_timeseries(
     image = (image * 255).clip(0, 255).astype(np.uint8)
 
     return image
+
+
+def render_vico_batch(
+    time_series: torch.Tensor,
+    att_mask: torch.Tensor = None,
+    img_size: int = 224,
+) -> torch.Tensor:
+    """Render ViCO frequency-domain images for a batch of time series.
+
+    This function renders ViCO images from raw (un-normalized) time series in
+    the training loop.  When ``att_mask`` is provided, only the valid (non-
+    padded) portion of each sample is used for rendering.
+
+    Each sample's period is automatically detected via FFT (``find_period_fft``),
+    which is designed for frequency-domain rendering and differs from the
+    ACF-based period used by VETime time-domain images.
+
+    Args:
+        time_series: [B, T, F] tensor of **raw** (un-normalized) time series
+            values.  Typically comes from the ``time_series_raw`` key in the
+            collated batch.
+        att_mask: [B, T] bool tensor. True = valid position, False = padding.
+            If None, the full time axis is used (caller guarantees no padding).
+        img_size: Target image size. Default: 224.
+
+    Returns:
+        [B, 3, img_size, img_size] float32 tensor on the same device as input.
+    """
+    device = time_series.device
+    B = time_series.shape[0]
+    vico_imgs = []
+
+    for i in range(B):
+        # Slice out valid region using att_mask
+        if att_mask is not None:
+            valid_len = att_mask[i].sum().item()
+            ts_np = time_series[i, :valid_len].detach().cpu().numpy()
+        else:
+            ts_np = time_series[i].detach().cpu().numpy()
+
+        # Period is auto-detected via FFT inside vico_render_timeseries
+        img = vico_render_timeseries(ts_np, periodicity=None, img_size=img_size)
+        vico_imgs.append(torch.from_numpy(img).float())
+
+    return torch.stack(vico_imgs).to(device)

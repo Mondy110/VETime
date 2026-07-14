@@ -23,7 +23,7 @@ from tqdm import tqdm
 
 from src.utils.logger import get_logger
 from src.datasets.masking import create_random_mask
-from src.datasets.pre_image import ts2image_Test
+from src.datasets.pre_image import ts2image_Test, render_vico_batch
 
 logger = get_logger(__name__)
 
@@ -97,6 +97,15 @@ def dataloader_TSB(
         value=0.0,
     ).transpose(1, 2)
 
+    # ViCO 专用：原始值 padding（未归一化）
+    ts_raw = torch.tensor(time_series, dtype=torch.float32).unsqueeze(0)
+    padded_ts_raw = F.pad(
+        ts_raw.transpose(1, 2),
+        pad=(0, target_length - lengths),
+        mode="constant",
+        value=0.0,
+    ).transpose(1, 2)
+
     padded_labels = F.pad(
         labels,
         pad=(0, target_length - lengths),
@@ -113,6 +122,7 @@ def dataloader_TSB(
 
     return {
         "time_series": padded_ts,
+        "time_series_raw": padded_ts_raw,
         "mask_time_series": mask_time_series,
         "image": image_inputs,
         "mask": mask,
@@ -238,21 +248,29 @@ class Evaluator:
         labels_tensor = batch["labels"]
         images = batch["image"]
         time_series = batch["time_series"]
+        time_series_raw = batch["time_series_raw"]
         att_mask = batch["attention_mask"]
 
         with torch.no_grad():
             if len(labels) > self.model.MAX_L:
-                data_splits = self.model.split_sequence(images, time_series, att_mask, labels_tensor)
+                data_splits = self.model.split_sequence(images, time_series, att_mask, labels_tensor, time_series_raw)
                 logits_list = []
                 for data_part in data_splits:
-                    img_part, ts_part, att_mask_p, label_part = data_part
+                    img_part, ts_part, att_mask_p, label_part, ts_raw_part = data_part
                     images_folded, init_img_size = self.model.fold_images(
                         img_part,
                         batch["period"].cpu().numpy(),
                         batch["p_value"],
                         **data_setting,
                     )
-                    local_embeddings, _, _, _ = self.model(images_folded, ts_part, att_mask_p, init_img_size)
+                    images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_p)
+                    local_embeddings, _, _, _ = self.model(
+                        hidden_states=images_folded,
+                        hidden_states_vico=images_vico_chunk,
+                        time_series=ts_part,
+                        att_mask=att_mask_p,
+                        init_img_size=init_img_size,
+                    )
                     _, logits_part = self.model.anomaly_detection_loss(local_embeddings, label_part)
                     logits_list.append(logits_part)
                 logits = torch.cat(logits_list, dim=1)
@@ -263,7 +281,14 @@ class Evaluator:
                     batch["p_value"],
                     **data_setting,
                 )
-                local_embeddings, _, _, _ = self.model(images_folded, time_series, att_mask, init_img_size)
+                images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
+                local_embeddings, _, _, _ = self.model(
+                    hidden_states=images_folded,
+                    hidden_states_vico=images_vico,
+                    time_series=time_series,
+                    att_mask=att_mask,
+                    init_img_size=init_img_size,
+                )
                 _, logits = self.model.anomaly_detection_loss(local_embeddings, labels_tensor)
 
         probs = torch.softmax(logits, dim=-1)[:, :, 1].detach().squeeze().cpu().numpy()

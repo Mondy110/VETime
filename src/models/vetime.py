@@ -342,7 +342,7 @@ class VETIME(TS_Model):
             self.ts_encoder.ts_encoder.gradient_checkpointing_disable()
         print("[INFO] Gradient checkpointing disabled")
 
-    def split_data(self,images, time_series, att_mask, labels):
+    def split_data(self,images, time_series, att_mask, labels, time_series_raw=None):
         """
         Split batched time-series data into chunks of length <= max_len along the time dimension (dim=1).
 
@@ -352,9 +352,14 @@ class VETIME(TS_Model):
             att_mask:     [B, T]
             labels:       [B, T] or [B, T, 1]
             max_len:      int, maximum sequence length per chunk
+            time_series_raw: Optional [B, T, F] tensor of un-normalized time series.
+                             If provided, each chunk tuple includes a 5th element
+                             ts_raw_chunk for ViCO rendering.
 
         Returns:
-            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk), ...]
+            List of tuples: [(img_chunk, ts_chunk, mask_chunk, label_chunk, ts_raw_chunk), ...]
+                            When time_series_raw is None, ts_raw_chunk is omitted and
+                            tuples have 4 elements (backward compatible).
         """
         B, T,_ = time_series.shape
         if T != labels.shape[1]:
@@ -395,7 +400,11 @@ class VETIME(TS_Model):
             mask_chunk = att_mask[:, start_time:end_time]       # [B, L]
             label_chunk = labels[:, start_time:end_time]        # [B, L] or [B, L, 1]
 
-            chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk))
+            if time_series_raw is not None:
+                ts_raw_chunk = time_series_raw[:, start_time:end_time, :]
+                chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk, ts_raw_chunk))
+            else:
+                chunks.append((img_chunk, ts_chunk, mask_chunk, label_chunk))
             start_time = end_time
         return chunks
 
@@ -422,7 +431,7 @@ class VETIME(TS_Model):
         )
         return images_folded, init_img_size
 
-    def split_sequence(self, images, time_series, att_mask, labels):
+    def split_sequence(self, images, time_series, att_mask, labels, time_series_raw=None):
         """
         封装 self.split_data 调用，用于长序列分块。
 
@@ -431,11 +440,12 @@ class VETIME(TS_Model):
             time_series: 时序数据 [B, L, C]
             att_mask: 注意力掩码 [B, L]
             labels: 标签 [B, L]
+            time_series_raw: Optional [B, L, C] un-normalized time series for ViCO rendering.
 
         Returns:
-            list of (sub_images, sub_ts, sub_att_mask, sub_labels) chunks
+            list of (sub_images, sub_ts, sub_att_mask, sub_labels[, sub_ts_raw]) chunks
         """
-        return self.split_data(images, time_series, att_mask, labels)
+        return self.split_data(images, time_series, att_mask, labels, time_series_raw)
 
     def compute_loss(self, outputs, time_series, att_mask, labels, stage,
                      alpha_recon=0.05, cl_weight=0.1, balance_weight=0.01):

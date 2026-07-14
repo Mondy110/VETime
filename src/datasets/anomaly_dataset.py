@@ -12,7 +12,7 @@ import random
 import torch
 from torch.utils.data import Dataset
 
-from src.datasets.pre_image import ts2image_1d, vico_render_timeseries
+from src.datasets.pre_image import ts2image_1d
 
 
 class AnomalyDataset(Dataset):
@@ -109,11 +109,12 @@ class AnomalyDataset(Dataset):
 
     def generate_image(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Generate dual-branch image representations for time series samples.
+        Generate VETime time-domain image representations for time series samples.
 
-        This function converts each time series in the data list to two images:
-        1. VETime image: Time-domain rendering using ts2image_1d
-        2. ViCO image: Frequency-domain rendering using vico_render_timeseries
+        This function converts each time series in the data list to a time-domain
+        image using ts2image_1d. ViCO frequency-domain images are rendered on-the-fly
+        in the training loop (via render_vico_batch) to ensure correct alignment with
+        chunk-level splits.
 
         The image width is determined by the sequence length and patch_size,
         rounded up to the nearest multiple of patch_size.
@@ -126,7 +127,6 @@ class AnomalyDataset(Dataset):
         Returns:
             List[Dict[str, Any]]: The same data list with added keys:
                 - 'image_vetime': VETime time-domain image (3, C*h_size, width)
-                - 'image_vico': ViCO frequency-domain image (3, 224, 224)
                 - 'period': Detected period (integer)
                 - 'padding_value': Padding values for VETime image
 
@@ -138,19 +138,13 @@ class AnomalyDataset(Dataset):
         for idx, data0 in enumerate(data):
             target_length = ((len(data0['time_series']) + self.patch_size - 1) // self.patch_size) * self.patch_size
 
-            # === VETime 时域渲染 (现有) ===
+            # === VETime 时域渲染 ===
             img_vetime, period, padding_value = ts2image_1d(
                 data0['time_series'], target_length, self.patch_size
             )
 
-            # === ViCO 频域渲染 (新增) ===
-            img_vico = vico_render_timeseries(
-                data0['time_series'], period, img_size=224
-            )
-
-            # 存储两分支图像
+            # 存储图像和元数据（ViCO 在训练循环中按 chunk 渲染）
             data[idx]['image_vetime'] = img_vetime  # [3, C*h_size, width]
-            data[idx]['image_vico'] = img_vico      # [3, 224, 224]
             data[idx]['period'] = period
             data[idx]['padding_value'] = padding_value
 
@@ -160,7 +154,7 @@ class AnomalyDataset(Dataset):
 
         return data
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict, int, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict, int, torch.Tensor]:
         """
         Get a single sample from the dataset.
 
@@ -172,20 +166,17 @@ class AnomalyDataset(Dataset):
                 - time_series: Time series data as float32 tensor (L, C)
                 - normal_time_series: Normal reference time series (L, C)
                 - image_vetime: VETime time-domain image as float32 tensor (3, H, W)
-                - image_vico: ViCO frequency-domain image as float32 tensor (3, 224, 224)
                 - labels: Anomaly labels as long tensor (L,)
                 - attribute: Metadata dictionary
                 - period: Detected period (int)
                 - padding_value: Padding values as float32 tensor (3, C, 1)
         """
         sample = self.data[idx]
-        # 双分支图像
         img_vetime_tensor = torch.tensor(sample['image_vetime'], dtype=torch.float32)
-        img_vico_tensor = torch.tensor(sample['image_vico'], dtype=torch.float32)
         time_series = torch.tensor(sample['time_series'], dtype=torch.float32)
         normal_time_series = torch.tensor(sample['normal_time_series'], dtype=torch.float32)
         labels = torch.tensor(sample['labels'], dtype=torch.long)
         attribute = sample['attribute']
         period = sample['period']
         padding_value = torch.tensor(sample['padding_value'], dtype=torch.float32)
-        return time_series, normal_time_series, img_vetime_tensor, img_vico_tensor, labels, attribute, period, padding_value
+        return time_series, normal_time_series, img_vetime_tensor, labels, attribute, period, padding_value
