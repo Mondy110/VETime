@@ -17,7 +17,7 @@ from accelerate import Accelerator
 from src.utils.logger import get_logger
 from src.engines.hooks import freeze_for_cls_warmup, restore_requires_grad
 from src.losses.balance import load_balance_loss
-from src.datasets.pre_image import render_vico_batch
+from src.datasets.renderers import create_renderer  # 新增
 
 logger = get_logger(__name__)
 
@@ -45,6 +45,11 @@ class Trainer:
         self.start_epoch = 0
         self.device = accelerator.device
 
+        # === 新增：初始化 ViCO 渲染器 ===
+        renderer_name = self._get_renderer_name(cfg)
+        self.vico_renderer = create_renderer(renderer_name)
+        logger.info(f"ViCO 渲染器: {self.vico_renderer}")
+
         # 从 cfg 中提取常用字段
         self.epochs = cfg.training.total_epochs
         self.stage1_epochs = cfg.training.stage1_epochs
@@ -64,6 +69,12 @@ class Trainer:
         self.output_path0 = f'./output/score/uni/{self.model_name}_train'
         self.checkpoint_dir = f'./output/checkpoints/{self.model_name}'
         os.makedirs(self.output_path0, exist_ok=True)
+
+    def _get_renderer_name(self, cfg) -> str:
+        """从配置中获取渲染器名称，默认 'vico'。"""
+        if hasattr(cfg, 'model') and hasattr(cfg.model, 'vision_branch'):
+            return getattr(cfg.model.vision_branch, 'vico_renderer', 'vico')
+        return 'vico'
 
     # =================================================================
     # Setup
@@ -325,7 +336,9 @@ class Trainer:
                     )
 
                     # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像（内部自动 FFT 检测周期）
-                    images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
+                    images_vico_chunk = self.vico_renderer.render_batch(
+                        ts_raw_part, att_mask=att_mask_part, img_size=self.img_size
+                    )
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
                         hidden_states_vico=images_vico_chunk,
@@ -382,7 +395,9 @@ class Trainer:
                 )
 
                 # 渲染 ViCO 频域图像（原始值，att_mask 过滤 padding，内部自动 FFT 检测周期）
-                images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
+                images_vico = self.vico_renderer.render_batch(
+                    time_series_raw, att_mask=att_mask, img_size=self.img_size
+                )
                 local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                     hidden_states=images_folded,
                     hidden_states_vico=images_vico,
@@ -607,7 +622,9 @@ class Trainer:
                         )
 
                         # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像（内部自动 FFT 检测周期）
-                        images_vico_chunk = render_vico_batch(ts_raw_part, att_mask=att_mask_part)
+                        images_vico_chunk = self.vico_renderer.render_batch(
+                            ts_raw_part, att_mask=att_mask_part, img_size=self.img_size
+                        )
                         local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                             hidden_states=images_folded,
                             hidden_states_vico=images_vico_chunk,
@@ -638,7 +655,9 @@ class Trainer:
                         images, period, p_value, **data_setting
                     )
 
-                    images_vico = render_vico_batch(time_series_raw, att_mask=att_mask)
+                    images_vico = self.vico_renderer.render_batch(
+                        time_series_raw, att_mask=att_mask, img_size=self.img_size
+                    )
                     local_embeddings1, m_w, loss_cl, local_embeddings2 = model(
                         hidden_states=images_folded,
                         hidden_states_vico=images_vico,
