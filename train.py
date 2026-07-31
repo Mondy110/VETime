@@ -131,7 +131,7 @@ def train_univariate_hydra(cfg):
              f"({100*trainable_params/total_params:.2f}%)")
 
     # ---- DataSetting ----
-    data_setting = {"img_size": 224, "T_sqrt": False}
+    data_setting = dict(getattr(cfg.data, 'data_setting', {"img_size": 224, "T_sqrt": False}))
     collatefn = partial(collate_fn, patch_size=patch_size)
     g = torch.Generator()
     g.manual_seed(cfg.seed)

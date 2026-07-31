@@ -39,8 +39,13 @@ data:
   min_seq_length: 100               # 最短序列长度过滤阈值
   dynamic_batch: false              # 动态批大小（短样本自动增大 batch）
   max_batch_size: 64                # 动态批最大值（dynamic_batch=true 时生效）
-  padding_ratio: 0.1                # 动态批 padding 比例
+  padding_ratio: 1.5                # 动态批 padding 比例（用于 ViCO 图像渲染）
   shuffle_bucket: false             # 是否按长度分桶后 shuffle
+
+  # ==================== 数据预处理配置 ====================
+  data_setting:
+    img_size: 224                   # 图像尺寸
+    T_sqrt: false                   # 是否对时序值开方
 
 # ==================== 模型配置 ====================
 model:
@@ -68,6 +73,7 @@ paths:
   ts_path: checkpoints/weight_ts/full_mask_anomaly_head_pretrain_checkpoint_best.pth  # TS Encoder 预训练权重
   vision_path: ./checkpoints/weight_v       # 视觉编码器权重目录
   vetime_path: null                         # VETime 完整权重路径（null=不加载）
+  pretrain_from: null                       # 预训练权重路径（用于迁移学习，null=不加载）
   resume: null                              # 恢复训练的 checkpoint 路径（null=不恢复）
   save_dir: ./output                        # 输出目录
   output_file_path: ./output/result.json    # 评估结果输出文件
