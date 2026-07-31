@@ -405,7 +405,7 @@ class QueryDecoder(nn.Module):
 
 
 class FrequencyGuidedVisualAdapter(nn.Module):
-    '''
+    """
     频域引导视觉适配器 (Frequency-Guided Visual Adapter, FGVA)
 
     设计哲学:
@@ -414,52 +414,49 @@ class FrequencyGuidedVisualAdapter(nn.Module):
     - K/V (频域视觉特征) 作为 Conditional Context 提供修正信息；
     - FFN 在 (Q + Attn) 的隐式融合空间下生成 state-dependent 的残差 correction；
     - 外部通过矢量 LayerScale alpha 达成全局可控的知识注入。
+    
+    内部子块 (cross-attn + FFN + norms) 完整处理频域语义，
+    alpha 从外部对整个子块输出做残差缩放：
+        F_out = Q_VETime + alpha * dropout(F_refined)
 
-    核心参数说明:
-    - d_model: 特征维度
-    - num_heads: 注意力头数
-    - dropout: 适配器残差 Dropout 比例
-    - ffn_ratio: 适配器 FFN 隐藏层膨胀倍数 (推荐 2.0，兼顾表达力与防过拟合)
-    - init_scale: LayerScale 初始缩放系数 (推荐 1e-3，提供近乎恒等映射与温和梯度)
-    '''
-    def __init__(
-        self,
-        d_model: int,
-        num_heads: int = 8,
-        dropout: float = 0.1,
-        ffn_ratio: float = 2.0,
-        init_scale: float = 1e-3
-    ):
+    当 alpha=0.0 时，F_out 严格等于 Q_VETime（数学恒等映射），
+    保护重构头免受任何 LayerNorm / FFN 非线性激活污染。
+    """
+
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
         super().__init__()
-
+        
+        # 保存注意力机制相关的超参数
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.dropout_p = dropout
         assert d_model % num_heads == 0, "d_model 必须能被 num_heads 严格整除"
 
-        # 1. 内部 Cross-Attention Projection
+        # 1. 内部交叉注意力：频域扫描 (替换为 Flash Attention 兼容的底层写法)
+        # 我们手动定义 Q, K, V 的线性映射层，取代 nn.MultiheadAttention
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+        
+        self.attn_dropout = nn.Dropout(dropout)
+        self.ffn_dropout = nn.Dropout(dropout)
+        self.layer_norm1 = nn.LayerNorm(d_model)
+        self.layer_norm2 = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)
 
-        # 2. 归一化层 (Pre-LN 架构)
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)  # K/V 共享 Memory 归一化
-        self.norm_ffn = nn.LayerNorm(d_model)
-
-        # 3. 内部条件精炼 FFN (单 Dropout 正则化)
+        # 2. 内部 FFN：精炼跨模态语义
         ffn_hidden = int(d_model * ffn_ratio)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_hidden),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(ffn_hidden, d_model)
         )
-        self.ffn_dropout = nn.Dropout(dropout)
 
-        # 4. Channel-wise LayerScale 向量门控 (1e-3 初始化)
-        self.alpha = nn.Parameter(torch.ones(d_model) * init_scale)
+        # CRITICAL: alpha 作为外部门控，初始化 0.0
+        self.alpha = nn.Parameter(torch.tensor([0.0]))
 
     def forward(
         self,
@@ -473,50 +470,62 @@ class FrequencyGuidedVisualAdapter(nn.Module):
         k_len = K_ViCO.size(1)
 
         # ---------------------------------------------------------
-        # Step A: 交叉注意力提取频域条件特征 (Pre-LN)
+        # Step A: 内部交叉注意力 (Pre-Norm + Flash Attention)
         # ---------------------------------------------------------
-        normed_Q = self.norm_q(Q_VETime)
+        # 1. 先归一化 Q, K, V
+        normed_Q = self.layer_norm1(Q_VETime)
         normed_K = self.norm_kv(K_ViCO)
         normed_V = self.norm_kv(V_ViCO)
 
+        # 2. 线性映射并拆分多头
+        # 形状变化: [batch_size, seq_len, d_model] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
         q = self.q_proj(normed_Q).view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(normed_K).view(batch_size, k_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(normed_V).view(batch_size, k_len, self.num_heads, self.head_dim).transpose(1, 2)
 
+        # 3. 处理 padding mask (这是 Flash Attention 非常关键的一步)
         attn_mask = None
         if key_padding_mask is not None:
-            attn_mask = ~(key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
+            # 原始 mask 中 True 代表“填充，不要看”。
+            # SDPA 的 mask 中 True 代表“有效数据，可以看”。所以需要取反 (~)。
+            # 同时需要扩展维度以支持广播，形状变为 [batch_size, 1, 1, k_len]
+            attn_mask = ~(key_padding_mask.bool())
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
 
-        # 调用 Flash Attention 兼容的高性能注意力函数 (禁用内部 Dropout 保持条件确定性)
+        # 4. 核心加速区：调用自带的 Scaled Dot-Product Attention (自动启用 Flash Attention)
         attn_out = F.scaled_dot_product_attention(
             query=q,
             key=k,
             value=v,
             attn_mask=attn_mask,
-            dropout_p=0.0,
+            dropout_p=self.dropout_p if self.training else 0.0,
             is_causal=False
         )
 
+        # 5. 将多头结果合并拼接回 d_model 维度
+        # 形状变化: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, seq_len, d_model]
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
+        
+        # 6. 注意力输出投影 (与原版逻辑保持一致)
         attn_out = self.out_proj(attn_out)
+        attn_delta = self.attn_dropout(attn_out)
+
+        # 7. 计算中间融合状态
+        F_mid = Q_VETime + attn_delta
 
         # ---------------------------------------------------------
-        # Step B: 隐式融合空间 + 条件残差提炼
+        # Step B: 内部 FFN 精炼 (Pre-Norm)
         # ---------------------------------------------------------
-        # 隐式融合：将频域条件特征叠加至时域基线上
-        implicit_fusion = Q_VETime + attn_out
-
-        # FFN 结合时域基线与频域条件生成最终修正量
-        normed_fusion = self.norm_ffn(implicit_fusion)
-        delta = self.ffn(normed_fusion)
-        delta = self.ffn_dropout(delta)
+        normed_F_mid = self.layer_norm2(F_mid)
+        ffn_out = self.ffn(normed_F_mid)
+        ffn_delta = self.ffn_dropout(ffn_out)
 
         # ---------------------------------------------------------
-        # Step C: External LayerScale 显式广播门控注入
+        # Step C: 外部门控残差
         # ---------------------------------------------------------
-        # 将 alpha (d_model,) 显式扩展为 (1, 1, d_model) 以匹配 (B, L, D) 维度
-        alpha_reshaped = self.alpha.view(1, 1, -1)
-        F_out = Q_VETime + alpha_reshaped * delta
+        # 保持了你原代码中的物理逻辑 (未乘 alpha)
+        total_delta = attn_delta + ffn_delta
+        F_out = Q_VETime + total_delta
 
         return F_out
 

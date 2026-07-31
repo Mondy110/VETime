@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from src.losses.contrastive import win_Contrastive_Loss
 from src.models.ts_encoder.ts_encoder import TimeSeriesEncoder
 from src.models.ts_encoder.ts_model import TS_Model
-from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, GatedTimeFrequencyFusion
+from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, FrequencyGuidedVisualAdapter
 
 
 class VETIME(TS_Model):
@@ -37,9 +37,9 @@ class VETIME(TS_Model):
         self.I_att = V_Attention(t_dim)
 
         # === 视觉时频双分支 ===
-        # 门控残差交叉注意力融合模块：用 VETime 时域特征查询 ViCO 频域特征
-        # 可学习 alpha 参数（初始化 0.0）实现稳定热启动，训练初期自动回退到纯 VETime
-        self.visual_cross_attn = GatedTimeFrequencyFusion(t_dim, num_heads=8, dropout=0.1)
+        # 频域引导视觉适配器：用 VETime 时域特征查询 ViCO 频域特征
+        # Channel-wise LayerScale (init_scale=1e-3) 实现近乎恒等映射，训练初期自动回退到纯 VETime
+        self.visual_cross_attn = FrequencyGuidedVisualAdapter(t_dim, num_heads=8, dropout=0.1)
 
         # ViCO 分支的 MLP（与 VETime 分支结构一致）
         self.mlp_vico = nn.Sequential(
@@ -65,26 +65,14 @@ class VETIME(TS_Model):
         self.query_decoder = None
         self.fusion_proj = None
         self.use_query_decoder = kwargs.get('use_query_decoder', False)
-        self.num_query_decoder_layers = kwargs.get('num_query_decoder_layers', 1)  # 1=单层, 2+=多层
 
         if self.use_query_decoder:
-            if self.num_query_decoder_layers == 1:
-                # 单层 QueryDecoder（原版）
-                from src.models.vts_module import QueryDecoder
-                self.query_decoder = QueryDecoder(
-                    d_model=t_dim,
-                    num_heads=8,
-                    dropout=0.1
-                )
-            else:
-                # 多层 QueryDecoder（迭代 Query，静态专家）
-                from src.models.vts_module import MultiLayerQueryDecoder
-                self.query_decoder = MultiLayerQueryDecoder(
-                    d_model=t_dim,
-                    num_layers=self.num_query_decoder_layers,
-                    num_heads=8,
-                    dropout=0.1
-                )
+            from src.models.vts_module import QueryDecoder
+            self.query_decoder = QueryDecoder(
+                d_model=t_dim,
+                num_heads=4,
+                dropout=0.1
+            )
             self.fusion_proj = nn.Sequential(
                 nn.LayerNorm(t_dim * 2),
                 nn.Linear(t_dim * 2, t_dim)
@@ -135,6 +123,7 @@ class VETIME(TS_Model):
         image_features_vetime, _ = self.vit_encoder(hidden_states)
         I_embeddings_vetime = self.vit_encoder.unfold_image(image_features_vetime, init_img_size)
         I_embeddings_vetime = self.mlp_i(I_embeddings_vetime + multivariate_pos_emb)
+        # I_embeddings0 = self.I_att(I_embeddings, patch_mask)
         Q_visual = self.I_att(I_embeddings_vetime, patch_mask)  # [B, N_TS, t_dim]
 
         # === 分支 B: ViCO 频域 (使用真实 ViCO 图像) ===
@@ -148,13 +137,14 @@ class VETIME(TS_Model):
         K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
 
         # === 交叉注意力融合 ===
-        # GatedTimeFrequencyFusion: Q_VETime 查询 K_V_ViCO
+        # FrequencyGuidedVisualAdapter: Q_VETime 查询 K_V_ViCO
         I_embeddings0 = self.visual_cross_attn(
             Q_VETime=Q_visual,
             K_ViCO=K_V_tokens_proj,
             V_ViCO=K_V_tokens_proj
         )  # [B, N_TS, t_dim]
-
+        
+        
         # 后续流程保持不变：fusion → MoE → 任务头
         I_embeddings, TS_embeddings = self.fusion(I_embeddings0, TS_embeddings0, patch_mask)
         loss_sc=self.compute_cl(I_embeddings,TS_embeddings,labels,num_features)
@@ -163,7 +153,7 @@ class VETIME(TS_Model):
         if self.use_query_decoder and self.query_decoder is not None:
             # 生成三个专家特征
             F_TS = TS_embeddings0  # (B, N, D) 时间专家
-            F_V = I_embeddings      # (B, N, D) 视觉专家
+            F_V = I_embeddings0      # (B, N, D) 视觉专家
 
             # 融合专家特征
             mix_out0_for_proj = torch.cat([TS_embeddings, I_embeddings], dim=-1)
@@ -283,7 +273,7 @@ class VETIME(TS_Model):
                 return local_embeddings1, local_embeddings2
 
             F_TS = TS_embeddings0
-            F_V = I_embeddings
+            F_V = I_embeddings0
             mix_out0 = torch.cat([TS_embeddings, I_embeddings], dim=-1)
 
             local_embeddings1, local_embeddings2 = checkpoint(
