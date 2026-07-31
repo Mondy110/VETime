@@ -36,22 +36,34 @@ VETime introduces a Reversible Image Conversion and a Patch-Level Temporal Align
 VETime/
 ├── train.py                  # Main training script (with Accelerate support)
 ├── Test_TSB.py               # TSB-AD benchmark evaluation and inference
-├── model/
-│   ├── VETime.py             # VETIME main model architecture
-│   ├── VTS_module.py         # Vision-Time Series fusion module
-│   ├── Vision_encoder/       # Vision backbone (MAE, ViT)
-│   └── TS_encoder/           # Time series encoder
-├── dataset/
-│   ├── dataloader.py         # Data loaders and collate functions
-│   ├── pre_image.py          # Time series to image conversion utilities
+├── src/                      # Core source code (modular architecture)
+│   ├── models/               # Model implementations
+│   │   ├── vetime.py         # VETIME main model architecture
+│   │   ├── vts_module.py     # Vision-Time Series fusion module
+│   │   ├── vision_encoder/   # Vision backbone (MAE, ViT)
+│   │   └── ts_encoder/       # Time series encoder
+│   ├── datasets/             # Data loading and preprocessing
+│   │   ├── anomaly_dataset.py    # Dataset class
+│   │   ├── collate.py        # Collate functions
+│   │   └── pre_image.py      # Time series to image conversion
+│   ├── losses/               # Loss functions
+│   │   ├── contrastive.py    # Contrastive loss
+│   │   └── anomaly.py        # Anomaly detection losses
+│   └── engines/              # Training and evaluation engines
+│       ├── trainer.py        # Trainer class
+│       └── evaluator.py      # Evaluator class
+├── configs/                  # Hydra configuration files
+│   ├── base.yaml             # Base configuration
+│   └── model/                # Model-specific configs
+├── dataset/                  # Data directories (not source code)
 │   └── TSB-AD/               # TSB-AD benchmark datasets
-├── loss/
-│   └── loss.py               # Contrastive loss, etc.
 ├── evaluation/
 │   ├── metrics.py            # Comprehensive anomaly detection metrics
 │   └── basic_metrics.py      # Basic metric implementations
 └── requirements.txt          # Dependencies list
 ```
+
+> **Note**: Legacy paths (`model/`, `loss/`) are maintained as re-export layers for backward compatibility. New code should import from `src.models`, `src.losses`, `src.datasets`.
 
 ---
 
