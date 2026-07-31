@@ -50,6 +50,11 @@ model:
   use_vectorized_fold: true         # 是否使用向量化 fold_image（约150倍加速）
   use_gradient_checkpointing: false  # 是否使用梯度检查点节省显存
 
+  # ==================== 视觉双分支配置 ====================
+  vision_branch:
+    vico_renderer: vico              # 渲染器类型：vico / gaf / stft / ...
+    renderer_params: {}              # 渲染器特定参数（预留扩展）
+
   # ==================== 解码器配置 ====================
   use_query_decoder: true          # 是否使用 Query-based 解码器（替代 MoE）
   # MoE 模式：需要二阶段课程训练（stage1 仅重构，stage2 联合训练）
