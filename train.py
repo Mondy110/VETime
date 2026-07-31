@@ -1,123 +1,21 @@
-# train_ad_qwen_vl.py
+# train.py
 """
-VETime Training Script
+VETime Training Script (Hydra Entry)
 
-As per paper (B.4 Implementation Details):
-- Vision Encoder: Frozen MAE (no fine-tuning)
-- Time-Series Encoder: LoRA fine-tuning (r=8, α=16)
-- Learning Rate: 5e-4
-- Weight Decay: 1e-5
-- Optimizer: AdamW
-- Epochs: 25 (with early stopping patience=4)
-- Batch Size: 32
+New entry point using Hydra configuration system and src/ modules.
 """
-import argparse
-import gc
-import json
-import random
-import numpy as np
-import yaml
-from typing import Dict, Any, Optional
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from accelerate import Accelerator
-from accelerate.logging import get_logger
-from Test_TSB import PASS_LIST, TSB_test
-from evaluation.metrics import fast_get_metrics
-import logging
-from tqdm.auto import tqdm
-import os
-from datetime import datetime
-from Test_TSB import EarlyStopping
 from functools import partial
-logging.basicConfig(level=logging.INFO)
-logger = get_logger(__name__)
+import logging
+import os
+
+# Environment setup
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-torch.cuda.empty_cache()
 
-
-def set_seed(seed: int):
-    """设置所有随机种子以保证可复现性（PyTorch 2.4+ 支持确定性 Flash Attention）"""
-    import os
-    # 设置环境变量
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'  # CUDA 确定性所需
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    # 确保CUDA操作确定性
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    # ✅ PyTorch 2.1+ 支持确定性 Flash Attention
-    # 这会启用所有操作的确定性模式，包括 Flash Attention
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
-def seed_worker(worker_id):
-    """为每个DataLoader worker设置不同的种子"""
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-
-
-def load_config(config_path: str) -> Dict[str, Any]:
-    """
-    加载 YAML 配置文件
-
-    Args:
-        config_path: 配置文件路径
-
-    Returns:
-        配置字典
-    """
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
-
-
-def freeze_for_cls_warmup(model, accelerator):
-    """冻结除异常分类相关参数外的所有参数，用于分类头平稳预热。
-
-    可训练参数:
-      - anomaly_head.*            (分类 MLP)
-      - mm_w.task_proj.1.T.*      (分类时序专家投影)
-      - mm_w.task_proj.1.I.*      (分类图像专家投影)
-      - mm_w.task_proj.1.M.*      (分类混合专家投影)
-      - mm_w.Router.*             (任务路由，task_embedding 按任务隔离)
-
-    其余全部冻结（视觉编码器、时序编码器、LoRA、重构头、重构专家、共享 mlp_m、fusion 等）。
-    返回 saved_requires_grad 字典，用于后续恢复。
-    """
-    unwrapped = accelerator.unwrap_model(model)
-    classification_patterns = ['anomaly_head', 'mm_w.task_proj.1.', 'mm_w.Router.']
-    saved_requires_grad = {}
-    frozen_count = 0
-    trainable_count = 0
-    for name, param in unwrapped.named_parameters():
-        saved_requires_grad[name] = param.requires_grad
-        if not any(pattern in name for pattern in classification_patterns):
-            if param.requires_grad:
-                param.requires_grad = False
-                frozen_count += 1
-        else:
-            trainable_count += 1
-    print(f"[Cls Warmup] 冻结 {frozen_count} 个参数组，保留 {trainable_count} 个分类相关参数组可训练")
-    return saved_requires_grad
-
-
-def restore_requires_grad(model, accelerator, saved_requires_grad):
-    """恢复参数的 requires_grad 状态（分类预热结束后调用）。"""
-    unwrapped = accelerator.unwrap_model(model)
-    for name, param in unwrapped.named_parameters():
-        if name in saved_requires_grad:
-            param.requires_grad = saved_requires_grad[name]
-
+logging.basicConfig(level=logging.INFO)
 
 
 def train_univariate_hydra(cfg):
@@ -270,33 +168,42 @@ def train_univariate_hydra(cfg):
                 min_batch_size=cfg.data.batch_size,
                 max_batch_size=getattr(cfg.data, 'max_batch_size', 256),
                 padding_ratio=getattr(cfg.data, 'padding_ratio', 1.5),
-                drop_last=False, effective_batch_size=0,
+                drop_last=False, effective_batch_size=cfg.data.batch_size,
+                shuffle_each_epoch=False, seed=cfg.seed,
             )
-            log.info(f"动态 Batch Size: {train_sampler.get_batch_info()}")
-            accelerator.gradient_accumulation_steps = 1
 
             from src.utils.seed import seed_worker
             train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                                      collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                      collate_fn=collatefn,
+                                      num_workers=cfg.data.num_workers,
                                       pin_memory=True, persistent_workers=True,
                                       worker_init_fn=seed_worker)
             val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
-                                    collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                    collate_fn=collatefn,
+                                    num_workers=cfg.data.num_workers,
                                     pin_memory=True, persistent_workers=True,
                                     worker_init_fn=seed_worker)
         else:
             from src.utils.seed import seed_worker
             train_loader = DataLoader(train_dataset, batch_size=cfg.data.batch_size,
-                                      collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                      collate_fn=collatefn,
+                                      shuffle=True,
+                                      num_workers=cfg.data.num_workers,
                                       pin_memory=True, drop_last=True, persistent_workers=True,
                                       worker_init_fn=seed_worker, generator=g)
             val_loader = DataLoader(val_dataset, batch_size=cfg.data.batch_size,
-                                    collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                    collate_fn=collatefn,
+                                    shuffle=False,
+                                    num_workers=cfg.data.num_workers,
                                     pin_memory=True, drop_last=False, persistent_workers=True,
                                     worker_init_fn=seed_worker, generator=g)
-    else:
-        train_dataset = AnomalyDataset(cfg.paths.dataset_path, patch_size=patch_size, split="train")
-        log.info(f"验证模式: tsb, 训练集 {len(train_dataset)} 样本")
+
+        log.info(f"DataLoader 创建完成: batch_size={cfg.data.batch_size}, "
+                 f"dynamic_batch={dynamic_batch}")
+
+    else:  # val_mode == 'tsb' (default, no validation during training)
+        train_dataset = AnomalyDataset(cfg.paths.dataset_path, patch_size=patch_size)
+        log.info(f"验证模式: tsb (训练期间无验证), 训练集 {len(train_dataset)} 样本")
 
         if dynamic_batch:
             train_lengths = [len(train_dataset.data[i]['time_series']) for i in range(len(train_dataset))]
@@ -310,28 +217,29 @@ def train_univariate_hydra(cfg):
                 drop_last=True, effective_batch_size=cfg.data.batch_size,
                 shuffle_each_epoch=getattr(cfg.data, 'shuffle_bucket', False), seed=cfg.seed,
             )
-            log.info(f"动态 Batch Size: {train_sampler.get_batch_info()}")
-
-            accumulation_steps = train_sampler.get_accumulation_steps()
-            accelerator.gradient_accumulation_steps = accumulation_steps
 
             from src.utils.seed import seed_worker
             train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
-                                      collate_fn=collatefn, num_workers=cfg.data.num_workers,
+                                      collate_fn=collatefn,
+                                      num_workers=cfg.data.num_workers,
                                       pin_memory=True, persistent_workers=True,
                                       worker_init_fn=seed_worker)
         else:
             from src.utils.seed import seed_worker
             train_loader = DataLoader(train_dataset, batch_size=cfg.data.batch_size,
-                                      collate_fn=collatefn, shuffle=False, num_workers=cfg.data.num_workers,
+                                      collate_fn=collatefn,
+                                      shuffle=True,
+                                      num_workers=cfg.data.num_workers,
                                       pin_memory=True, drop_last=True, persistent_workers=True,
                                       worker_init_fn=seed_worker, generator=g)
+
+        log.info(f"DataLoader 创建完成: batch_size={cfg.data.batch_size}, "
+                 f"dynamic_batch={dynamic_batch}")
 
     # ---- Trainer ----
     trainer = Trainer(cfg, model, train_loader, val_loader, accelerator,
                       data_setting, patch_size)
     return trainer.run()
-
 
 
 if __name__ == "__main__":
