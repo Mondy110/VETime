@@ -703,8 +703,10 @@ def train_univariate(args):
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
-                    "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
-                    "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+                    "Gate/alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+                    "Gate/alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+                    "Gate/alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
+                    "Gate/alpha_std": unwrapped.visual_cross_attn.alpha.std().item(),
                 }, step=global_step)
 
 
@@ -774,7 +776,9 @@ def train_univariate(args):
             "epoch_loss_mse": avg_loss_mse,
             "epoch_loss_cl": avg_loss_cl,
             "epoch_loss_e": avg_loss_e,
-            "epoch_alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+            "epoch_alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+            "epoch_alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+            "epoch_alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
         }, step=epoch)
 
         print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
@@ -1775,8 +1779,10 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Loss/CL_Contrastive": batch_loss_cl,
                         "Loss/Balance": batch_loss_e,
                         "Train/LR": optimizer.param_groups[0]['lr'],
-                        "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
-                        "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+                        "Gate/alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+                        "Gate/alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+                        "Gate/alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
+                        "Gate/alpha_std": unwrapped.visual_cross_attn.alpha.std().item(),
                     }, step=global_step)
 
 
@@ -1834,7 +1840,9 @@ def train_multivariate(args, config: Dict[str, Any]):
                 "epoch_loss_mse": avg_loss_mse,
                 "epoch_loss_cl": avg_loss_cl,
                 "epoch_loss_e": avg_loss_e,
-                "epoch_alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+                "epoch_alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+                "epoch_alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+                "epoch_alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
             }, step=epoch)
 
             print(f"\n[Epoch {epoch + 1}/{epochs}] Training Summary:")
@@ -2004,16 +2012,13 @@ def train_univariate_hydra(cfg):
     # ---- VETIME Model ----
     # 解码器模式：use_query_decoder=True 时使用 Query-based 解码器替代 MoE
     use_query_decoder = getattr(cfg.model, 'use_query_decoder', False)
-    num_query_decoder_layers = getattr(cfg.model, 'num_query_decoder_layers', 1)
     model = VETIME(
         config_v, vision_model, config_t, ts_model, cfg.model.model_name,
         use_query_decoder=use_query_decoder,
-        num_query_decoder_layers=num_query_decoder_layers,
         use_gradient_checkpointing=cfg.model.use_gradient_checkpointing
     )
     if use_query_decoder:
-        layer_info = f"{num_query_decoder_layers}层" if num_query_decoder_layers > 1 else "单层"
-        log.info(f"使用 Query-based 解码器模式（{layer_info}，单阶段训练，无需课程学习）")
+        log.info("使用 Query-based 解码器模式（单阶段训练，无需课程学习）")
     else:
         log.info("使用 MoE 解码器模式（二阶段课程训练）")
     if hasattr(cfg.paths, 'vetime_path') and cfg.paths.vetime_path:

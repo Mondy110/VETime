@@ -33,3 +33,5 @@ export CUBLAS_WORKSPACE_CONFIG=':4096:8'
     --val_ratio 0.1 \
     --val_mode split \
     --seed 64
+
+/home/cjm/.conda/envs/tslib2/bin/accelerate launch train.py --use_hydra 2>&1 | tee train_VETime.log

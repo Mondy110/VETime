@@ -258,21 +258,26 @@ class QueryDecoder(nn.Module):
     实现双任务在隐空间的自发分化与解耦，并原生支持块对齐 RoPE 与 Flash Attention 加速。
     """
 
-    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, max_seq_len: int = 512):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.max_seq_len = max_seq_len
         assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
 
-        # 1. 任务原型 Token（可学习参数，保持 1x1 极其轻量）
+        # 1. 任务原型 Token（共享语义，形状 1x1xD）
         self.task_token_rec = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.task_token_cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        # 2. 时间位置 Embedding（区分不同时间步，形状 1xmax_seq_lenxD）
+        # 类似 ViT 的 position embedding，为每个时间位置提供独立语义
+        self.temporal_query_embedding = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.02)
 
         # RoPE 位置编码（复用现有）
         self.rope = RotaryEmbedding(d_model)
 
-        # 2. 显式定义交叉注意力的四路投影层，以便在正确的位置插入 RoPE 算子
+        # 3. 显式定义交叉注意力的四路投影层，以便在正确的位置插入 RoPE 算子
         self.q_proj = nn.Linear(d_model, d_model, bias=False)
         self.k_proj = nn.Linear(d_model, d_model, bias=False)
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
@@ -318,9 +323,18 @@ class QueryDecoder(nn.Module):
         K_expert = torch.cat([F_TS, F_V, F_A], dim=1)  # (B, 3N, D)
         V_expert = K_expert
 
-        # 2. 动态构建基础任务矩阵
-        Q_rec_base = self.task_token_rec.expand(B, N, -1)
-        Q_cls_base = self.task_token_cls.expand(B, N, -1)
+        # 2. 动态构建 Query（任务原型 + 时间位置）
+        assert N <= self.max_seq_len, f"序列长度 N={N} 超过 max_seq_len={self.max_seq_len}"
+
+        # 时间位置 embedding 切片：(1, N, D)
+        time_emb = self.temporal_query_embedding[:, :N, :]
+
+        # 重建 Query = 任务原型 + 时间位置
+        Q_rec_base = self.task_token_rec.expand(B, N, -1) + time_emb  # (B, N, D)
+
+        # 分类 Query = 任务原型 + 时间位置（共享同一个 time_emb）
+        Q_cls_base = self.task_token_cls.expand(B, N, -1) + time_emb  # (B, N, D)
+
         Q_combined = torch.cat([Q_rec_base, Q_cls_base], dim=1)  # (B, 2N, D)
 
         # ==========================================
@@ -390,236 +404,62 @@ class QueryDecoder(nn.Module):
         return F_rec_out, F_cls_out
 
 
-class QueryDecoderLayer(nn.Module):
-    """单层 Query Decoder（修正版）。
+class FrequencyGuidedVisualAdapter(nn.Module):
+    '''
+    频域引导视觉适配器 (Frequency-Guided Visual Adapter, FGVA)
 
-    修正内容：
-    1. RoPE 先拆多头再旋转（head_dim 维度），确保每个头位置感知对称
-    2. 使用 reshape 处理非连续张量
-    3. 显式处理设备与精度对齐
-    """
+    设计哲学:
+    Frequency-Conditioned Residual Adaptation (频域条件化残差适配)
+    - Q (时域特征) 作为 Identity Pathway 主干表示；
+    - K/V (频域视觉特征) 作为 Conditional Context 提供修正信息；
+    - FFN 在 (Q + Attn) 的隐式融合空间下生成 state-dependent 的残差 correction；
+    - 外部通过矢量 LayerScale alpha 达成全局可控的知识注入。
 
-    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-
-        # RoPE 使用 head_dim，确保每个头位置感知对称
-        self.rope = RotaryEmbedding(self.head_dim)
-
-        # Q/K/V 投影（每层独立）
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_model, bias=False)
-
-        # Pre-LN
-        self.norm_q = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
-        self.norm_ffn = nn.LayerNorm(d_model)
-
-        # FFN
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model)
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
+    核心参数说明:
+    - d_model: 特征维度
+    - num_heads: 注意力头数
+    - dropout: 适配器残差 Dropout 比例
+    - ffn_ratio: 适配器 FFN 隐藏层膨胀倍数 (推荐 2.0，兼顾表达力与防过拟合)
+    - init_scale: LayerScale 初始缩放系数 (推荐 1e-3，提供近乎恒等映射与温和梯度)
+    '''
+    def __init__(
         self,
-        Q: torch.Tensor,           # (B, 2N, D)
-        K_expert: torch.Tensor,    # (B, 3N, D)
-        N: int,
-        patch_mask: torch.Tensor = None
-    ) -> torch.Tensor:
-        B, _, D = Q.shape
-
-        # 1. Pre-LN + 投影
-        Q_normed = self.norm_q(Q)
-        K_normed = self.norm_kv(K_expert)
-        q = self.q_proj(Q_normed)    # (B, 2N, D)
-        k = self.k_proj(K_normed)    # (B, 3N, D)
-        v = self.v_proj(K_normed)    # (B, 3N, D)
-
-        # 2. 先拆多头（transpose 后张量变为非连续）
-        q = q.view(B, 2 * N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 2N, hd) 非连续
-        k = k.view(B, 3 * N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 3N, hd) 非连续
-        v = v.view(B, 3 * N, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, 3N, hd) 非连续
-
-        # 3. 生成 RoPE 频率
-        freqs_N = self.rope(N)      # (N, head_dim // 2)
-        freqs_2N = torch.cat([freqs_N, freqs_N], dim=0)  # (2N, head_dim // 2)
-        freqs_3N = torch.cat([freqs_N, freqs_N, freqs_N], dim=0)  # (3N, head_dim // 2)
-
-        # 4. 应用 RoPE（内部处理设备/精度/非连续张量）
-        q_rot = self.apply_rope_per_head(q, freqs_2N)
-        k_rot = self.apply_rope_per_head(k, freqs_3N)
-
-        # 5. Attention mask（处理形状兼容性）
-        attn_mask = None
-        if patch_mask is not None:
-            # 确保 patch_mask 是 2D (B, N)
-            if patch_mask.dim() == 3:
-                patch_mask = patch_mask.squeeze(1)  # (B, 1, N) -> (B, N)
-            kv_mask = patch_mask.repeat(1, 3)  # (B, 3N)
-            attn_mask = kv_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, 3N)，True=保留
-
-        # 6. Flash Attention
-        y = F.scaled_dot_product_attention(
-            query=q_rot,
-            key=k_rot,
-            value=v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False
-        )
-
-        # 7. 输出投影 + 残差
-        y = y.transpose(1, 2).contiguous().view(B, 2 * N, D)
-        F_attn = self.out_proj(y)
-        F_mid = Q + self.dropout(F_attn)
-
-        # 8. FFN + 残差
-        F_out = F_mid + self.ffn(self.norm_ffn(F_mid))
-
-        return F_out  # (B, 2N, D)
-
-    def apply_rope_per_head(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-        """在 head_dim 维度上应用 RoPE。
-
-        Args:
-            x: (B, H, seq_len, head_dim)，可能非连续
-            freqs: (seq_len, head_dim // 2)
-
-        Returns:
-            x_rot: (B, H, seq_len, head_dim)
-        """
-        B, H, seq_len, hd = x.shape
-
-        # 设备与精度对齐
-        cos = freqs.cos().to(device=x.device, dtype=x.dtype)  # (seq_len, hd//2)
-        sin = freqs.sin().to(device=x.device, dtype=x.dtype)  # (seq_len, hd//2)
-
-        # 扩展维度用于广播
-        cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, hd//2)
-        sin = sin.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, hd//2)
-
-        # 使用 reshape 处理非连续张量
-        x_ = x.reshape(B, H, seq_len, hd // 2, 2)
-
-        # 旋转
-        x_rot = torch.stack([
-            x_[..., 0] * cos - x_[..., 1] * sin,
-            x_[..., 0] * sin + x_[..., 1] * cos,
-        ], dim=-1)
-
-        return x_rot.reshape(B, H, seq_len, hd)
-
-
-class MultiLayerQueryDecoder(nn.Module):
-    """多层 Query Decoder（共享参数版）。
-
-    架构：
-    - 共享参数：所有层共享同一组 Q/K/V/FFN（类似 RNN 权重共享）
-    - 统一多层：rec/cls 共享层参数，通过 token 分离
-    - 迭代 Query：Q_{l+1} = F_l（上一层输出 → 下一层 Query）
-    - 静态专家：K/V = [F_TS, F_V, F_A] 固定不变
-
-    优势：
-    - 参数量与单层相同，不随层数增长
-    - 类似 RNN 的迭代精炼机制
-    """
-
-    def __init__(self, d_model: int, num_layers: int = 2, num_heads: int = 8, dropout: float = 0.1):
+        d_model: int,
+        num_heads: int = 8,
+        dropout: float = 0.1,
+        ffn_ratio: float = 2.0,
+        init_scale: float = 1e-3
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.num_layers = num_layers
 
-        # 任务原型 Token（仅在 Layer 1 使用）
-        self.task_token_rec = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        self.task_token_cls = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-
-        # 共享参数：所有层共用同一个 QueryDecoderLayer
-        self.layer = QueryDecoderLayer(d_model, num_heads, dropout)
-
-    def forward(
-        self,
-        F_TS: torch.Tensor,           # (B, N, D) 时序专家
-        F_V: torch.Tensor,            # (B, N, D) 视觉专家
-        F_A: torch.Tensor,            # (B, N, D) 融合专家
-        patch_mask: torch.Tensor = None  # (B, N) 或 (B, 1, N)，True=有效
-    ) -> tuple:
-        B, N, D = F_TS.shape
-
-        # 1. 专家库（静态，所有层共享）
-        K_expert = torch.cat([F_TS, F_V, F_A], dim=1)  # (B, 3N, D)
-
-        # 2. 初始 Query（来自 task_token）
-        Q_rec = self.task_token_rec.expand(B, N, -1)
-        Q_cls = self.task_token_cls.expand(B, N, -1)
-        Q = torch.cat([Q_rec, Q_cls], dim=1)  # (B, 2N, D)
-
-        # 3. 逐层迭代（共享参数）
-        for _ in range(self.num_layers):
-            Q = self.layer(Q, K_expert, N, patch_mask)
-
-        # 4. 任务分离
-        F_rec_out = Q[:, :N, :]
-        F_cls_out = Q[:, N:, :]
-
-        return F_rec_out, F_cls_out
-
-
-class GatedTimeFrequencyFusion(nn.Module):
-    """
-    External-Gate 架构：门控参数 alpha 位于模块绝对外层边界。
-
-    内部子块 (cross-attn + FFN + norms) 完整处理频域语义，
-    alpha 从外部对整个子块输出做残差缩放：
-        F_out = Q_VETime + alpha * dropout(F_refined)
-
-    当 alpha=0.0 时，F_out 严格等于 Q_VETime（数学恒等映射），
-    保护重构头免受任何 LayerNorm / FFN 非线性激活污染。
-    """
-
-    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
-        super().__init__()
-        
-        # 保存注意力机制相关的超参数
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.dropout_p = dropout
         assert d_model % num_heads == 0, "d_model 必须能被 num_heads 严格整除"
 
-        # 1. 内部交叉注意力：频域扫描 (替换为 Flash Attention 兼容的底层写法)
-        # 我们手动定义 Q, K, V 的线性映射层，取代 nn.MultiheadAttention
+        # 1. 内部 Cross-Attention Projection
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        
-        self.attn_dropout = nn.Dropout(dropout)
-        self.ffn_dropout = nn.Dropout(dropout)
-        self.layer_norm1 = nn.LayerNorm(d_model)
-        self.layer_norm2 = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
 
-        # 2. 内部 FFN：精炼跨模态语义
+        # 2. 归一化层 (Pre-LN 架构)
+        self.norm_q = nn.LayerNorm(d_model)
+        self.norm_kv = nn.LayerNorm(d_model)  # K/V 共享 Memory 归一化
+        self.norm_ffn = nn.LayerNorm(d_model)
+
+        # 3. 内部条件精炼 FFN (单 Dropout 正则化)
         ffn_hidden = int(d_model * ffn_ratio)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_hidden),
             nn.GELU(),
-            nn.Dropout(dropout),
             nn.Linear(ffn_hidden, d_model)
         )
+        self.ffn_dropout = nn.Dropout(dropout)
 
-        # CRITICAL: alpha 作为外部门控，初始化 0.0
-        self.alpha = nn.Parameter(torch.tensor([0.0]))
+        # 4. Channel-wise LayerScale 向量门控 (1e-3 初始化)
+        self.alpha = nn.Parameter(torch.ones(d_model) * init_scale)
 
     def forward(
         self,
@@ -633,61 +473,50 @@ class GatedTimeFrequencyFusion(nn.Module):
         k_len = K_ViCO.size(1)
 
         # ---------------------------------------------------------
-        # Step A: 内部交叉注意力 (Pre-Norm + Flash Attention)
+        # Step A: 交叉注意力提取频域条件特征 (Pre-LN)
         # ---------------------------------------------------------
-        # 1. 先归一化 Q, K, V
-        normed_Q = self.layer_norm1(Q_VETime)
+        normed_Q = self.norm_q(Q_VETime)
         normed_K = self.norm_kv(K_ViCO)
         normed_V = self.norm_kv(V_ViCO)
 
-        # 2. 线性映射并拆分多头
-        # 形状变化: [batch_size, seq_len, d_model] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
         q = self.q_proj(normed_Q).view(batch_size, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(normed_K).view(batch_size, k_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(normed_V).view(batch_size, k_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 3. 处理 padding mask (这是 Flash Attention 非常关键的一步)
         attn_mask = None
         if key_padding_mask is not None:
-            # 原始 mask 中 True 代表“填充，不要看”。
-            # SDPA 的 mask 中 True 代表“有效数据，可以看”。所以需要取反 (~)。
-            # 同时需要扩展维度以支持广播，形状变为 [batch_size, 1, 1, k_len]
-            attn_mask = ~(key_padding_mask.bool())
-            attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = ~(key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
 
-        # 4. 核心加速区：调用自带的 Scaled Dot-Product Attention (自动启用 Flash Attention)
+        # 调用 Flash Attention 兼容的高性能注意力函数 (禁用内部 Dropout 保持条件确定性)
         attn_out = F.scaled_dot_product_attention(
             query=q,
             key=k,
             value=v,
             attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
+            dropout_p=0.0,
             is_causal=False
         )
 
-        # 5. 将多头结果合并拼接回 d_model 维度
-        # 形状变化: [batch_size, num_heads, seq_len, head_dim] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, seq_len, d_model]
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, q_len, self.d_model)
-        
-        # 6. 注意力输出投影 (与原版逻辑保持一致)
         attn_out = self.out_proj(attn_out)
-        attn_delta = self.attn_dropout(attn_out)
-
-        # 7. 计算中间融合状态
-        F_mid = Q_VETime + attn_delta
 
         # ---------------------------------------------------------
-        # Step B: 内部 FFN 精炼 (Pre-Norm)
+        # Step B: 隐式融合空间 + 条件残差提炼
         # ---------------------------------------------------------
-        normed_F_mid = self.layer_norm2(F_mid)
-        ffn_out = self.ffn(normed_F_mid)
-        ffn_delta = self.ffn_dropout(ffn_out)
+        # 隐式融合：将频域条件特征叠加至时域基线上
+        implicit_fusion = Q_VETime + attn_out
+
+        # FFN 结合时域基线与频域条件生成最终修正量
+        normed_fusion = self.norm_ffn(implicit_fusion)
+        delta = self.ffn(normed_fusion)
+        delta = self.ffn_dropout(delta)
 
         # ---------------------------------------------------------
-        # Step C: 外部门控残差
+        # Step C: External LayerScale 显式广播门控注入
         # ---------------------------------------------------------
-        # 保持了你原代码中的物理逻辑 (未乘 alpha)
-        total_delta = attn_delta + ffn_delta
-        F_out = Q_VETime + total_delta
+        # 将 alpha (d_model,) 显式扩展为 (1, 1, d_model) 以匹配 (B, L, D) 维度
+        alpha_reshaped = self.alpha.view(1, 1, -1)
+        F_out = Q_VETime + alpha_reshaped * delta
 
         return F_out
+

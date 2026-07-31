@@ -467,8 +467,10 @@ class Trainer:
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
-                    "Gate/alpha_raw": unwrapped.visual_cross_attn.alpha.item(),
-                    "Gate/alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+                    "Gate/alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+                    "Gate/alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+                    "Gate/alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
+                    "Gate/alpha_std": unwrapped.visual_cross_attn.alpha.std().item(),
                 }, step=self.global_step)
 
             # ---- 采样预测指标 ----
@@ -517,7 +519,9 @@ class Trainer:
             "epoch_loss_mse": avg_loss_mse,
             "epoch_loss_cl": avg_loss_cl,
             "epoch_loss_e": avg_loss_e,
-            "epoch_alpha": torch.sigmoid(unwrapped.visual_cross_attn.alpha).item(),
+            "epoch_alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
+            "epoch_alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
+            "epoch_alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
         }, step=epoch)
 
         logger.info(
