@@ -705,7 +705,7 @@ class Trainer:
 
         val_mode = getattr(cfg.data, 'val_mode', 'tsb')
         from Test_TSB import PASS_LIST, TSB_test
-        from train import save_full_checkpoint
+        from src.utils.checkpoint import save_full_checkpoint
 
         for epoch in range(self.start_epoch, self.epochs):
             # ---- 训练 ----
