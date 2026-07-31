@@ -5,6 +5,7 @@ import torch
 from typing import Optional
 from .base import BaseRenderer
 from . import RendererRegistry
+from src.datasets.pre_image import render_vico_batch
 
 
 @RendererRegistry.register('vico')
@@ -33,5 +34,4 @@ class ViCORenderer(BaseRenderer):
         Returns:
             [B, 3, img_size, img_size] float32 tensor,值在 [0, 255] 范围
         """
-        from src.datasets.pre_image import render_vico_batch
         return render_vico_batch(time_series, att_mask, img_size)
