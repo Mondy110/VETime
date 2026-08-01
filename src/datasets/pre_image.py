@@ -1021,7 +1021,12 @@ def render_vico_batch(
         else:
             ts_np = time_series[i].detach().cpu().numpy()
 
-        # Period is auto-detected via FFT inside vico_render_timeseries
+        # Guard against empty sequences (all padding)
+        # if ts_np.shape[0] == 0:
+        #     # Return zeros for empty sequences
+        #     img = np.zeros((3, img_size, img_size), dtype=np.uint8)
+        # else:
+            # Period is auto-detected via FFT inside vico_render_timeseries
         img = vico_render_timeseries(ts_np, periodicity=None, img_size=img_size)
         vico_imgs.append(torch.from_numpy(img).float())
 

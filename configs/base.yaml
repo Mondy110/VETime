@@ -39,7 +39,7 @@ data:
   min_seq_length: 100               # 最短序列长度过滤阈值
   dynamic_batch: false              # 动态批大小（短样本自动增大 batch）
   max_batch_size: 64                # 动态批最大值（dynamic_batch=true 时生效）
-  padding_ratio: 1.5                # 动态批 padding 比例（用于 ViCO 图像渲染）
+  padding_ratio: 1.1                # 动态批 padding 比例（用于 ViCO 图像渲染）
   shuffle_bucket: false             # 是否按长度分桶后 shuffle
 
   # ==================== 数据预处理配置 ====================

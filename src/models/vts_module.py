@@ -414,18 +414,23 @@ class FrequencyGuidedVisualAdapter(nn.Module):
     - K/V (频域视觉特征) 作为 Conditional Context 提供修正信息；
     - FFN 在 (Q + Attn) 的隐式融合空间下生成 state-dependent 的残差 correction；
     - 外部通过矢量 LayerScale alpha 达成全局可控的知识注入。
-    
+
     内部子块 (cross-attn + FFN + norms) 完整处理频域语义，
     alpha 从外部对整个子块输出做残差缩放：
         F_out = Q_VETime + alpha * dropout(F_refined)
 
     当 alpha=0.0 时，F_out 严格等于 Q_VETime（数学恒等映射），
     保护重构头免受任何 LayerNorm / FFN 非线性激活污染。
+
+    位置编码集成 (2026-08-01):
+    - 使用连续归一化位置编码解决变长时序 N 与定长视觉 196 的对齐问题
+    - Q 添加 1D PE（动态长度适配）
+    - K/V 添加 2D PE（固定 14x14 网格，X轴时间/Y轴频率）
     """
 
-    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0):
+    def __init__(self, d_model: int, num_heads: int = 8, dropout: float = 0.1, ffn_ratio: float = 4.0, scale_factor: float = 1000.0):
         super().__init__()
-        
+
         # 保存注意力机制相关的超参数
         self.d_model = d_model
         self.num_heads = num_heads
@@ -433,13 +438,28 @@ class FrequencyGuidedVisualAdapter(nn.Module):
         self.dropout_p = dropout
         assert d_model % num_heads == 0, "d_model 必须能被 num_heads 严格整除"
 
+        # 0. 连续归一化位置编码模块
+        #    解决变长时序与定长视觉特征的时间对齐问题
+        from .fractional_pe import FractionalPositionalEncoding1D, FractionalPositionalEncoding2D
+
+        self.pe_1d = FractionalPositionalEncoding1D(
+            d_model=d_model,
+            scale_factor=scale_factor
+        )
+
+        self.pe_2d = FractionalPositionalEncoding2D(
+            d_model=d_model,
+            grid_size=14,  # 对应 ViCO 图像的 14x14 patches
+            scale_factor=scale_factor
+        )
+
         # 1. 内部交叉注意力：频域扫描 (替换为 Flash Attention 兼容的底层写法)
         # 我们手动定义 Q, K, V 的线性映射层，取代 nn.MultiheadAttention
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
-        
+
         self.attn_dropout = nn.Dropout(dropout)
         self.ffn_dropout = nn.Dropout(dropout)
         self.layer_norm1 = nn.LayerNorm(d_model)
@@ -470,12 +490,21 @@ class FrequencyGuidedVisualAdapter(nn.Module):
         k_len = K_ViCO.size(1)
 
         # ---------------------------------------------------------
+        # Step 0: 添加连续归一化位置编码
+        # ---------------------------------------------------------
+        # 为 Q (时域特征) 添加 1D PE，解决动态长度 N 的位置编码问题
+        # 为 K/V (频域视觉特征) 添加 2D PE，编码 14x14 网格的时间和频率信息
+        Q_VETime_pe = self.pe_1d(Q_VETime)  # [B, N, D]
+        K_ViCO_pe = self.pe_2d(K_ViCO)      # [B, 196, D]
+        V_ViCO_pe = self.pe_2d(V_ViCO)      # [B, 196, D]
+
+        # ---------------------------------------------------------
         # Step A: 内部交叉注意力 (Pre-Norm + Flash Attention)
         # ---------------------------------------------------------
-        # 1. 先归一化 Q, K, V
-        normed_Q = self.layer_norm1(Q_VETime)
-        normed_K = self.norm_kv(K_ViCO)
-        normed_V = self.norm_kv(V_ViCO)
+        # 1. 先归一化 Q, K, V（使用添加了位置编码的特征）
+        normed_Q = self.layer_norm1(Q_VETime_pe)
+        normed_K = self.norm_kv(K_ViCO_pe)
+        normed_V = self.norm_kv(V_ViCO_pe)
 
         # 2. 线性映射并拆分多头
         # 形状变化: [batch_size, seq_len, d_model] -> [batch_size, seq_len, num_heads, head_dim] -> [batch_size, num_heads, seq_len, head_dim]
@@ -523,9 +552,10 @@ class FrequencyGuidedVisualAdapter(nn.Module):
         # ---------------------------------------------------------
         # Step C: 外部门控残差
         # ---------------------------------------------------------
-        # 保持了你原代码中的物理逻辑 (未乘 alpha)
+        # alpha 作为门控参数，控制频域特征的注入程度
+        # 初始化为 0.0，训练过程中逐渐学习合适的值
         total_delta = attn_delta + ffn_delta
-        F_out = Q_VETime + total_delta
+        F_out = Q_VETime + self.alpha * total_delta
 
         return F_out
 

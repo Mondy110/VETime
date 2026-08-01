@@ -482,10 +482,7 @@ class Trainer:
                     "Loss/CL_Contrastive": batch_loss_cl,
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
-                    "Gate/alpha_mean": unwrapped.visual_cross_attn.alpha.mean().item(),
-                    "Gate/alpha_max": unwrapped.visual_cross_attn.alpha.max().item(),
-                    "Gate/alpha_min": unwrapped.visual_cross_attn.alpha.min().item(),
-                    "Gate/alpha_std": unwrapped.visual_cross_attn.alpha.std().item(),
+                    "Gate/alpha": unwrapped.visual_cross_attn.alpha.item(),
                 }, step=self.global_step)
 
             # ---- 采样预测指标 ----
