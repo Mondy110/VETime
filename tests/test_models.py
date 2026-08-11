@@ -107,4 +107,4 @@ def test_src_models_ts_encoder_import():
 
 def test_src_models_vts_module_import():
     """验证 VTS 模块可从 src.models 导入。"""
-    from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, FrequencyGuidedVisualAdapter
+    from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, GatedTimeFrequencyFusion

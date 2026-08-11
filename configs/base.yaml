@@ -49,7 +49,7 @@ data:
 
 # ==================== 模型配置 ====================
 model:
-  model_name: VETime-query-FGVA                # 模型名称
+  model_name: VETime-query-08-10                # 模型名称
   vision_name: mae_visualize_base.pth  # 视觉编码器权重文件名
   ts_finetune_type: lora            # 时序编码器微调类型（lora/freeze）
   use_vectorized_fold: true         # 是否使用向量化 fold_image（约150倍加速）

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from src.losses.contrastive import win_Contrastive_Loss
 from src.models.ts_encoder.ts_encoder import TimeSeriesEncoder
 from src.models.ts_encoder.ts_model import TS_Model
-from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, FrequencyGuidedVisualAdapter
+from src.models.vts_module import V_Attention, VTS_Alignment, M_moe, GatedTimeFrequencyFusion
 
 
 class VETIME(TS_Model):
@@ -39,7 +39,7 @@ class VETIME(TS_Model):
         # === 视觉时频双分支 ===
         # 频域引导视觉适配器：用 VETime 时域特征查询 ViCO 频域特征
         # Channel-wise LayerScale (init_scale=1e-3) 实现近乎恒等映射，训练初期自动回退到纯 VETime
-        self.visual_cross_attn = FrequencyGuidedVisualAdapter(t_dim, num_heads=8, dropout=0.1)
+        self.visual_cross_attn = GatedTimeFrequencyFusion(t_dim, num_heads=8, dropout=0.1)
 
         # ViCO 分支的 MLP（与 VETime 分支结构一致）
         self.mlp_vico = nn.Sequential(
@@ -137,7 +137,7 @@ class VETIME(TS_Model):
         K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
 
         # === 交叉注意力融合 ===
-        # FrequencyGuidedVisualAdapter: Q_VETime 查询 K_V_ViCO
+        # GatedTimeFrequencyFusion: Q_VETime 查询 K_V_ViCO
         I_embeddings0 = self.visual_cross_attn(
             Q_VETime=Q_visual,
             K_ViCO=K_V_tokens_proj,

@@ -176,12 +176,12 @@ def train_univariate_hydra(cfg):
             train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
                                       collate_fn=collatefn,
                                       num_workers=cfg.data.num_workers,
-                                      pin_memory=True, persistent_workers=True,
+                                      pin_memory=True, persistent_workers=False,
                                       worker_init_fn=seed_worker)
             val_loader = DataLoader(val_dataset, batch_sampler=val_sampler,
                                     collate_fn=collatefn,
                                     num_workers=cfg.data.num_workers,
-                                    pin_memory=True, persistent_workers=True,
+                                    pin_memory=True, persistent_workers=False,
                                     worker_init_fn=seed_worker)
         else:
             from src.utils.seed import seed_worker
@@ -189,13 +189,13 @@ def train_univariate_hydra(cfg):
                                       collate_fn=collatefn,
                                       shuffle=False,
                                       num_workers=cfg.data.num_workers,
-                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      pin_memory=True, drop_last=True, persistent_workers=False,
                                       worker_init_fn=seed_worker, generator=g)
             val_loader = DataLoader(val_dataset, batch_size=cfg.data.batch_size,
                                     collate_fn=collatefn,
                                     shuffle=False,
                                     num_workers=cfg.data.num_workers,
-                                    pin_memory=True, drop_last=False, persistent_workers=True,
+                                    pin_memory=True, drop_last=False, persistent_workers=False,
                                     worker_init_fn=seed_worker, generator=g)
 
         log.info(f"DataLoader 创建完成: batch_size={cfg.data.batch_size}, "
@@ -222,7 +222,7 @@ def train_univariate_hydra(cfg):
             train_loader = DataLoader(train_dataset, batch_sampler=train_sampler,
                                       collate_fn=collatefn,
                                       num_workers=cfg.data.num_workers,
-                                      pin_memory=True, persistent_workers=True,
+                                      pin_memory=True, persistent_workers=False,
                                       worker_init_fn=seed_worker)
         else:
             from src.utils.seed import seed_worker
@@ -230,7 +230,7 @@ def train_univariate_hydra(cfg):
                                       collate_fn=collatefn,
                                       shuffle=False,
                                       num_workers=cfg.data.num_workers,
-                                      pin_memory=True, drop_last=True, persistent_workers=True,
+                                      pin_memory=True, drop_last=True, persistent_workers=False,
                                       worker_init_fn=seed_worker, generator=g)
 
         log.info(f"DataLoader 创建完成: batch_size={cfg.data.batch_size}, "

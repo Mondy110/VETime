@@ -205,7 +205,7 @@ dataloader = DataLoader(
     num_workers=4,            # 多线程预取
     pin_memory=True,          # GPU 直传
     prefetch_factor=2,        # 预取 batch 数
-    persistent_workers=True,  # 常驻 worker 避免重启开销
+    persistent_workers=False,  # 常驻 worker 避免重启开销
 )
 ```
 
