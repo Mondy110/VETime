@@ -703,6 +703,7 @@ class Trainer:
         val_mode = getattr(cfg.data, 'val_mode', 'tsb')
         from Test_TSB import PASS_LIST, TSB_test
         from src.utils.checkpoint import save_full_checkpoint
+        from src.utils.checkpoint_architecture import checkpoint_state_dict, make_model_checkpoint
 
         for epoch in range(self.start_epoch, self.epochs):
             # ---- 训练 ----
@@ -722,7 +723,13 @@ class Trainer:
                     unwrapped_model = accelerator.unwrap_model(model)
                     best_model_path = f'./output/{self.model_name}__{self.img_size}_best.pth'
                     if accelerator.is_main_process:
-                        torch.save(unwrapped_model.state_dict(), best_model_path)
+                        torch.save(
+                            make_model_checkpoint(
+                                unwrapped_model.state_dict(),
+                                use_query_decoder=self.use_query_decoder,
+                            ),
+                            best_model_path,
+                        )
                         logger.info(f"  Best model saved: {best_model_path} (val_loss={avg_val_loss:.4f})")
 
                 if self.early_stopping.early_stop:
@@ -747,7 +754,13 @@ class Trainer:
                         f'./output/{self.model_name}__{self.img_size}'
                         f'_{avg_tsb_val_loss:.4f}_{timestamp}.pth'
                     )
-                    torch.save(unwrapped_model.state_dict(), name_save)
+                    torch.save(
+                        make_model_checkpoint(
+                            unwrapped_model.state_dict(),
+                            use_query_decoder=self.use_query_decoder,
+                        ),
+                        name_save,
+                    )
                     logger.info(
                         f"Model saved at epoch {epoch+1} with TSB_val_loss={avg_tsb_val_loss:.4f}"
                     )
@@ -790,7 +803,13 @@ class Trainer:
                         f'./output/{self.model_name}__{self.img_size}'
                         f'_{avg_val_loss:.4f}_{timestamp}.pth'
                     )
-                    torch.save(unwrapped_model.state_dict(), name_save)
+                    torch.save(
+                        make_model_checkpoint(
+                            unwrapped_model.state_dict(),
+                            use_query_decoder=self.use_query_decoder,
+                        ),
+                        name_save,
+                    )
                     logger.info(f"Model saved at epoch {epoch+1} with val_loss={avg_val_loss:.4f}")
 
                     epoch_log = {
@@ -842,7 +861,7 @@ class Trainer:
                 logger.info(f"加载早停保存的最佳模型: {best_model_path}")
                 unwrapped_model = accelerator.unwrap_model(model)
                 unwrapped_model.load_state_dict(
-                    torch.load(best_model_path, map_location='cpu')
+                    checkpoint_state_dict(torch.load(best_model_path, map_location='cpu'))
                 )
 
         args_for_tsb = _cfg_to_args(cfg)

@@ -59,6 +59,9 @@ def save_full_checkpoint(
 
     checkpoint = {
         'model_state_dict': unwrapped_model.state_dict(),
+        'model_config': {
+            'use_query_decoder': bool(getattr(unwrapped_model, 'use_query_decoder', False)),
+        },
         'optimizer_state_dict': optimizer.state_dict(),
         'epoch': epoch,
         'global_step': global_step,

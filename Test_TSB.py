@@ -28,6 +28,7 @@ from model.TS_encoder.config import default_config_t
 from model.TS_encoder.ts_model import TS_Model
 from model.VETime import VETIME
 from model.Vision_encoder.V_encoder import V_model
+from src.utils.checkpoint_architecture import checkpoint_model_config, checkpoint_state_dict
 
 SEED = 2024
 torch.manual_seed(SEED)
@@ -193,7 +194,10 @@ def create_dynamic_model(args_test, num_features, vision_model, config_v):
 
     default_config_t.num_features = num_features
     ts_model = TS_Model(default_config_t)
-    model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+    model = VETIME(
+        config_v, vision_model, default_config_t, ts_model, args_test.model_name,
+        use_query_decoder=args_test.use_query_decoder,
+    )
     return model
 
 def TSB_test(
@@ -369,8 +373,8 @@ def TSB_test_multivariate(
 
             # 加载用户指定的权重
             if args_test.vetime_path is not None:
-                state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-                active_model.load_state_dict(state_dict, strict=False)
+                checkpoint = torch.load(args_test.vetime_path, map_location='cpu')
+                active_model.load_state_dict(checkpoint_state_dict(checkpoint), strict=True)
                 if verbose:
                     print(f"[INFO] Loaded weights from {args_test.vetime_path}")
 
@@ -664,10 +668,19 @@ if __name__ == '__main__':
     # 从 checkpoint 推断 MAX_L（位置编码长度）
     max_l = 5000  # 默认值
     if args_test.vetime_path is not None and os.path.exists(args_test.vetime_path):
-        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
+        checkpoint = torch.load(args_test.vetime_path, map_location='cpu')
+        state_dict = checkpoint_state_dict(checkpoint)
+        checkpoint_config = checkpoint_model_config(checkpoint)
+        args_test.use_query_decoder = checkpoint_config['use_query_decoder']
         if 'pos_emb_v' in state_dict:
             max_l = state_dict['pos_emb_v'].shape[1]
             print(f"[INFO] Detected MAX_L={max_l} from checkpoint")
+        print(
+            "[INFO] Decoder selected from checkpoint: "
+            f"{'QueryDecoder' if args_test.use_query_decoder else 'MoE'}"
+        )
+    else:
+        args_test.use_query_decoder = False
 
     # 预先实例化共用的 vision_model（单变量和多变量共用）
     vision_model = V_model(args_test.vision_name, unpatch=True, MAX_L=max_l)
@@ -686,12 +699,15 @@ if __name__ == '__main__':
     else:
         # 单变量测试：原有逻辑
         ts_model = TS_Model(default_config_t)
-        model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+        model = VETIME(
+            config_v, vision_model, default_config_t, ts_model, args_test.model_name,
+            use_query_decoder=args_test.use_query_decoder,
+        )
         model.eval().to(device)
 
         if args_test.vetime_path is not None:
-            state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-            model.load_state_dict(state_dict, strict=False)
+            checkpoint = torch.load(args_test.vetime_path, map_location='cpu')
+            model.load_state_dict(checkpoint_state_dict(checkpoint), strict=True)
 
         TSB_test(model, args_test, args_test.data_setting, device,
                  dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False)

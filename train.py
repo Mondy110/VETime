@@ -36,6 +36,7 @@ def train_univariate_hydra(cfg):
     from src.models.vetime import VETIME
     from src.datasets.anomaly_dataset import AnomalyDataset
     from src.datasets.collate import collate_fn, DynamicLengthBatchSampler
+    from src.utils.checkpoint_architecture import checkpoint_state_dict
     from omegaconf import OmegaConf
 
     log = get_src_logger(__name__)
@@ -118,8 +119,8 @@ def train_univariate_hydra(cfg):
         log.info("使用 MoE 解码器模式（二阶段课程训练）")
     if hasattr(cfg.paths, 'vetime_path') and cfg.paths.vetime_path:
         log.info(f"加载 VETime 完整权重: {cfg.paths.vetime_path}")
-        state_dict = torch.load(cfg.paths.vetime_path, map_location='cpu')
-        model.load_state_dict(state_dict)
+        checkpoint = torch.load(cfg.paths.vetime_path, map_location='cpu')
+        model.load_state_dict(checkpoint_state_dict(checkpoint))
         log.info("VETime 权重加载完成")
 
     del vision_model, ts_model
