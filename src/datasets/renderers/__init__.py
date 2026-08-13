@@ -72,10 +72,12 @@ def create_renderer(name: str, **kwargs) -> BaseRenderer:
 
 # 导入已注册的渲染器（触发注册）
 from .vico import ViCORenderer
+from .multiscale_stft import MultiScaleSTFTRenderer
 
 __all__ = [
     'BaseRenderer',
     'RendererRegistry',
     'create_renderer',
     'ViCORenderer',
+    'MultiScaleSTFTRenderer',
 ]

@@ -57,7 +57,7 @@ model:
 
   # ==================== 视觉双分支配置 ====================
   vision_branch:
-    vico_renderer: vico              # 渲染器类型：vico / gaf / stft / ...
+    vico_renderer: stft_multiscale   # 严格时频支：32/64/128 多尺度 STFT 谱图
     renderer_params: {}              # 渲染器特定参数（预留扩展）
 
   # ==================== 解码器配置 ====================

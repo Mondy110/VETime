@@ -45,10 +45,10 @@ class Trainer:
         self.start_epoch = 0
         self.device = accelerator.device
 
-        # === 新增：初始化 ViCO 渲染器 ===
+        # 初始化辅助视觉渲染器（默认 ViCO；配置可选择严格时频 STFT）
         renderer_name = self._get_renderer_name(cfg)
         self.vico_renderer = create_renderer(renderer_name)
-        logger.info(f"ViCO 渲染器: {self.vico_renderer}")
+        logger.info(f"辅助视觉渲染器: {self.vico_renderer}")
 
         # 从 cfg 中提取常用字段
         self.epochs = cfg.training.total_epochs
@@ -335,7 +335,7 @@ class Trainer:
                         img_part, period, p_value, **data_setting
                     )
 
-                    # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像（内部自动 FFT 检测周期）
+                    # 每个 chunk 从原始时序渲染辅助视觉图像。
                     images_vico_chunk = self.vico_renderer.render_batch(
                         ts_raw_part, att_mask=att_mask_part, img_size=self.img_size
                     )
@@ -394,7 +394,7 @@ class Trainer:
                     images, period, p_value, **data_setting
                 )
 
-                # 渲染 ViCO 频域图像（原始值，att_mask 过滤 padding，内部自动 FFT 检测周期）
+                # 渲染辅助视觉图像，att_mask 会过滤 padding。
                 images_vico = self.vico_renderer.render_batch(
                     time_series_raw, att_mask=att_mask, img_size=self.img_size
                 )
@@ -618,7 +618,7 @@ class Trainer:
                             img_part, period, p_value, **data_setting
                         )
 
-                        # 每个 chunk 从 ts_raw_part 渲染 ViCO 图像（内部自动 FFT 检测周期）
+                        # 每个 chunk 从原始时序渲染辅助视觉图像。
                         images_vico_chunk = self.vico_renderer.render_batch(
                             ts_raw_part, att_mask=att_mask_part, img_size=self.img_size
                         )

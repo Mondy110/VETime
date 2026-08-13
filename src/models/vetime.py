@@ -36,12 +36,12 @@ class VETIME(TS_Model):
         nn.init.normal_(self.pos_emb_v, std=0.02)
         self.I_att = V_Attention(t_dim)
 
-        # === 视觉时频双分支 ===
-        # 频域引导视觉适配器：用 VETime 时域特征查询 ViCO 频域特征
+        # === 时域—时频视觉双分支 ===
+        # 时频引导视觉适配器：用时域图特征查询多尺度 STFT 图特征
         # Channel-wise LayerScale (init_scale=1e-3) 实现近乎恒等映射，训练初期自动回退到纯 VETime
         self.visual_cross_attn = GatedTimeFrequencyFusion(t_dim, num_heads=8, dropout=0.1)
 
-        # ViCO 分支的 MLP（与 VETime 分支结构一致）
+        # 辅助时频分支的 MLP（与时域图分支结构一致；保留名称以兼容 checkpoint）
         self.mlp_vico = nn.Sequential(
             nn.Linear(v_dim, t_dim2),
             nn.GELU(),
@@ -119,25 +119,25 @@ class VETIME(TS_Model):
 
         multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
 
-        # === 分支 A: VETime 时域 (现有流程) ===
+        # === 分支 A: 趋势分解时域图 ===
         image_features_vetime, _ = self.vit_encoder(hidden_states)
         I_embeddings_vetime = self.vit_encoder.unfold_image(image_features_vetime, init_img_size)
         I_embeddings_vetime = self.mlp_i(I_embeddings_vetime + multivariate_pos_emb)
         # I_embeddings0 = self.I_att(I_embeddings, patch_mask)
         Q_visual = self.I_att(I_embeddings_vetime, patch_mask)  # [B, N_TS, t_dim]
 
-        # === 分支 B: ViCO 频域 (使用真实 ViCO 图像) ===
+        # === 分支 B: 多尺度 STFT 时频图（参数名保留 vico 以兼容 checkpoint） ===
         if hidden_states_vico is not None:
-            # 使用传入的真实 ViCO 图像通过共享 MAE encoder 提取频域 tokens
+            # 使用传入的多尺度 STFT 图像通过共享 MAE encoder 提取时频 tokens
             image_features_vico, _ = self.vit_encoder(hidden_states_vico)
             K_V_tokens = image_features_vico[:, 1:, :]  # [B, 196, v_dim] 原始 patch tokens
         else:
-            # 兼容旧代码：无 ViCO 输入时使用 VETime 图像的 patch tokens 作为 fallback
+            # 兼容旧代码：无辅助图像输入时使用时域图的 patch tokens 作为 fallback
             K_V_tokens = image_features_vetime[:, 1:, :]  # [B, 196, v_dim]
         K_V_tokens_proj = self.mlp_vico(K_V_tokens)   # [B, 196, t_dim]
 
         # === 交叉注意力融合 ===
-        # GatedTimeFrequencyFusion: Q_VETime 查询 K_V_ViCO
+        # GatedTimeFrequencyFusion: 时域图 Query 查询时频图 Key/Value
         I_embeddings0 = self.visual_cross_attn(
             Q_VETime=Q_visual,
             K_ViCO=K_V_tokens_proj,

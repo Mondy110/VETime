@@ -69,3 +69,31 @@ def test_trainer_default_renderer_without_config():
 
     from src.datasets.renderers import ViCORenderer
     assert isinstance(trainer.vico_renderer, ViCORenderer)
+
+
+def test_trainer_uses_multiscale_stft_renderer_when_configured():
+    """A time-frequency configuration must not silently fall back to ViCO."""
+    from omegaconf import OmegaConf
+    from src.engines.trainer import Trainer
+    from src.datasets.renderers import MultiScaleSTFTRenderer
+
+    cfg = OmegaConf.create({
+        'model': {
+            'model_name': 'test',
+            'vision_branch': {'vico_renderer': 'stft_multiscale'},
+        },
+        'training': {'total_epochs': 1, 'stage1_epochs': 0, 'early_stopping': {'patience': 1}},
+        'loss': {},
+        'data': {'dynamic_batch': False, 'effective_batch_size': 32},
+    })
+    model = MagicMock()
+    model.MAX_L = 5000
+    accelerator = MagicMock()
+    accelerator.device = 'cpu'
+
+    trainer = Trainer(
+        cfg, model, MagicMock(), MagicMock(), accelerator,
+        {'img_size': 224}, 16,
+    )
+
+    assert isinstance(trainer.vico_renderer, MultiScaleSTFTRenderer)
