@@ -3,13 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel,Qwen2_5_VLVisionBlock, Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLPreTrainedModel, Qwen2_5_VLCausalLMOutputWithPast
-from transformers import AutoProcessor
-from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import Qwen2_5_VLConfig, Qwen2_5_VLVisionConfig
 from model.TS_encoder.encoding_utils import CustomTransformerEncoder, RotaryEmbedding
 
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+
+from model.CMRG import CMRGContext
 
 
 @dataclass
@@ -43,6 +42,20 @@ class TimeSeriesConfig:
     use_lora: bool = True
     lora_r: int = 8
     lora_alpha: int = 16
+
+
+@dataclass
+class PreparedTimeSeriesInputs:
+    """Patch-level temporal encoder inputs and metadata."""
+
+    embedded_patches: torch.Tensor
+    freqs: Optional[torch.Tensor]
+    feature_id: torch.Tensor
+    full_mask: torch.Tensor
+    batch_size: int
+    seq_len: int
+    num_features: int
+    num_patches: int
 
 
 class TimeSeriesEncoder(nn.Module):
@@ -140,8 +153,8 @@ class TimeSeriesEncoder(nn.Module):
             elif 'bias' in name:
                 nn.init.constant_(param, 0.0)
 
-    def forward(self, time_series, mask):
-        """Forward pass to generate local embeddings."""
+    def prepare_inputs(self, time_series, mask):
+        """Create patch embeddings and metadata for temporal encoding."""
         if time_series.dim() == 2:
             time_series = time_series.unsqueeze(-1)
         device = time_series.device
@@ -182,44 +195,77 @@ class TimeSeriesEncoder(nn.Module):
         else:
             freqs = None
 
-        # Encode sequence with optional gradient checkpointing
+        return PreparedTimeSeriesInputs(
+            embedded_patches=embedded_patches,
+            freqs=freqs,
+            feature_id=feature_id,
+            full_mask=full_mask,
+            batch_size=B,
+            seq_len=seq_len,
+            num_features=num_features,
+            num_patches=num_patches,
+        )
+
+    def _run_transformer(self, prepared, cmrg_context=None):
+        if prepared.num_features > 1:
+            return self.transformer_encoder(
+                prepared.embedded_patches,
+                freqs=prepared.freqs,
+                src_id=prepared.feature_id,
+                attn_mask=prepared.full_mask,
+                cmrg_context=cmrg_context,
+            )
+        return self.transformer_encoder(
+            prepared.embedded_patches,
+            freqs=prepared.freqs,
+            attn_mask=prepared.full_mask,
+            cmrg_context=cmrg_context,
+        )
+
+    def encode_prepared(self, prepared, cmrg_context: Optional[CMRGContext] = None):
+        """Encode prepared patches, optionally with cross-modal guidance."""
         if self._gradient_checkpointing and self.training:
             from torch.utils.checkpoint import checkpoint
 
-            def _encode_forward(embedded_patches, freqs, feature_id, full_mask, num_features):
-                if num_features > 1:
-                    return self.transformer_encoder(
-                        embedded_patches, freqs=freqs, src_id=feature_id, attn_mask=full_mask
-                    )
-                else:
-                    return self.transformer_encoder(
-                        embedded_patches, freqs=freqs, attn_mask=full_mask
-                    )
-
-            output = checkpoint(
-                _encode_forward,
-                embedded_patches, freqs, feature_id, full_mask, num_features
+            return checkpoint(
+                lambda embedded_patches: self._run_transformer(
+                    PreparedTimeSeriesInputs(
+                        embedded_patches=embedded_patches,
+                        freqs=prepared.freqs,
+                        feature_id=prepared.feature_id,
+                        full_mask=prepared.full_mask,
+                        batch_size=prepared.batch_size,
+                        seq_len=prepared.seq_len,
+                        num_features=prepared.num_features,
+                        num_patches=prepared.num_patches,
+                    ),
+                    cmrg_context,
+                ),
+                prepared.embedded_patches,
+                use_reentrant=False,
             )
-        else:
-            if num_features > 1:
-                output = self.transformer_encoder(
-                    embedded_patches,
-                    freqs=freqs,
-                    src_id=feature_id,
-                    attn_mask=full_mask
-                )
-            else:
-                output = self.transformer_encoder(
-                    embedded_patches,
-                    freqs=freqs,
-                    attn_mask=full_mask
-                )
+        return self._run_transformer(prepared, cmrg_context)
+
+    def project_local_embeddings(self, patch_embeddings, prepared):
+        """Project encoded patches back to local time-step embeddings."""
+        patch_proj = self.projection_layer(patch_embeddings)
+        local_embeddings = patch_proj.view(
+            prepared.batch_size,
+            prepared.num_features,
+            prepared.num_patches,
+            self.patch_size,
+            self.d_proj,
+        )
+        local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)
+        return local_embeddings.view(
+            prepared.batch_size, -1, prepared.num_features, self.d_proj
+        )[:, :prepared.seq_len, :, :]
+
+    def forward(self, time_series, mask, cmrg_context: Optional[CMRGContext] = None):
+        """Forward pass to generate local embeddings."""
+        prepared = self.prepare_inputs(time_series, mask)
+        patch_embeddings = self.encode_prepared(prepared, cmrg_context)
 
         # Extract and project local embeddings
-        patch_embeddings = output  # (B, L, d_model)
-        patch_proj = self.projection_layer(patch_embeddings)  # (B, L, patch_size * d_proj)
-        local_embeddings = patch_proj.view(B, num_features, num_patches, self.patch_size, self.d_proj)
-        local_embeddings = local_embeddings.permute(0, 2, 3, 1, 4)  # (B, num_patches, patch_size, num_features, d_proj)
-        local_embeddings = local_embeddings.view(B, -1, num_features, self.d_proj)[:, :seq_len, :, :]  # (B, seq_len, num_features, d_proj)
-
-        return patch_embeddings, local_embeddings, full_mask
+        local_embeddings = self.project_local_embeddings(patch_embeddings, prepared)
+        return patch_embeddings, local_embeddings, prepared.full_mask

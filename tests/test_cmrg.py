@@ -7,6 +7,12 @@ from model.CMRG import (
     CrossModalRelationGuider,
     RelationDistiller,
 )
+from model.TS_encoder.encoding_utils import (
+    CustomTransformerEncoder,
+    MultiheadAttentionWithRoPE,
+    RotaryEmbedding,
+)
+from model.TS_encoder.ts_encoder import TimeSeriesEncoder
 
 
 def test_relation_distiller_returns_relation_tokens_without_dropout():
@@ -88,3 +94,106 @@ def test_cmrg_context_exposes_factorized_correction_and_strength():
     strength = context.frobenius_strength(alpha)
     expected_strength = (alpha * correction).square().sum().sqrt()
     torch.testing.assert_close(strength, expected_strength)
+
+
+def _attention_inputs():
+    torch.manual_seed(12)
+    attention = MultiheadAttentionWithRoPE(embed_dim=4, num_heads=2, num_features=2)
+    attention.eval()
+    tokens = torch.randn(1, 3, 4)
+    freqs = RotaryEmbedding(4)(3)
+    feature_ids = torch.tensor([[0, 0, 1]])
+    return attention, tokens, freqs, feature_ids
+
+
+def _cmrg_context():
+    logits = torch.tensor(
+        [[[[1.0, -1.0], [0.5, 2.0], [-1.0, 0.25]], [[-0.5, 1.5], [1.0, 0.0], [0.75, -0.25]]]]
+    )
+    factor = torch.tensor(
+        [[[[0.5, 1.0], [1.0, -0.5], [0.25, 1.5]], [[1.0, 0.25], [-0.75, 0.5], [0.5, 1.0]]]]
+    )
+    return CMRGContext(logits, factor, torch.ones(1, 3, dtype=torch.bool))
+
+
+def test_rope_attention_zero_cmrg_gate_preserves_output_exactly():
+    attention, tokens, freqs, feature_ids = _attention_inputs()
+    context = _cmrg_context()
+
+    without_context = attention(tokens, tokens, tokens, freqs, feature_ids, feature_ids)
+    with_zero_gate = attention(
+        tokens,
+        tokens,
+        tokens,
+        freqs,
+        feature_ids,
+        feature_ids,
+        cmrg_context=context,
+        cmrg_alpha=torch.zeros(()),
+    )
+
+    assert torch.equal(without_context, with_zero_gate)
+
+
+def test_rope_attention_nonzero_cmrg_gate_changes_explicit_score_output():
+    attention, tokens, freqs, feature_ids = _attention_inputs()
+    context = _cmrg_context()
+    without_context = attention(tokens, tokens, tokens, freqs, feature_ids, feature_ids)
+    with_context = attention(
+        tokens,
+        tokens,
+        tokens,
+        freqs,
+        feature_ids,
+        feature_ids,
+        cmrg_context=context,
+        cmrg_alpha=torch.ones(()),
+    )
+
+    assert not torch.allclose(without_context, with_context)
+
+
+def test_each_rope_transformer_layer_owns_a_zero_initialized_cmrg_gate():
+    encoder = CustomTransformerEncoder(
+        d_model=4,
+        nhead=2,
+        dim_feedforward=8,
+        dropout=0.0,
+        activation="gelu",
+        num_layers=2,
+        num_features=2,
+        use_lora=False,
+    )
+
+    assert all(torch.equal(layer.cmrg_alpha.detach(), torch.zeros(())) for layer in encoder.layers)
+
+
+def test_cmrg_context_correction_matches_its_factorization():
+    context = _cmrg_context()
+
+    torch.testing.assert_close(
+        context.correction(), context.relation_factor @ context.relation_logits.transpose(-2, -1)
+    )
+
+
+def test_time_series_encoder_forward_keeps_return_tuple_compatible():
+    torch.manual_seed(7)
+    encoder = TimeSeriesEncoder(
+        d_model=4,
+        d_proj=3,
+        patch_size=2,
+        num_layers=1,
+        num_heads=2,
+        d_ff_dropout=0.0,
+        num_features=2,
+        use_lora=False,
+    )
+    encoder.eval()
+    time_series = torch.randn(2, 5, 2)
+    mask = torch.tensor([[True, True, True, True, True], [True, True, True, False, False]])
+
+    patch_embeddings, local_embeddings, full_mask = encoder(time_series, mask)
+
+    assert patch_embeddings.shape == (2, 6, 4)
+    assert local_embeddings.shape == (2, 5, 2, 3)
+    assert full_mask.shape == (2, 6)

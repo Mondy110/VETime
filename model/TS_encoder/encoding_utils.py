@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
+from model.CMRG import CMRGContext
 
 
 class LoRALinear(nn.Module):
@@ -160,10 +161,10 @@ class CustomTransformerEncoder(nn.Module):
                 lora_alpha=lora_alpha
             ) for _ in range(num_layers)
         ])
-    def forward(self, src, freqs, src_id=None, attn_mask=None):
+    def forward(self, src, freqs, src_id=None, attn_mask=None, cmrg_context: Optional[CMRGContext] = None):
         output = src
         for layer in self.layers:
-            output = layer(output, freqs, src_id, attn_mask=attn_mask)
+            output = layer(output, freqs, src_id, attn_mask=attn_mask, cmrg_context=cmrg_context)
         return output
 
 class TransformerEncoderLayerWithRoPE(nn.Module):
@@ -182,11 +183,22 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
+        self.cmrg_alpha = nn.Parameter(torch.zeros(()))
 
-    def forward(self, src, freqs, src_id=None, attn_mask=None):
+    def forward(self, src, freqs, src_id=None, attn_mask=None, cmrg_context: Optional[CMRGContext] = None):
         residual = src
         src = self.input_norm(src)
-        src = self.self_attn(src, src, src, freqs, src_id, src_id, attn_mask=attn_mask)
+        src = self.self_attn(
+            src,
+            src,
+            src,
+            freqs,
+            src_id,
+            src_id,
+            attn_mask=attn_mask,
+            cmrg_context=cmrg_context,
+            cmrg_alpha=self.cmrg_alpha,
+        )
         src = src + residual
         residual = src
         src = self.output_norm(src)
@@ -244,7 +256,26 @@ class MultiheadAttentionWithRoPE(nn.Module):
         )
         return x_rot.view(B, seq_len, embed_dim)
 
-    def forward(self, query, key, value, freqs, query_id=None, kv_id=None, attn_mask=None):
+    def _validate_cmrg_context(self, context: CMRGContext, batch_size: int, token_length: int):
+        expected_prefix = (batch_size, self.num_heads, token_length)
+        if context.relation_logits.shape[:3] != expected_prefix:
+            raise ValueError(
+                "CMRG relation_logits must have shape "
+                f"(batch_size, num_heads, token_length, num_relation_tokens); got "
+                f"{tuple(context.relation_logits.shape)}"
+            )
+        if context.relation_factor.shape != context.relation_logits.shape:
+            raise ValueError("CMRG relation_factor must have the same shape as relation_logits")
+        if context.temporal_valid_mask.shape != (batch_size, token_length):
+            raise ValueError(
+                "CMRG temporal_valid_mask must have shape "
+                f"(batch_size, token_length); got {tuple(context.temporal_valid_mask.shape)}"
+            )
+
+    def forward(
+        self, query, key, value, freqs, query_id=None, kv_id=None, attn_mask=None,
+        cmrg_context: Optional[CMRGContext] = None, cmrg_alpha: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass for multi-head attention with RoPE.
 
@@ -262,6 +293,8 @@ class MultiheadAttentionWithRoPE(nn.Module):
         """
         B, T, C = query.shape
         assert key.shape == (B, T, C) and value.shape == (B, T, C), "query, key, value shapes must match"
+        if cmrg_context is not None:
+            self._validate_cmrg_context(cmrg_context, B, T)
 
         # Project inputs to Q, K, V
         Q = self.q_proj(query)
@@ -289,6 +322,10 @@ class MultiheadAttentionWithRoPE(nn.Module):
             scores = torch.matmul(Q_rot, K_rot.transpose(-2, -1)) / math.sqrt(
                 self.head_dim)  # (B, num_heads, q_len, kv_len)
             scores += attn_bias
+            if cmrg_context is not None:
+                correction = cmrg_context.correction()
+                alpha = 0.0 if cmrg_alpha is None else cmrg_alpha
+                scores = scores + alpha * correction / math.sqrt(self.head_dim)
             if attn_mask is not None:
                 scores = scores.masked_fill(~attn_mask, float('-inf'))
             attn_weights = F.softmax(scores, dim=-1)  # (B, num_heads, q_len, kv_len)
