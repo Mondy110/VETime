@@ -64,8 +64,8 @@ def test_guider_uses_scaled_dot_products_not_softmax_probabilities():
     valid = torch.ones(1, 5, dtype=torch.bool)
 
     logits, _ = guider(temporal, relation, valid)
-    q = torch.nn.functional.normalize(guider.temporal_proj(temporal), dim=-1)
-    k = torch.nn.functional.normalize(guider.relation_proj(relation), dim=-1)
+    q = guider.temporal_proj(torch.nn.functional.normalize(temporal, dim=-1))
+    k = guider.relation_proj(torch.nn.functional.normalize(relation, dim=-1))
     q = q.view(1, 5, 2, 4).transpose(1, 2)
     k = k.view(1, 3, 2, 4).transpose(1, 2)
     expected = q @ k.transpose(-2, -1) / math.sqrt(4)

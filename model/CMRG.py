@@ -44,8 +44,8 @@ class CrossModalRelationGuider(nn.Module):
     def forward(self, temporal_tokens, relation_tokens, temporal_valid_mask=None):
         batch, num_temporal, _ = temporal_tokens.shape
         num_relation = relation_tokens.size(1)
-        q = F.normalize(self.temporal_proj(temporal_tokens), dim=-1)
-        k = F.normalize(self.relation_proj(relation_tokens), dim=-1)
+        q = self.temporal_proj(F.normalize(temporal_tokens, dim=-1))
+        k = self.relation_proj(F.normalize(relation_tokens, dim=-1))
         q = q.view(batch, num_temporal, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(batch, num_relation, self.num_heads, self.head_dim).transpose(1, 2)
         logits = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
