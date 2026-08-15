@@ -42,6 +42,14 @@ class TimeSeriesConfig:
     use_lora: bool = True
     lora_r: int = 8
     lora_alpha: int = 16
+    cmrg_enabled: bool = False
+    cmrg_num_relation_tokens: int = 16
+    cmrg_guide_dim: int = 512
+    cmrg_num_heads: int = 8
+    cmrg_metric_init: str = "identity"
+    cmrg_gate_init: float = 0.0
+    cmrg_injection_mode: str = "all_layers"
+    cmrg_factorized: bool = True
 
 
 @dataclass

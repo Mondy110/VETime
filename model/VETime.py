@@ -9,6 +9,7 @@ from loss.loss import win_Contrastive_Loss
 from model.TS_encoder.ts_encoder import TimeSeriesEncoder
 from model.TS_encoder.ts_model import TS_Model
 from model.VTS_module import V_Attention, VTS_Alignment, M_moe
+from model.CMRG import CMRGContext, CrossModalRelationGuider, RelationDistiller
 
 
 class VETIME(TS_Model):
@@ -24,6 +25,9 @@ class VETIME(TS_Model):
         self.name=model_name
         self.MAX_L=vision_model.MAX_L
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.cmrg_enabled = getattr(config_t, "cmrg_enabled", False)
+        self.cmrg_distiller = None
+        self.cmrg_guider = None
         
         t_dim2 = int(t_dim*2)
         self.mlp_i = nn.Sequential(
@@ -43,6 +47,9 @@ class VETIME(TS_Model):
         self.reconstruction_head = ts_model.reconstruction_head
         self.anomaly_head = ts_model.anomaly_head
         self.d_proj=ts_model.d_proj
+
+        if self.cmrg_enabled:
+            self._initialize_cmrg(config_t, v_dim, t_dim)
 
         # fusion setting
         self.fusion = VTS_Alignment(v_dim,t_dim)
@@ -71,6 +78,59 @@ class VETIME(TS_Model):
         if self.use_gradient_checkpointing:
             self._enable_gradient_checkpointing()
 
+    def _initialize_cmrg(self, config_t, vision_dim, temporal_dim):
+        """Construct CMRG modules after validating the custom RoPE configuration."""
+        guide_dim = config_t.cmrg_guide_dim
+        guide_heads = config_t.cmrg_num_heads
+        if not config_t.use_rope:
+            raise ValueError("CMRG requires the custom RoPE temporal attention implementation")
+        if guide_dim != temporal_dim:
+            raise ValueError("CMRG guide dimension must match config_t.d_model")
+        if guide_heads != config_t.num_heads:
+            raise ValueError("CMRG guide head count must match config_t.num_heads")
+        if config_t.cmrg_metric_init != "identity":
+            raise ValueError("CMRG currently supports only identity metric initialization")
+        if config_t.cmrg_injection_mode != "all_layers":
+            raise ValueError("CMRG currently supports only all_layers injection")
+        if not config_t.cmrg_factorized:
+            raise ValueError("CMRG requires factorized relation context")
+
+        self.cmrg_distiller = RelationDistiller(
+            vision_dim,
+            guide_dim,
+            config_t.cmrg_num_relation_tokens,
+            guide_heads,
+        )
+        self.cmrg_guider = CrossModalRelationGuider(
+            temporal_dim,
+            guide_dim,
+            guide_heads,
+            config_t.cmrg_num_relation_tokens,
+        )
+        with torch.no_grad():
+            for layer in self.ts_encoder.ts_encoder.transformer_encoder.layers:
+                layer.cmrg_alpha.fill_(config_t.cmrg_gate_init)
+
+    def _encode_temporal_with_cmrg(self, hidden_states, time_series, att_mask):
+        """Prepare temporal patches, build CMRG context, and encode them once."""
+        encoder = self.ts_encoder.ts_encoder
+        prepared = encoder.prepare_inputs(time_series, att_mask)
+        image_features, _ = self.vit_encoder(hidden_states)
+        relation_tokens = self.cmrg_distiller(image_features)
+        relation_logits, relation_factor = self.cmrg_guider(
+            prepared.embedded_patches,
+            relation_tokens,
+            prepared.full_mask,
+        )
+        cmrg_context = CMRGContext(
+            relation_logits,
+            relation_factor,
+            prepared.full_mask,
+        )
+        patch_embeddings = encoder.encode_prepared(prepared, cmrg_context)
+        local_embeddings = encoder.project_local_embeddings(patch_embeddings, prepared)
+        return patch_embeddings, local_embeddings, prepared.full_mask, image_features
+
     def forward(self, hidden_states: torch.Tensor,time_series: torch.Tensor, # grid_thw: torch.Tensor,size,
                 att_mask: Optional[torch.Tensor] = None,init_img_size=None,labels=None):
 
@@ -87,7 +147,12 @@ class VETIME(TS_Model):
     def _forward_impl(self, hidden_states: torch.Tensor, time_series: torch.Tensor,
                       att_mask: Optional[torch.Tensor] = None, init_img_size=None, labels=None):
         """实际的 forward 实现"""
-        TS_embeddings0,local_embeddings0,patch_mask=self.ts_encoder(time_series,att_mask)
+        if self.cmrg_enabled:
+            TS_embeddings0, local_embeddings0, patch_mask, image_features = self._encode_temporal_with_cmrg(
+                hidden_states, time_series, att_mask
+            )
+        else:
+            TS_embeddings0,local_embeddings0,patch_mask=self.ts_encoder(time_series,att_mask)
         B, seq_len, num_features = time_series.size()
 
         patch_num = patch_mask.size(1) // num_features
@@ -96,7 +161,8 @@ class VETIME(TS_Model):
 
         multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
 
-        image_features,_=self.vit_encoder(hidden_states)
+        if not self.cmrg_enabled:
+            image_features,_=self.vit_encoder(hidden_states)
         I_embeddings = self.vit_encoder.unfold_image(image_features,init_img_size)
         I_embeddings =self.mlp_i(I_embeddings+ multivariate_pos_emb)
         I_embeddings0=self.I_att(I_embeddings, patch_mask)
@@ -163,7 +229,12 @@ class VETIME(TS_Model):
         B, seq_len, num_features = time_series.size()
 
         # Part 1: TS encoder (已内置 checkpointing)
-        TS_embeddings0, local_embeddings0, patch_mask = self.ts_encoder(time_series, att_mask)
+        if self.cmrg_enabled:
+            TS_embeddings0, local_embeddings0, patch_mask, image_features = self._encode_temporal_with_cmrg(
+                hidden_states, time_series, att_mask
+            )
+        else:
+            TS_embeddings0, local_embeddings0, patch_mask = self.ts_encoder(time_series, att_mask)
 
         # Part 2: Vision encoder + fusion (使用 checkpoint)
         def vision_fusion_forward(hidden_states, patch_mask, init_img_size, TS_embeddings0, num_features):
@@ -171,8 +242,11 @@ class VETIME(TS_Model):
             temporal_pos_emb = self.pos_emb_v[:, :patch_num, :]
             multivariate_pos_emb = temporal_pos_emb.repeat(1, num_features, 1)
 
-            image_features, _ = self.vit_encoder(hidden_states)
-            I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
+            if self.cmrg_enabled:
+                I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
+            else:
+                image_features, _ = self.vit_encoder(hidden_states)
+                I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
             I_embeddings = self.mlp_i(I_embeddings + multivariate_pos_emb)
             I_embeddings0 = self.I_att(I_embeddings, patch_mask)
 

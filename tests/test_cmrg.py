@@ -13,6 +13,8 @@ from model.TS_encoder.encoding_utils import (
     RotaryEmbedding,
 )
 from model.TS_encoder.ts_encoder import TimeSeriesEncoder
+from model.TS_encoder.ts_model import TS_Model
+from model.VETime import VETIME
 
 
 def test_relation_distiller_returns_relation_tokens_without_dropout():
@@ -197,3 +199,83 @@ def test_time_series_encoder_forward_keeps_return_tuple_compatible():
     assert patch_embeddings.shape == (2, 6, 4)
     assert local_embeddings.shape == (2, 5, 2, 3)
     assert full_mask.shape == (2, 6)
+
+
+class _CountingVisionEncoder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hidden_size = 8
+        self.MAX_L = 8
+        self.forward_calls = 0
+        self.unfold_calls = 0
+
+    def forward(self, hidden_states):
+        self.forward_calls += 1
+        return hidden_states, None
+
+    def unfold_image(self, image_features, init_img_size):
+        self.unfold_calls += 1
+        return image_features
+
+
+class _RecordingTimeSeriesEncoder(TimeSeriesEncoder):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.received_cmrg_context = None
+
+    def encode_prepared(self, prepared, cmrg_context=None):
+        self.received_cmrg_context = cmrg_context
+        return super().encode_prepared(prepared, cmrg_context)
+
+
+def _tiny_vetime_config(cmrg_enabled):
+    from model.TS_encoder.ts_encoder import TimeSeriesConfig
+
+    return TimeSeriesConfig(
+        d_model=8,
+        d_proj=2,
+        patch_size=2,
+        num_layers=1,
+        num_heads=2,
+        d_ff_dropout=0.0,
+        num_features=1,
+        use_lora=False,
+        cmrg_enabled=cmrg_enabled,
+        cmrg_guide_dim=8,
+        cmrg_num_heads=2,
+    )
+
+
+def _make_tiny_vetime(cmrg_enabled=True):
+    config = _tiny_vetime_config(cmrg_enabled)
+    ts_model = TS_Model(config)
+    ts_model.ts_encoder = _RecordingTimeSeriesEncoder(
+        d_model=config.d_model,
+        d_proj=config.d_proj,
+        patch_size=config.patch_size,
+        num_layers=config.num_layers,
+        num_heads=config.num_heads,
+        d_ff_dropout=config.d_ff_dropout,
+        num_features=config.num_features,
+        use_lora=config.use_lora,
+    )
+    vision = _CountingVisionEncoder()
+    return VETIME(config, vision, config, ts_model, use_query_decoder=False), vision
+
+
+def test_vetime_cmrg_uses_raw_mae_tokens_without_replacing_fusion_path():
+    model, vision = _make_tiny_vetime(cmrg_enabled=True)
+    model.eval()
+    hidden_states = torch.randn(1, 2, 8)
+    time_series = torch.randn(1, 4, 1)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+
+    returns = model(hidden_states, time_series, mask, init_img_size=None)
+
+    context = model.ts_encoder.ts_encoder.received_cmrg_context
+    assert vision.forward_calls == 1
+    assert vision.unfold_calls == 1
+    assert context.relation_logits.shape == (1, 2, 2, 16)
+    assert len(returns) == 4
+    assert returns[0].shape == (1, 4, 1, 2)
+    assert returns[3].shape == (1, 4, 1, 2)
