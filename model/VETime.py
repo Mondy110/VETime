@@ -245,8 +245,8 @@ class VETIME(TS_Model):
             if self.cmrg_enabled:
                 I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
             else:
-                image_features, _ = self.vit_encoder(hidden_states)
-                I_embeddings = self.vit_encoder.unfold_image(image_features, init_img_size)
+                raw_image_features, _ = self.vit_encoder(hidden_states)
+                I_embeddings = self.vit_encoder.unfold_image(raw_image_features, init_img_size)
             I_embeddings = self.mlp_i(I_embeddings + multivariate_pos_emb)
             I_embeddings0 = self.I_att(I_embeddings, patch_mask)
 

@@ -246,7 +246,7 @@ def _tiny_vetime_config(cmrg_enabled):
     )
 
 
-def _make_tiny_vetime(cmrg_enabled=True):
+def _make_tiny_vetime(cmrg_enabled=True, use_gradient_checkpointing=False):
     config = _tiny_vetime_config(cmrg_enabled)
     ts_model = TS_Model(config)
     ts_model.ts_encoder = _RecordingTimeSeriesEncoder(
@@ -260,7 +260,14 @@ def _make_tiny_vetime(cmrg_enabled=True):
         use_lora=config.use_lora,
     )
     vision = _CountingVisionEncoder()
-    return VETIME(config, vision, config, ts_model, use_query_decoder=False), vision
+    return VETIME(
+        config,
+        vision,
+        config,
+        ts_model,
+        use_query_decoder=False,
+        use_gradient_checkpointing=use_gradient_checkpointing,
+    ), vision
 
 
 def test_vetime_cmrg_uses_raw_mae_tokens_without_replacing_fusion_path():
@@ -271,6 +278,28 @@ def test_vetime_cmrg_uses_raw_mae_tokens_without_replacing_fusion_path():
     mask = torch.ones(1, 4, dtype=torch.bool)
 
     returns = model(hidden_states, time_series, mask, init_img_size=None)
+
+    context = model.ts_encoder.ts_encoder.received_cmrg_context
+    assert vision.forward_calls == 1
+    assert vision.unfold_calls == 1
+    assert context.relation_logits.shape == (1, 2, 2, 16)
+    assert len(returns) == 4
+    assert returns[0].shape == (1, 4, 1, 2)
+    assert returns[3].shape == (1, 4, 1, 2)
+
+
+def test_vetime_cmrg_checkpointing_preserves_vision_and_return_contract():
+    model, vision = _make_tiny_vetime(
+        cmrg_enabled=True,
+        use_gradient_checkpointing=True,
+    )
+    model.train()
+    hidden_states = torch.randn(1, 2, 8)
+    time_series = torch.randn(1, 4, 1)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    labels = torch.zeros(1, 4, dtype=torch.long)
+
+    returns = model(hidden_states, time_series, mask, init_img_size=None, labels=labels)
 
     context = model.ts_encoder.ts_encoder.received_cmrg_context
     assert vision.forward_calls == 1
