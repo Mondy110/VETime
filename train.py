@@ -36,6 +36,14 @@ from tqdm.auto import tqdm
 import os
 from datetime import datetime
 from model.VETime import VETIME
+from model.CMRG import CMRGContext
+from model.cmrg_training import (
+    add_cmrg_injection_mode_argument,
+    collect_cmrg_monitoring,
+    configure_freeze_mode,
+    load_model_state_compat,
+    restore_optimizer_state_compat,
+)
 from Test_TSB import EarlyStopping
 from functools import partial
 import psutil  # 硬件资源监控
@@ -87,6 +95,36 @@ def load_config(config_path: str) -> Dict[str, Any]:
     """
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
+
+
+def apply_cmrg_config(args):
+    """Apply CMRG CLI controls to the shared temporal configuration."""
+    for option in (
+        "cmrg_enabled",
+        "cmrg_num_relation_tokens",
+        "cmrg_guide_dim",
+        "cmrg_num_heads",
+        "cmrg_metric_init",
+        "cmrg_gate_init",
+        "cmrg_injection_mode",
+        "cmrg_factorized",
+        "cmrg_log_interval",
+    ):
+        setattr(default_config_t, option, getattr(args, option))
+
+
+def enable_cmrg_monitoring(model):
+    """Capture the latest detached factorized context for interval logging."""
+    if not getattr(model, "cmrg_enabled", False):
+        return None
+
+    def capture_context(_, inputs, output):
+        temporal_valid_mask = inputs[2]
+        model._cmrg_monitoring_context = CMRGContext(
+            output[0].detach(), output[1].detach(), temporal_valid_mask.detach()
+        )
+
+    return model.cmrg_guider.register_forward_hook(capture_context)
 
 
 def create_model(args, num_features: int, vision_model, config_v, use_gradient_checkpointing=False):
@@ -232,6 +270,8 @@ def train_univariate(args):
         default_config_t.use_lora = False
         print(f"[INFO] TS Encoder 微调类型: 完全冻结")
 
+    apply_cmrg_config(args)
+
     ts_model = TS_Model(default_config_t)
     if args.ts_path is not None:
         print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
@@ -266,30 +306,19 @@ def train_univariate(args):
     else:
         print(f"[WARNING] 未指定 --ts_path，TS Encoder 使用随机初始化！")
 
-    # Freeze 模式：选择性冻结（仅冻结核心骨干，保留任务头可训练）
-    if args.ts_finetune_type == 'freeze':
-        frozen_layers = []
-        trainable_layers = []
-        for name, param in ts_model.named_parameters():
-            if any(key in name for key in ['transformer_encoder', 'embedding_layer', 'rope_embedder']):
-                param.requires_grad = False
-                frozen_layers.append(name)
-            else:
-                param.requires_grad = True
-                trainable_layers.append(name)
-        print(f"[INFO] TS Encoder 开启选择性冻结：")
-        print(f"  已冻结核心骨干: {len(frozen_layers)} 个张量")
-        print(f"  保持可训练 (projection/anomaly/reconstruction): {len(trainable_layers)} 个张量")
-
     # ========== Create VETime Model ==========
     model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
     if args.vetime_path is not None:
         print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
         state_dict = torch.load(args.vetime_path, map_location='cpu', weights_only=False)
-        model.load_state_dict(state_dict)
+        load_model_state_compat(model, state_dict, "legacy VETime weights")
         print(f"[INFO] VETime 权重加载完成（用于继续训练）")
     else:
         print(f"[INFO] 未指定 --vetime_path，VETime 融合模块从头训练")
+
+    if args.ts_finetune_type == 'freeze':
+        configure_freeze_mode(model)
+    enable_cmrg_monitoring(model)
 
     del vision_model, ts_model
 
@@ -474,8 +503,10 @@ def train_univariate(args):
                 if unexpected:
                     print(f"  未预期的参数: {len(unexpected)} 个")
 
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print(f"[INFO] Optimizer状态已恢复")
+                if restore_optimizer_state_compat(
+                    optimizer, checkpoint.get('optimizer_state_dict')
+                ):
+                    print(f"[INFO] Optimizer状态已恢复")
 
                 start_epoch = checkpoint['epoch'] + 1
                 global_step = checkpoint['global_step']
@@ -718,6 +749,14 @@ def train_univariate(args):
                     "Loss/Balance": batch_loss_e,
                     "Train/LR": optimizer.param_groups[0]['lr'],
                 }, step=global_step)
+            if (args.cmrg_enabled and global_step > 0
+                    and global_step % args.cmrg_log_interval == 0):
+                cmrg_metrics = collect_cmrg_monitoring(
+                    accelerator.unwrap_model(model),
+                    getattr(accelerator.unwrap_model(model), "_cmrg_monitoring_context", None),
+                )
+                if cmrg_metrics:
+                    accelerator.log(cmrg_metrics, step=global_step)
 
             # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
             if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
@@ -1146,8 +1185,8 @@ def load_full_checkpoint(
         print(f"  未预期的参数: {len(unexpected)} 个")
 
     # 加载optimizer状态
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    print(f"[INFO] Optimizer状态已恢复")
+    if restore_optimizer_state_compat(optimizer, checkpoint.get('optimizer_state_dict')):
+        print(f"[INFO] Optimizer状态已恢复")
 
     # 恢复随机状态
     random_state = checkpoint.get('random_state', {})
@@ -1374,6 +1413,8 @@ def train_multivariate(args, config: Dict[str, Any]):
         default_config_t.use_lora = False
         print(f"[INFO] TS Encoder 微调类型: 完全冻结")
 
+    apply_cmrg_config(args)
+
     # 全局 checkpoint 路径（用于维度间传递）
     prev_checkpoint_path = None
 
@@ -1437,6 +1478,10 @@ def train_multivariate(args, config: Dict[str, Any]):
         # ========== 2. 全新实例化模型（复用 vision_model）==========
         model, ts_model = create_model(args, current_dim, vision_model, config_v,
                                        use_gradient_checkpointing=use_gradient_checkpointing)
+
+        if args.ts_finetune_type == 'freeze':
+            configure_freeze_mode(model)
+        enable_cmrg_monitoring(model)
 
         # ========== 处理pretrain加载（仅第一个维度）==========
         if pretrain_path is not None and dataset_idx == 0:
@@ -1789,6 +1834,14 @@ def train_multivariate(args, config: Dict[str, Any]):
                         "Loss/Balance": batch_loss_e,
                         "Train/LR": optimizer.param_groups[0]['lr'],
                     }, step=global_step)
+                if (args.cmrg_enabled and global_step > 0
+                        and global_step % args.cmrg_log_interval == 0):
+                    cmrg_metrics = collect_cmrg_monitoring(
+                        accelerator.unwrap_model(model),
+                        getattr(accelerator.unwrap_model(model), "_cmrg_monitoring_context", None),
+                    )
+                    if cmrg_metrics:
+                        accelerator.log(cmrg_metrics, step=global_step)
 
                 # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
                 if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
@@ -2036,6 +2089,25 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay (paper: 1e-5)')
     parser.add_argument('--ts_finetune_type', type=str, default='lora', choices=['lora', 'freeze'],
                         help="TS Encoder fine-tuning type: 'lora' or 'freeze'")
+    parser.add_argument('--cmrg_enabled', action='store_true', default=False,
+                        help='Enable cross-modal relational guidance')
+    parser.add_argument('--cmrg_num_relation_tokens', type=int, default=16,
+                        help='Number of distilled CMRG relation tokens')
+    parser.add_argument('--cmrg_guide_dim', type=int, default=512,
+                        help='CMRG guide dimension (must match temporal d_model)')
+    parser.add_argument('--cmrg_num_heads', type=int, default=8,
+                        help='CMRG guide head count (must match temporal num_heads)')
+    parser.add_argument('--cmrg_metric_init', choices=['identity'], default='identity',
+                        help='CMRG relation metric initialization')
+    parser.add_argument('--cmrg_gate_init', type=float, default=0.0,
+                        help='Initial per-layer CMRG gate')
+    add_cmrg_injection_mode_argument(parser)
+    parser.add_argument('--cmrg_factorized', action='store_true', default=True,
+                        help='Keep the CMRG relation context factorized')
+    parser.add_argument('--no_cmrg_factorized', action='store_false', dest='cmrg_factorized',
+                        help='Disable factorized CMRG context (unsupported by the model)')
+    parser.add_argument('--cmrg_log_interval', type=int, default=100,
+                        help='Global-step interval for CMRG monitoring')
     parser.add_argument('--resume', type=str, default=None,
                         help='从checkpoint继续训练的路径（完整状态恢复）')
     parser.add_argument('--pretrain_from', type=str, default=None,

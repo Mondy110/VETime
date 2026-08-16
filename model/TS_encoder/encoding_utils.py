@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
+from model.CMRG import CMRGContext, factorized_product_frobenius
 
 
 class LoRALinear(nn.Module):
@@ -145,7 +146,7 @@ class LlamaMLP(nn.Module):
 class CustomTransformerEncoder(nn.Module):
     """Stack of Transformer Encoder Layers."""
     def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features,
-                 use_lora=False, lora_r=8, lora_alpha=16):
+                 use_lora=False, lora_r=8, lora_alpha=16, cmrg_injection_mode="all_layers"):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayerWithRoPE(
@@ -160,10 +161,22 @@ class CustomTransformerEncoder(nn.Module):
                 lora_alpha=lora_alpha
             ) for _ in range(num_layers)
         ])
-    def forward(self, src, freqs, src_id=None, attn_mask=None):
+        self.set_cmrg_injection_mode(cmrg_injection_mode)
+
+    def set_cmrg_injection_mode(self, mode):
+        if mode not in ("all_layers", "last_layer"):
+            raise ValueError(f"Unsupported CMRG injection mode: {mode}")
+        self.cmrg_injection_mode = mode
+        last_index = len(self.layers) - 1
+        for layer_index, layer in enumerate(self.layers):
+            layer.cmrg_active = mode == "all_layers" or layer_index == last_index
+            layer.cmrg_alpha.requires_grad_(layer.cmrg_active)
+
+    def forward(self, src, freqs, src_id=None, attn_mask=None, cmrg_context: Optional[CMRGContext] = None):
         output = src
         for layer in self.layers:
-            output = layer(output, freqs, src_id, attn_mask=attn_mask)
+            layer_context = cmrg_context if layer.cmrg_active else None
+            output = layer(output, freqs, src_id, attn_mask=attn_mask, cmrg_context=layer_context)
         return output
 
 class TransformerEncoderLayerWithRoPE(nn.Module):
@@ -182,11 +195,22 @@ class TransformerEncoderLayerWithRoPE(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
+        self.cmrg_alpha = nn.Parameter(torch.zeros(()))
 
-    def forward(self, src, freqs, src_id=None, attn_mask=None):
+    def forward(self, src, freqs, src_id=None, attn_mask=None, cmrg_context: Optional[CMRGContext] = None):
         residual = src
         src = self.input_norm(src)
-        src = self.self_attn(src, src, src, freqs, src_id, src_id, attn_mask=attn_mask)
+        src = self.self_attn(
+            src,
+            src,
+            src,
+            freqs,
+            src_id,
+            src_id,
+            attn_mask=attn_mask,
+            cmrg_context=cmrg_context,
+            cmrg_alpha=self.cmrg_alpha,
+        )
         src = src + residual
         residual = src
         src = self.output_norm(src)
@@ -219,6 +243,8 @@ class MultiheadAttentionWithRoPE(nn.Module):
             self.v_proj = LoRALinear(self.v_proj, r=lora_r, alpha=lora_alpha)
             self.out_proj = LoRALinear(self.out_proj, r=lora_r, alpha=lora_alpha)
 
+        self.cmrg_qk_frobenius = None
+
         # Binary attention bias for time series
         if num_features > 1:
             self.binary_attention_bias = BinaryAttentionBias(num_heads)
@@ -244,7 +270,26 @@ class MultiheadAttentionWithRoPE(nn.Module):
         )
         return x_rot.view(B, seq_len, embed_dim)
 
-    def forward(self, query, key, value, freqs, query_id=None, kv_id=None, attn_mask=None):
+    def _validate_cmrg_context(self, context: CMRGContext, batch_size: int, token_length: int):
+        expected_prefix = (batch_size, self.num_heads, token_length)
+        if context.relation_logits.shape[:3] != expected_prefix:
+            raise ValueError(
+                "CMRG relation_logits must have shape "
+                f"(batch_size, num_heads, token_length, num_relation_tokens); got "
+                f"{tuple(context.relation_logits.shape)}"
+            )
+        if context.relation_factor.shape != context.relation_logits.shape:
+            raise ValueError("CMRG relation_factor must have the same shape as relation_logits")
+        if context.temporal_valid_mask.shape != (batch_size, token_length):
+            raise ValueError(
+                "CMRG temporal_valid_mask must have shape "
+                f"(batch_size, token_length); got {tuple(context.temporal_valid_mask.shape)}"
+            )
+
+    def forward(
+        self, query, key, value, freqs, query_id=None, kv_id=None, attn_mask=None,
+        cmrg_context: Optional[CMRGContext] = None, cmrg_alpha: Optional[torch.Tensor] = None,
+    ):
         """
         Forward pass for multi-head attention with RoPE.
 
@@ -262,6 +307,8 @@ class MultiheadAttentionWithRoPE(nn.Module):
         """
         B, T, C = query.shape
         assert key.shape == (B, T, C) and value.shape == (B, T, C), "query, key, value shapes must match"
+        if cmrg_context is not None:
+            self._validate_cmrg_context(cmrg_context, B, T)
 
         # Project inputs to Q, K, V
         Q = self.q_proj(query)
@@ -277,6 +324,9 @@ class MultiheadAttentionWithRoPE(nn.Module):
         K_rot = K_rot.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
         V = V.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
 
+        if cmrg_context is not None:
+            self.cmrg_qk_frobenius = factorized_product_frobenius(Q_rot, K_rot).detach()
+
         # Prepare attention mask for padding
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
@@ -289,6 +339,10 @@ class MultiheadAttentionWithRoPE(nn.Module):
             scores = torch.matmul(Q_rot, K_rot.transpose(-2, -1)) / math.sqrt(
                 self.head_dim)  # (B, num_heads, q_len, kv_len)
             scores += attn_bias
+            if cmrg_context is not None:
+                correction = cmrg_context.correction()
+                alpha = 0.0 if cmrg_alpha is None else cmrg_alpha
+                scores = scores + alpha * correction / math.sqrt(self.head_dim)
             if attn_mask is not None:
                 scores = scores.masked_fill(~attn_mask, float('-inf'))
             attn_weights = F.softmax(scores, dim=-1)  # (B, num_heads, q_len, kv_len)
@@ -300,11 +354,38 @@ class MultiheadAttentionWithRoPE(nn.Module):
             #     param.requires_grad = False
             # 注意：为了可复现性，需要确保 Flash Attention 被禁用
             # 可以在 train.py 的 set_seed() 中设置 torch.backends.cuda.enable_flash_sdp(False)
-            y = F.scaled_dot_product_attention(
-                Q_rot, K_rot, V,
-                attn_mask=attn_mask,
-                is_causal=False  # Non-causal attention for encoder
-            )  # (B, nh, T, hs)
+            if cmrg_context is None:
+                y = F.scaled_dot_product_attention(
+                    Q_rot, K_rot, V,
+                    attn_mask=attn_mask,
+                    is_causal=False,
+                )
+            else:
+                alpha = 0.0 if cmrg_alpha is None else cmrg_alpha
+                correction_bias = (
+                    alpha * cmrg_context.correction() / math.sqrt(self.head_dim)
+                )
+                if attn_mask is not None:
+                    correction_bias = correction_bias.masked_fill(~attn_mask, float('-inf'))
+                guided = F.scaled_dot_product_attention(
+                    Q_rot,
+                    K_rot,
+                    V,
+                    attn_mask=correction_bias,
+                    is_causal=False,
+                )
+                alpha_is_zero = torch.as_tensor(alpha).detach().eq(0).all().item()
+                if alpha_is_zero:
+                    baseline = F.scaled_dot_product_attention(
+                        Q_rot,
+                        K_rot,
+                        V,
+                        attn_mask=attn_mask,
+                        is_causal=False,
+                    )
+                    y = baseline.detach() + (guided - guided.detach())
+                else:
+                    y = guided
 
         # Reshape and project output
         y = y.transpose(1, 2).contiguous().view(B, T, C)

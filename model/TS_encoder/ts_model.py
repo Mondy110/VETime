@@ -20,7 +20,8 @@ class TS_Model(nn.Module):
             d_ff_dropout=ts_config.d_ff_dropout,
             use_rope=ts_config.use_rope,
             num_features=ts_config.num_features,
-            activation=ts_config.activation
+            activation=ts_config.activation,
+            cmrg_injection_mode=getattr(ts_config, "cmrg_injection_mode", "all_layers"),
         )
 
         self.d_proj=ts_config.d_proj
