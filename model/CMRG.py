@@ -8,6 +8,14 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def factorized_product_frobenius(left, right):
+    """Return ``||left @ right.T||_F`` without forming the product."""
+    left_gram = torch.matmul(left.transpose(-2, -1), left)
+    right_gram = torch.matmul(right.transpose(-2, -1), right)
+    squared = (left_gram * right_gram).sum(dim=(-2, -1))
+    return squared.clamp_min(0).sum().sqrt()
+
+
 class RelationDistiller(nn.Module):
     """Distill a fixed set of learnable relation tokens from visual patches."""
 
@@ -66,9 +74,11 @@ class CMRGContext:
 
     def frobenius_strength(self, alpha=1.0):
         """Return ``||alpha * (M Rᵀ)||_F`` using factor Gram products."""
-        left = self.relation_factor
-        right = self.relation_logits
-        left_gram = torch.matmul(left.transpose(-2, -1), left)
-        right_gram = torch.matmul(right.transpose(-2, -1), right)
-        squared = (left_gram * right_gram).sum(dim=(-2, -1))
-        return torch.as_tensor(alpha, device=left.device, dtype=left.dtype).abs() * squared.clamp_min(0).sum().sqrt()
+        alpha = torch.as_tensor(
+            alpha,
+            device=self.relation_factor.device,
+            dtype=self.relation_factor.dtype,
+        )
+        return alpha.abs() * factorized_product_frobenius(
+            self.relation_factor, self.relation_logits
+        )

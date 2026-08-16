@@ -1,5 +1,7 @@
+import argparse
 import math
 
+import pytest
 import torch
 
 from model.CMRG import (
@@ -7,7 +9,13 @@ from model.CMRG import (
     CrossModalRelationGuider,
     RelationDistiller,
 )
-from model.cmrg_training import collect_cmrg_monitoring, configure_freeze_mode
+from model.cmrg_training import (
+    add_cmrg_injection_mode_argument,
+    collect_cmrg_monitoring,
+    configure_freeze_mode,
+    load_model_state_compat,
+    restore_optimizer_state_compat,
+)
 from model.TS_encoder.encoding_utils import (
     CustomTransformerEncoder,
     MultiheadAttentionWithRoPE,
@@ -153,6 +161,49 @@ def test_rope_attention_nonzero_cmrg_gate_changes_explicit_score_output():
     )
 
     assert not torch.allclose(without_context, with_context)
+
+
+def test_univariate_rope_attention_nonzero_cmrg_gate_changes_output_and_backpropagates():
+    attention, tokens, freqs, _ = _attention_inputs()
+    logits = _cmrg_context().relation_logits.clone().requires_grad_()
+    factor = _cmrg_context().relation_factor.clone().requires_grad_()
+    context = CMRGContext(logits, factor, torch.ones(1, 3, dtype=torch.bool))
+    alpha = torch.tensor(0.5, requires_grad=True)
+
+    baseline = attention(tokens, tokens, tokens, freqs)
+    guided = attention(
+        tokens,
+        tokens,
+        tokens,
+        freqs,
+        cmrg_context=context,
+        cmrg_alpha=alpha,
+    )
+    guided.square().sum().backward()
+
+    assert not torch.allclose(baseline, guided)
+    assert alpha.grad is not None and alpha.grad.abs() > 0
+    assert logits.grad is not None and torch.count_nonzero(logits.grad) > 0
+    assert factor.grad is not None and torch.count_nonzero(factor.grad) > 0
+
+
+def test_univariate_rope_attention_zero_gate_preserves_masked_output_exactly():
+    attention, tokens, freqs, _ = _attention_inputs()
+    context = _cmrg_context()
+    mask = torch.tensor([[True, True, False]])
+
+    baseline = attention(tokens, tokens, tokens, freqs, attn_mask=mask)
+    guided = attention(
+        tokens,
+        tokens,
+        tokens,
+        freqs,
+        attn_mask=mask,
+        cmrg_context=context,
+        cmrg_alpha=torch.zeros((), requires_grad=True),
+    )
+
+    assert torch.equal(baseline, guided)
 
 
 def test_each_rope_transformer_layer_owns_a_zero_initialized_cmrg_gate():
@@ -323,6 +374,104 @@ def test_cmrg_monitoring_collects_zero_gate_factorized_strength_without_correcti
     assert metrics["cmrg/alpha_0"] == 0.0
     assert metrics["cmrg/rho_0"] == 0.0
     assert collect_cmrg_monitoring(model, None) == {}
+
+
+def test_cmrg_monitoring_reports_factorized_relative_qk_strength():
+    model, _ = _make_tiny_vetime(cmrg_enabled=True)
+    layer = model.ts_encoder.ts_encoder.transformer_encoder.layers[0]
+    attention = layer.self_attn
+    attention.eval()
+    tokens = torch.tensor(
+        [[[1.0, 2.0, -1.0, 0.5, 0.25, -0.75, 1.25, 0.0],
+          [0.25, -0.5, 1.5, 2.0, -1.0, 0.75, 0.5, 1.0]]]
+    )
+    freqs = RotaryEmbedding(8)(2)
+    context = CMRGContext(
+        relation_logits=torch.tensor([[[[1.0, 2.0], [-1.0, 0.5]], [[0.5, -1.0], [2.0, 1.5]]]]),
+        relation_factor=torch.tensor([[[[2.0, -0.5], [1.0, 3.0]], [[-1.0, 0.25], [0.75, 2.0]]]]),
+        temporal_valid_mask=torch.ones(1, 2, dtype=torch.bool),
+    )
+    alpha = torch.tensor(0.25)
+    layer.cmrg_alpha.data.copy_(alpha)
+
+    attention(tokens, tokens, tokens, freqs, cmrg_context=context, cmrg_alpha=alpha)
+    q = attention.apply_rope(attention.q_proj(tokens), freqs).view(1, 2, 2, 4).transpose(1, 2)
+    k = attention.apply_rope(attention.k_proj(tokens), freqs).view(1, 2, 2, 4).transpose(1, 2)
+    direct_qk = q @ k.transpose(-2, -1)
+    direct_correction = context.relation_factor @ context.relation_logits.transpose(-2, -1)
+    expected = (alpha * direct_correction).norm() / (direct_qk.norm() + 1e-12)
+
+    metrics = collect_cmrg_monitoring(model, context)
+
+    assert metrics["cmrg/rho_0"] == pytest.approx(expected.item(), rel=1e-6)
+
+
+def test_legacy_model_load_reports_missing_and_unexpected_keys(capsys):
+    model = torch.nn.Linear(2, 1)
+    legacy_state = {"weight": model.weight.detach().clone(), "retired": torch.ones(1)}
+
+    missing, unexpected = load_model_state_compat(model, legacy_state, "legacy VETime")
+
+    assert missing == ["bias"]
+    assert unexpected == ["retired"]
+    report = capsys.readouterr().out
+    assert "strict=False" in report
+    assert "1" in report
+
+
+def test_incompatible_optimizer_resume_is_skipped_with_warning():
+    source_param = torch.nn.Parameter(torch.ones(()))
+    source_optimizer = torch.optim.AdamW([source_param])
+    incompatible_state = source_optimizer.state_dict()
+    target_optimizer = torch.optim.AdamW(
+        [torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.zeros(()))]
+    )
+
+    with pytest.warns(RuntimeWarning, match="Optimizer.*skipped"):
+        restored = restore_optimizer_state_compat(target_optimizer, incompatible_state)
+
+    assert restored is False
+
+
+@pytest.mark.parametrize("mode", ["all_layers", "last_layer"])
+def test_cmrg_cli_accepts_supported_injection_modes(mode):
+    parser = argparse.ArgumentParser()
+    add_cmrg_injection_mode_argument(parser)
+
+    args = parser.parse_args(["--cmrg_injection_mode", mode])
+
+    assert args.cmrg_injection_mode == mode
+
+
+def test_last_layer_injection_ignores_earlier_gates_and_uses_final_gate():
+    encoder = CustomTransformerEncoder(
+        d_model=4,
+        nhead=2,
+        dim_feedforward=8,
+        dropout=0.0,
+        activation="gelu",
+        num_layers=2,
+        num_features=1,
+        use_lora=False,
+        cmrg_injection_mode="last_layer",
+    )
+    encoder.eval()
+    tokens = torch.randn(1, 3, 4)
+    freqs = RotaryEmbedding(4)(3)
+    context = _cmrg_context()
+    encoder.layers[0].cmrg_alpha.data.fill_(0.0)
+    encoder.layers[1].cmrg_alpha.data.fill_(1.0)
+
+    final_gate_output = encoder(tokens, freqs, cmrg_context=context)
+    encoder.layers[0].cmrg_alpha.data.fill_(100.0)
+    earlier_gate_changed = encoder(tokens, freqs, cmrg_context=context)
+    encoder.layers[1].cmrg_alpha.data.zero_()
+    final_gate_disabled = encoder(tokens, freqs, cmrg_context=context)
+
+    assert torch.equal(final_gate_output, earlier_gate_changed)
+    assert not torch.allclose(final_gate_output, final_gate_disabled)
+    assert not encoder.layers[0].cmrg_alpha.requires_grad
+    assert encoder.layers[1].cmrg_alpha.requires_grad
 
 
 def test_freeze_mode_keeps_cmrg_modules_and_gates_trainable():

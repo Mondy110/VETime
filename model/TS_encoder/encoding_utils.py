@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
-from model.CMRG import CMRGContext
+from model.CMRG import CMRGContext, factorized_product_frobenius
 
 
 class LoRALinear(nn.Module):
@@ -146,7 +146,7 @@ class LlamaMLP(nn.Module):
 class CustomTransformerEncoder(nn.Module):
     """Stack of Transformer Encoder Layers."""
     def __init__(self, d_model, nhead, dim_feedforward, dropout, activation, num_layers, num_features,
-                 use_lora=False, lora_r=8, lora_alpha=16):
+                 use_lora=False, lora_r=8, lora_alpha=16, cmrg_injection_mode="all_layers"):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerEncoderLayerWithRoPE(
@@ -161,10 +161,22 @@ class CustomTransformerEncoder(nn.Module):
                 lora_alpha=lora_alpha
             ) for _ in range(num_layers)
         ])
+        self.set_cmrg_injection_mode(cmrg_injection_mode)
+
+    def set_cmrg_injection_mode(self, mode):
+        if mode not in ("all_layers", "last_layer"):
+            raise ValueError(f"Unsupported CMRG injection mode: {mode}")
+        self.cmrg_injection_mode = mode
+        last_index = len(self.layers) - 1
+        for layer_index, layer in enumerate(self.layers):
+            layer.cmrg_active = mode == "all_layers" or layer_index == last_index
+            layer.cmrg_alpha.requires_grad_(layer.cmrg_active)
+
     def forward(self, src, freqs, src_id=None, attn_mask=None, cmrg_context: Optional[CMRGContext] = None):
         output = src
         for layer in self.layers:
-            output = layer(output, freqs, src_id, attn_mask=attn_mask, cmrg_context=cmrg_context)
+            layer_context = cmrg_context if layer.cmrg_active else None
+            output = layer(output, freqs, src_id, attn_mask=attn_mask, cmrg_context=layer_context)
         return output
 
 class TransformerEncoderLayerWithRoPE(nn.Module):
@@ -230,6 +242,8 @@ class MultiheadAttentionWithRoPE(nn.Module):
             self.k_proj = LoRALinear(self.k_proj, r=lora_r, alpha=lora_alpha)
             self.v_proj = LoRALinear(self.v_proj, r=lora_r, alpha=lora_alpha)
             self.out_proj = LoRALinear(self.out_proj, r=lora_r, alpha=lora_alpha)
+
+        self.cmrg_qk_frobenius = None
 
         # Binary attention bias for time series
         if num_features > 1:
@@ -310,6 +324,9 @@ class MultiheadAttentionWithRoPE(nn.Module):
         K_rot = K_rot.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
         V = V.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
 
+        if cmrg_context is not None:
+            self.cmrg_qk_frobenius = factorized_product_frobenius(Q_rot, K_rot).detach()
+
         # Prepare attention mask for padding
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
@@ -337,11 +354,38 @@ class MultiheadAttentionWithRoPE(nn.Module):
             #     param.requires_grad = False
             # 注意：为了可复现性，需要确保 Flash Attention 被禁用
             # 可以在 train.py 的 set_seed() 中设置 torch.backends.cuda.enable_flash_sdp(False)
-            y = F.scaled_dot_product_attention(
-                Q_rot, K_rot, V,
-                attn_mask=attn_mask,
-                is_causal=False  # Non-causal attention for encoder
-            )  # (B, nh, T, hs)
+            if cmrg_context is None:
+                y = F.scaled_dot_product_attention(
+                    Q_rot, K_rot, V,
+                    attn_mask=attn_mask,
+                    is_causal=False,
+                )
+            else:
+                alpha = 0.0 if cmrg_alpha is None else cmrg_alpha
+                correction_bias = (
+                    alpha * cmrg_context.correction() / math.sqrt(self.head_dim)
+                )
+                if attn_mask is not None:
+                    correction_bias = correction_bias.masked_fill(~attn_mask, float('-inf'))
+                guided = F.scaled_dot_product_attention(
+                    Q_rot,
+                    K_rot,
+                    V,
+                    attn_mask=correction_bias,
+                    is_causal=False,
+                )
+                alpha_is_zero = torch.as_tensor(alpha).detach().eq(0).all().item()
+                if alpha_is_zero:
+                    baseline = F.scaled_dot_product_attention(
+                        Q_rot,
+                        K_rot,
+                        V,
+                        attn_mask=attn_mask,
+                        is_causal=False,
+                    )
+                    y = baseline.detach() + (guided - guided.detach())
+                else:
+                    y = guided
 
         # Reshape and project output
         y = y.transpose(1, 2).contiguous().view(B, T, C)

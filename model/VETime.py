@@ -90,8 +90,8 @@ class VETIME(TS_Model):
             raise ValueError("CMRG guide head count must match config_t.num_heads")
         if config_t.cmrg_metric_init != "identity":
             raise ValueError("CMRG currently supports only identity metric initialization")
-        if config_t.cmrg_injection_mode != "all_layers":
-            raise ValueError("CMRG currently supports only all_layers injection")
+        if config_t.cmrg_injection_mode not in ("all_layers", "last_layer"):
+            raise ValueError("CMRG injection mode must be all_layers or last_layer")
         if not config_t.cmrg_factorized:
             raise ValueError("CMRG requires factorized relation context")
 
@@ -107,9 +107,11 @@ class VETIME(TS_Model):
             guide_heads,
             config_t.cmrg_num_relation_tokens,
         )
+        transformer = self.ts_encoder.ts_encoder.transformer_encoder
+        transformer.set_cmrg_injection_mode(config_t.cmrg_injection_mode)
         with torch.no_grad():
-            for layer in self.ts_encoder.ts_encoder.transformer_encoder.layers:
-                layer.cmrg_alpha.fill_(config_t.cmrg_gate_init)
+            for layer in transformer.layers:
+                layer.cmrg_alpha.fill_(config_t.cmrg_gate_init if layer.cmrg_active else 0.0)
 
     def _encode_temporal_with_cmrg(self, hidden_states, time_series, att_mask):
         """Prepare temporal patches, build CMRG context, and encode them once."""

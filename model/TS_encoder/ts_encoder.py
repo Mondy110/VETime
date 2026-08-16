@@ -94,7 +94,8 @@ class TimeSeriesEncoder(nn.Module):
     """
     def __init__(self, d_model=512, d_proj=256, patch_size=14, num_layers=8, num_heads=8,
                  d_ff_dropout=0.1, max_total_tokens=8192, use_rope=True, num_features=1,
-                 activation="gelu", use_lora=True, lora_r=8, lora_alpha=16, **kwargs):
+                 activation="gelu", use_lora=True, lora_r=8, lora_alpha=16,
+                 cmrg_injection_mode="all_layers", **kwargs):
         super().__init__()
         self.patch_size = patch_size
         self.d_model = d_model
@@ -124,7 +125,8 @@ class TimeSeriesEncoder(nn.Module):
                 num_features=num_features,
                 use_lora=use_lora,
                 lora_r=lora_r,
-                lora_alpha=lora_alpha
+                lora_alpha=lora_alpha,
+                cmrg_injection_mode=cmrg_injection_mode,
             )
         else:
             # Standard encoder without RoPE

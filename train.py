@@ -37,7 +37,13 @@ import os
 from datetime import datetime
 from model.VETime import VETIME
 from model.CMRG import CMRGContext
-from model.cmrg_training import collect_cmrg_monitoring, configure_freeze_mode
+from model.cmrg_training import (
+    add_cmrg_injection_mode_argument,
+    collect_cmrg_monitoring,
+    configure_freeze_mode,
+    load_model_state_compat,
+    restore_optimizer_state_compat,
+)
 from Test_TSB import EarlyStopping
 from functools import partial
 import psutil  # 硬件资源监控
@@ -305,7 +311,7 @@ def train_univariate(args):
     if args.vetime_path is not None:
         print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
         state_dict = torch.load(args.vetime_path, map_location='cpu', weights_only=False)
-        model.load_state_dict(state_dict)
+        load_model_state_compat(model, state_dict, "legacy VETime weights")
         print(f"[INFO] VETime 权重加载完成（用于继续训练）")
     else:
         print(f"[INFO] 未指定 --vetime_path，VETime 融合模块从头训练")
@@ -497,8 +503,10 @@ def train_univariate(args):
                 if unexpected:
                     print(f"  未预期的参数: {len(unexpected)} 个")
 
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                print(f"[INFO] Optimizer状态已恢复")
+                if restore_optimizer_state_compat(
+                    optimizer, checkpoint.get('optimizer_state_dict')
+                ):
+                    print(f"[INFO] Optimizer状态已恢复")
 
                 start_epoch = checkpoint['epoch'] + 1
                 global_step = checkpoint['global_step']
@@ -1177,8 +1185,8 @@ def load_full_checkpoint(
         print(f"  未预期的参数: {len(unexpected)} 个")
 
     # 加载optimizer状态
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    print(f"[INFO] Optimizer状态已恢复")
+    if restore_optimizer_state_compat(optimizer, checkpoint.get('optimizer_state_dict')):
+        print(f"[INFO] Optimizer状态已恢复")
 
     # 恢复随机状态
     random_state = checkpoint.get('random_state', {})
@@ -2093,8 +2101,7 @@ if __name__ == "__main__":
                         help='CMRG relation metric initialization')
     parser.add_argument('--cmrg_gate_init', type=float, default=0.0,
                         help='Initial per-layer CMRG gate')
-    parser.add_argument('--cmrg_injection_mode', choices=['all_layers'], default='all_layers',
-                        help='CMRG attention injection mode')
+    add_cmrg_injection_mode_argument(parser)
     parser.add_argument('--cmrg_factorized', action='store_true', default=True,
                         help='Keep the CMRG relation context factorized')
     parser.add_argument('--no_cmrg_factorized', action='store_false', dest='cmrg_factorized',
