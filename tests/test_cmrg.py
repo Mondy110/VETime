@@ -7,6 +7,7 @@ from model.CMRG import (
     CrossModalRelationGuider,
     RelationDistiller,
 )
+from model.cmrg_training import collect_cmrg_monitoring, configure_freeze_mode
 from model.TS_encoder.encoding_utils import (
     CustomTransformerEncoder,
     MultiheadAttentionWithRoPE,
@@ -15,7 +16,6 @@ from model.TS_encoder.encoding_utils import (
 from model.TS_encoder.ts_encoder import TimeSeriesEncoder
 from model.TS_encoder.ts_model import TS_Model
 from model.VETime import VETIME
-
 
 def test_relation_distiller_returns_relation_tokens_without_dropout():
     distiller = RelationDistiller(vision_dim=768, guide_dim=512, num_relation_tokens=16, num_heads=8)
@@ -308,3 +308,31 @@ def test_vetime_cmrg_checkpointing_preserves_vision_and_return_contract():
     assert len(returns) == 4
     assert returns[0].shape == (1, 4, 1, 2)
     assert returns[3].shape == (1, 4, 1, 2)
+
+
+def test_cmrg_monitoring_collects_zero_gate_factorized_strength_without_correction():
+    model, _ = _make_tiny_vetime(cmrg_enabled=True)
+    context = CMRGContext(
+        relation_logits=torch.tensor([[[[3.0, 4.0]]]]),
+        relation_factor=torch.tensor([[[[5.0, 12.0]]]]),
+        temporal_valid_mask=torch.ones(1, 1, dtype=torch.bool),
+    )
+
+    metrics = collect_cmrg_monitoring(model, context)
+
+    assert metrics["cmrg/alpha_0"] == 0.0
+    assert metrics["cmrg/rho_0"] == 0.0
+    assert collect_cmrg_monitoring(model, None) == {}
+
+
+def test_freeze_mode_keeps_cmrg_modules_and_gates_trainable():
+    model, _ = _make_tiny_vetime(cmrg_enabled=True)
+
+    configure_freeze_mode(model)
+
+    parameters = dict(model.named_parameters())
+    assert all(param.requires_grad for name, param in parameters.items() if "cmrg_" in name)
+    assert not parameters["ts_encoder.ts_encoder.embedding_layer.weight"].requires_grad
+    assert not parameters[
+        "ts_encoder.ts_encoder.transformer_encoder.layers.0.self_attn.q_proj.weight"
+    ].requires_grad
