@@ -1,0 +1,6 @@
+# Main experiment profile for the QueryDecoder branch.
+
+defaults:
+  - base
+  - model: query_cmrg
+  - _self_

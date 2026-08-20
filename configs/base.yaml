@@ -1,0 +1,56 @@
+# Shared defaults for the legacy QueryDecoder/CMRG training loop.
+# Override values at runtime, for example:
+#   python train_hydra.py data.batch_size=64 data.effective_batch_size=256
+
+seed: 64
+device: cuda
+
+training:
+  total_epochs: 10
+  stage1_epochs: 1
+  cls_warmup_ratio: 0.5
+  optimizer:
+    lr: 5e-4
+    weight_decay: 1e-5
+  early_stopping:
+    patience: 4
+
+data:
+  batch_size: 32
+  effective_batch_size: 256
+  num_workers: 4
+  val_ratio: 0.1
+  val_mode: split
+  dynamic_batch: false
+  max_batch_size: 64
+  padding_ratio: 1.1
+  shuffle_bucket: false
+  data_setting:
+    img_size: 224
+    T_sqrt: false
+
+model:
+  model_name: VETime-query-08-10
+  vision_name: mae_visualize_base.pth
+  ts_finetune_type: lora
+  use_vectorized_fold: true
+
+paths:
+  dataset_path: ./dataset/post_150000.pkl
+  dataset_test_dir: ./dataset/TSB-AD/Datasets/TSB-AD-U
+  file_list: ./dataset/TSB-AD/Datasets/File_List/TSB-AD-U.csv
+  ts_path: checkpoints/weight_ts/full_mask_anomaly_head_pretrain_checkpoint_best.pth
+  vision_path: ./checkpoints/weight_v
+  vetime_path: null
+  resume: null
+  pretrain_from: null
+  output_file_path: ./output/result.json
+  keep_idx_path: null
+
+# Keep relative dataset/checkpoint paths relative to the repository root.
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

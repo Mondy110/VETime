@@ -114,6 +114,27 @@ After downloading and extracting, place the datasets in the following directory 
 └── File_List/         # Evaluation split files
 ```
 
+### Hydra experiment configuration
+
+The QueryDecoder experiment branch supports a layered Hydra configuration while
+keeping the original `train.py` command line unchanged. Edit the shared values
+in `configs/base.yaml`, QueryDecoder/CMRG settings in
+`configs/model/query_cmrg.yaml`, and experiment-specific values in
+`configs/univariate.yaml`.
+
+For example, run micro-batches of 64 with an effective batch size of 256:
+
+```bash
+python train_hydra.py data.batch_size=64 data.effective_batch_size=256
+```
+
+Command-line overrides can also select staged QueryDecoder training and enable
+CMRG:
+
+```bash
+python train_hydra.py model.query_decoder_training_mode=staged model.cmrg.enabled=true
+```
+
 ---
 
 ## 📈 Evaluate Model

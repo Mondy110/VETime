@@ -1,0 +1,16 @@
+# @package model
+
+# QueryDecoder uses independent reconstruction/classification queries.
+query_decoder_training_mode: joint  # joint | staged
+
+# Cross-modal relational guidance (CMRG) controls.
+cmrg:
+  enabled: false
+  num_relation_tokens: 16
+  guide_dim: 512
+  num_heads: 8
+  metric_init: identity
+  gate_init: 0.0
+  injection_mode: all_layers  # all_layers | last_layer
+  factorized: true
+  log_interval: 100
