@@ -46,7 +46,7 @@ from model.cmrg_training import (
 )
 from Test_TSB import EarlyStopping
 from functools import partial
-import psutil  # 硬件资源监控
+from training_logging import log_batch_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
@@ -738,17 +738,17 @@ def train_univariate(args):
             if cls_warmup_active and batch_idx < cls_warmup_batches:
                 progress_bar.set_description(f"Epoch {epoch+1}[Train|CLS_Warmup]")
 
-            # ========== TensorBoard 深度监控 ==========
-            # 任务1: 记录 batch 级别的损失和学习率
-            if global_step > 0:
-                accelerator.log({
-                    "Loss/Total": batch_loss,
-                    "Loss/BCE_Anomaly": batch_loss_bce,
-                    "Loss/MSE_Recon": batch_loss_mse,
-                    "Loss/CL_Contrastive": batch_loss_cl,
-                    "Loss/Balance": batch_loss_e,
-                    "Train/LR": optimizer.param_groups[0]['lr'],
-                }, step=global_step)
+            # TensorBoard: retain scalar training metrics only.
+            log_batch_metrics(
+                accelerator.log,
+                global_step=global_step,
+                batch_loss=batch_loss,
+                batch_loss_bce=batch_loss_bce,
+                batch_loss_mse=batch_loss_mse,
+                batch_loss_cl=batch_loss_cl,
+                batch_loss_e=batch_loss_e,
+                learning_rate=optimizer.param_groups[0]['lr'],
+            )
             if (args.cmrg_enabled and global_step > 0
                     and global_step % args.cmrg_log_interval == 0):
                 cmrg_metrics = collect_cmrg_monitoring(
@@ -757,31 +757,6 @@ def train_univariate(args):
                 )
                 if cmrg_metrics:
                     accelerator.log(cmrg_metrics, step=global_step)
-
-            # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
-            if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
-                writer = accelerator.get_tracker("tensorboard").writer
-                unwrapped_model = accelerator.unwrap_model(model)
-
-                # 记录参数和梯度直方图
-                for name, param in unwrapped_model.named_parameters():
-                    if param.requires_grad:
-                        # 记录权重
-                        writer.add_histogram(f"Parameters/{name}", param.data, global_step)
-                        # 记录梯度（如果有）
-                        if param.grad is not None:
-                            writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
-
-                # 记录硬件资源利用率
-                if torch.cuda.is_available():
-                    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                    writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
-                    writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
-
-                # 记录系统 RAM
-                ram_used = psutil.virtual_memory().used / (1024 ** 3)
-                writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
             probs = torch.softmax(logits, dim=-1)[:, :, 1]
             preds = (probs > 0.5).float()
@@ -1823,17 +1798,17 @@ def train_multivariate(args, config: Dict[str, Any]):
                 total_loss_e += batch_loss_e
                 progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
 
-                # ========== TensorBoard 深度监控 ==========
-                # 任务1: 记录 batch 级别的损失和学习率
-                if global_step > 0:
-                    accelerator.log({
-                        "Loss/Total": batch_loss,
-                        "Loss/BCE_Anomaly": batch_loss_bce,
-                        "Loss/MSE_Recon": batch_loss_mse,
-                        "Loss/CL_Contrastive": batch_loss_cl,
-                        "Loss/Balance": batch_loss_e,
-                        "Train/LR": optimizer.param_groups[0]['lr'],
-                    }, step=global_step)
+                # TensorBoard: retain scalar training metrics only.
+                log_batch_metrics(
+                    accelerator.log,
+                    global_step=global_step,
+                    batch_loss=batch_loss,
+                    batch_loss_bce=batch_loss_bce,
+                    batch_loss_mse=batch_loss_mse,
+                    batch_loss_cl=batch_loss_cl,
+                    batch_loss_e=batch_loss_e,
+                    learning_rate=optimizer.param_groups[0]['lr'],
+                )
                 if (args.cmrg_enabled and global_step > 0
                         and global_step % args.cmrg_log_interval == 0):
                     cmrg_metrics = collect_cmrg_monitoring(
@@ -1842,31 +1817,6 @@ def train_multivariate(args, config: Dict[str, Any]):
                     )
                     if cmrg_metrics:
                         accelerator.log(cmrg_metrics, step=global_step)
-
-                # 任务2 & 任务3: 每 100 个 global_step 记录直方图和硬件监控
-                if global_step > 0 and global_step % 100 == 0 and accelerator.is_main_process:
-                    writer = accelerator.get_tracker("tensorboard").writer
-                    unwrapped_model = accelerator.unwrap_model(model)
-
-                    # 记录参数和梯度直方图
-                    for name, param in unwrapped_model.named_parameters():
-                        if param.requires_grad:
-                            # 记录权重
-                            writer.add_histogram(f"Parameters/{name}", param.data, global_step)
-                            # 记录梯度（如果有）
-                            if param.grad is not None:
-                                writer.add_histogram(f"Gradients/{name}", param.grad, global_step)
-
-                    # 记录硬件资源利用率
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                        writer.add_scalar("Hardware/GPU_Memory_Allocated_GB", allocated, global_step)
-                        writer.add_scalar("Hardware/GPU_Memory_Reserved_GB", reserved, global_step)
-
-                    # 记录系统 RAM
-                    ram_used = psutil.virtual_memory().used / (1024 ** 3)
-                    writer.add_scalar("Hardware/CPU_RAM_Used_GB", ram_used, global_step)
 
                 # 只在需要时计算 probs/preds，避免不必要的显存占用
                 if global_step % 10 == 0:

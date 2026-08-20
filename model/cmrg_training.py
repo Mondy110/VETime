@@ -63,17 +63,21 @@ def configure_freeze_mode(model):
 
 
 def collect_cmrg_monitoring(model, cmrg_context: Optional[CMRGContext]):
-    """Return per-layer CMRG gates and factorized correction strengths."""
+    """Return all layer gates and active-layer factorized correction strengths."""
     if not getattr(model, "cmrg_enabled", False) or cmrg_context is None:
         return {}
 
     layers = model.ts_encoder.ts_encoder.transformer_encoder.layers
     metrics = {}
     for layer_idx, layer in enumerate(layers):
-        if not getattr(layer, "cmrg_active", True):
-            continue
         alpha = layer.cmrg_alpha.detach()
         metrics[f"cmrg/alpha_{layer_idx}"] = alpha.item()
+
+        # Inactive layers (e.g. last-layer injection) still expose their gate,
+        # but do not receive CMRG context and therefore have no meaningful rho.
+        if not getattr(layer, "cmrg_active", True):
+            continue
+
         numerator = cmrg_context.frobenius_strength(alpha)
         qk_frobenius = getattr(layer.self_attn, "cmrg_qk_frobenius", None)
         if qk_frobenius is None:
