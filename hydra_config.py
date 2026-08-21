@@ -29,6 +29,8 @@ def namespace_from_config(config: Mapping[str, Any]) -> Namespace:
         batch_size=_get(config, "data.batch_size", 32),
         effective_batch_size=_get(config, "data.effective_batch_size", 256),
         num_workers=_get(config, "data.num_workers", 5),
+        tsb_postprocess_workers=_get(config, "evaluation.postprocess_workers", 4),
+        tsb_worker_cpu_threads=_get(config, "evaluation.cpu_threads_per_worker", 1),
         dynamic_batch=_get(config, "data.dynamic_batch", False),
         max_batch_size=_get(config, "data.max_batch_size", 256),
         padding_ratio=_get(config, "data.padding_ratio", 1.5),

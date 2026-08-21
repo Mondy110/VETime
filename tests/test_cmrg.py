@@ -1,5 +1,6 @@
 import argparse
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -374,6 +375,35 @@ def test_cmrg_monitoring_collects_zero_gate_factorized_strength_without_correcti
     assert metrics["cmrg/alpha_0"] == 0.0
     assert metrics["cmrg/rho_0"] == 0.0
     assert collect_cmrg_monitoring(model, None) == {}
+
+
+def test_cmrg_monitoring_reports_gates_for_inactive_layers():
+    """Last-layer injection must still expose every layer's gate in TensorBoard."""
+    encoder = CustomTransformerEncoder(
+        d_model=4,
+        nhead=2,
+        dim_feedforward=8,
+        dropout=0.0,
+        activation="gelu",
+        num_layers=2,
+        num_features=1,
+        use_lora=False,
+        cmrg_injection_mode="last_layer",
+    )
+    encoder.layers[0].cmrg_alpha.data.fill_(0.25)
+    encoder.layers[1].cmrg_alpha.data.fill_(0.75)
+    model = SimpleNamespace(
+        cmrg_enabled=True,
+        ts_encoder=SimpleNamespace(
+            ts_encoder=SimpleNamespace(transformer_encoder=encoder)
+        ),
+    )
+
+    metrics = collect_cmrg_monitoring(model, _cmrg_context())
+
+    assert metrics["cmrg/alpha_0"] == 0.25
+    assert metrics["cmrg/alpha_1"] == 0.75
+    assert "cmrg/rho_0" not in metrics
 
 
 def test_cmrg_monitoring_reports_factorized_relative_qk_strength():

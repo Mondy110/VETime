@@ -46,7 +46,7 @@ from model.cmrg_training import (
 )
 from Test_TSB import EarlyStopping
 from functools import partial
-from training_logging import log_batch_metrics
+from training_logging import DeferredLossMetrics, log_batch_metrics
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
@@ -582,11 +582,7 @@ def train_univariate(args):
             print(f"  已冻结: 视觉编码器、时序编码器(含LoRA)、重构头、重构专家、共享mlp_m、fusion 等")
 
         model.train()
-        total_loss = 0
-        total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
-        total_loss_mse = 0  # 重建损失 (MSE)
-        total_loss_cl = 0   # 对比学习损失
-        total_loss_e = 0    # 门控平衡损失 (Expert Balance)
+        loss_metrics = DeferredLossMetrics()
         all_probs, all_preds, all_labels = [], [], []
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]", disable=not accelerator.is_local_main_process)
@@ -602,7 +598,9 @@ def train_univariate(args):
             labels = batch["labels"]
             images = batch["image"]  # (B, C, H, W)
             time_series, att_mask = batch['time_series'], batch['attention_mask']
-            mask = batch['mask']
+            # Legacy masked-input feature; disabled in dataloader because the
+            # current Query/CMRG forward path does not consume it.
+            # mask = batch['mask']
             period = batch['period']
             p_value = batch['padding_value']
 
@@ -613,10 +611,10 @@ def train_univariate(args):
                 data_splits = model.split_data(images, time_series, att_mask, labels)
                 loss1 = 0
                 loss2 = 0
-                batch_loss_bce = 0
-                batch_loss_mse = 0
-                batch_loss_cl = 0
-                batch_loss_e = 0
+                batch_loss_bce = torch.zeros((), device=device)
+                batch_loss_mse = torch.zeros((), device=device)
+                batch_loss_cl = torch.zeros((), device=device)
+                batch_loss_e = torch.zeros((), device=device)
                 logits_list = []
                 for data_part in data_splits:
                     img_part, ts_part, att_mask_part, label_part = data_part
@@ -639,7 +637,7 @@ def train_univariate(args):
                         else:
                             batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                     else:
-                        batch_loss_e_part = 0.0
+                        batch_loss_e_part = torch.zeros((), device=device)
 
                     # ========== 两阶段训练范式：异常分类损失 ==========
                     # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
@@ -648,10 +646,10 @@ def train_univariate(args):
                         loss01 = torch.tensor(0.0, device=device)
 
                     # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
-                    batch_loss_bce += loss01.item()
-                    batch_loss_mse += loss02.item()
-                    batch_loss_cl += (0.1 * loss_cl).item()
-                    batch_loss_e += batch_loss_e_part if isinstance(batch_loss_e_part, float) else batch_loss_e_part.item()
+                    batch_loss_bce += loss01.detach()
+                    batch_loss_mse += loss02.detach()
+                    batch_loss_cl += (0.1 * loss_cl).detach()
+                    batch_loss_e += batch_loss_e_part.detach()
 
                     # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
                     loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
@@ -701,16 +699,17 @@ def train_univariate(args):
                 loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
 
                 # 提取纯数值用于打 log
-                batch_loss_bce = loss1.item()
-                batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
-                batch_loss_cl = (0.1 * loss_cl).item()
-                batch_loss_e = loss_e_tensor.item() if hasattr(loss_e_tensor, 'item') else 0.0
+                batch_loss_bce = loss1.detach()
+                batch_loss_mse = loss_recon.detach()  # 记录原始未缩放的重构损失
+                batch_loss_cl = (0.1 * loss_cl).detach()
+                batch_loss_e = loss_e_tensor.detach()
 
             # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
             accelerator.backward(loss1 + loss2)
 
             # 梯度累积：按样本数触发反向传播
             current_bs = labels.shape[0]
+            did_optimizer_step = False
             if args.dynamic_batch:
                 accumulated_samples += current_bs
                 if accumulated_samples >= args.effective_batch_size:
@@ -720,6 +719,7 @@ def train_univariate(args):
                     optimizer.zero_grad()
                     global_step += 1
                     accumulated_samples = 0
+                    did_optimizer_step = True
             else:
                 global_step += 1
                 if global_step % accelerator.gradient_accumulation_steps == 0:
@@ -727,28 +727,31 @@ def train_univariate(args):
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+                    did_optimizer_step = True
 
-            batch_loss = loss1.item() + loss2.item()
-            total_loss += batch_loss
-            total_loss_bce += batch_loss_bce
-            total_loss_mse += batch_loss_mse
-            total_loss_cl += batch_loss_cl
-            total_loss_e += batch_loss_e
-            progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
+            loss_metrics.add(
+                total=(loss1 + loss2).detach(),
+                bce=batch_loss_bce,
+                mse=batch_loss_mse,
+                cl=batch_loss_cl,
+                balance=batch_loss_e,
+            )
+            if did_optimizer_step:
+                update_metrics = loss_metrics.consume_update_average()
+                progress_bar.set_postfix({"Tot": f"{update_metrics['total']:.3f}", "BCE": f"{update_metrics['bce']:.3f}", "MSE": f"{update_metrics['mse']:.3f}", "CL": f"{update_metrics['cl']:.3f}", "Bal": f"{update_metrics['balance']:.4f}"})
+                log_batch_metrics(
+                    accelerator.log,
+                    global_step=global_step,
+                    batch_loss=update_metrics["total"],
+                    batch_loss_bce=update_metrics["bce"],
+                    batch_loss_mse=update_metrics["mse"],
+                    batch_loss_cl=update_metrics["cl"],
+                    batch_loss_e=update_metrics["balance"],
+                    learning_rate=optimizer.param_groups[0]['lr'],
+                )
             if cls_warmup_active and batch_idx < cls_warmup_batches:
                 progress_bar.set_description(f"Epoch {epoch+1}[Train|CLS_Warmup]")
 
-            # TensorBoard: retain scalar training metrics only.
-            log_batch_metrics(
-                accelerator.log,
-                global_step=global_step,
-                batch_loss=batch_loss,
-                batch_loss_bce=batch_loss_bce,
-                batch_loss_mse=batch_loss_mse,
-                batch_loss_cl=batch_loss_cl,
-                batch_loss_e=batch_loss_e,
-                learning_rate=optimizer.param_groups[0]['lr'],
-            )
             if (args.cmrg_enabled and global_step > 0
                     and global_step % args.cmrg_log_interval == 0):
                 cmrg_metrics = collect_cmrg_monitoring(
@@ -770,7 +773,9 @@ def train_univariate(args):
 
             # 清理变量
             del images_folded, logits, loss1, probs, preds, labels, loss2
-            del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+            # Legacy cleanup when ``mask = batch['mask']`` is restored:
+            # del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+            del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, period, p_value
             del images, time_series, att_mask, init_img_size
 
         # epoch 结束时 flush 剩余梯度
@@ -811,11 +816,12 @@ def train_univariate(args):
             # 防御性代码：如果因为某些原因没采样到数据，给个空字典防止后面报错
             train_metrics = {}
 
-        avg_train_loss = total_loss / len(train_loader)
-        avg_loss_bce = total_loss_bce / len(train_loader)
-        avg_loss_mse = total_loss_mse / len(train_loader)
-        avg_loss_cl = total_loss_cl / len(train_loader)
-        avg_loss_e = total_loss_e / len(train_loader)
+        epoch_metrics = loss_metrics.epoch_average()
+        avg_train_loss = epoch_metrics["total"]
+        avg_loss_bce = epoch_metrics["bce"]
+        avg_loss_mse = epoch_metrics["mse"]
+        avg_loss_cl = epoch_metrics["cl"]
+        avg_loss_e = epoch_metrics["balance"]
 
         accelerator.log({
             "epoch_train_loss": avg_train_loss,
@@ -856,7 +862,9 @@ def train_univariate(args):
             if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
                 model.eval()
                 avg_tsb_val_loss = TSB_test(model, args, args.data_setting, device,
-                                            dataset_setting=PASS_LIST, verbose=False)
+                                            dataset_setting=PASS_LIST, verbose=False,
+                                            postprocess_workers=args.tsb_postprocess_workers,
+                                            cpu_threads_per_worker=args.tsb_worker_cpu_threads)
                 gc.collect()
                 torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()
@@ -891,7 +899,9 @@ def train_univariate(args):
             if (epoch + 1) % 2 == 0 or epoch == epochs - 1:
                 model.eval()
                 avg_val_loss = TSB_test(model, args, args.data_setting, device,
-                                        dataset_setting=PASS_LIST, verbose=False)
+                                        dataset_setting=PASS_LIST, verbose=False,
+                                        postprocess_workers=args.tsb_postprocess_workers,
+                                        cpu_threads_per_worker=args.tsb_worker_cpu_threads)
                 gc.collect()
                 torch.cuda.empty_cache()
                 accelerator.wait_for_everyone()
@@ -952,7 +962,11 @@ def train_univariate(args):
             unwrapped_model = accelerator.unwrap_model(model)
             unwrapped_model.load_state_dict(torch.load(best_model_path, map_location='cpu', weights_only=False))
 
-    loss_all = TSB_test(model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False)
+    loss_all = TSB_test(
+        model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False,
+        postprocess_workers=args.tsb_postprocess_workers,
+        cpu_threads_per_worker=args.tsb_worker_cpu_threads,
+    )
     print(f"Final TSB validation loss: {loss_all}")
     accelerator.end_training()
     logger.info("Training completed!")
@@ -1651,11 +1665,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                 reserved = torch.cuda.memory_reserved() / 1024**3
                 print(f"[显存监控] Epoch {epoch+1} 开始: 已分配 {allocated:.2f} GB, 已保留 {reserved:.2f} GB")
 
-            total_loss = 0
-            total_loss_bce = 0  # 分类损失 (Binary Cross Entropy)
-            total_loss_mse = 0  # 重建损失 (MSE)
-            total_loss_cl = 0   # 对比学习损失
-            total_loss_e = 0    # 门控平衡损失 (Expert Balance)
+            loss_metrics = DeferredLossMetrics()
             all_probs, all_preds, all_labels = [], [], []
 
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}[Train]",
@@ -1665,7 +1675,9 @@ def train_multivariate(args, config: Dict[str, Any]):
                 labels = batch["labels"]
                 images = batch["image"]
                 time_series, att_mask = batch['time_series'], batch['attention_mask']
-                mask = batch['mask']
+                # Legacy masked-input feature; disabled in dataloader because the
+                # current Query/CMRG forward path does not consume it.
+                # mask = batch['mask']
                 period = batch['period']
                 p_value = batch['padding_value']
                 # 【新增】定义重构损失的缩放系数，大象的体重缩水 20 倍
@@ -1675,10 +1687,10 @@ def train_multivariate(args, config: Dict[str, Any]):
                     data_splits = model.split_data(images, time_series, att_mask, labels)
                     loss1 = 0
                     loss2 = 0
-                    batch_loss_bce = 0
-                    batch_loss_mse = 0
-                    batch_loss_cl = 0
-                    batch_loss_e = 0
+                    batch_loss_bce = torch.zeros((), device=device)
+                    batch_loss_mse = torch.zeros((), device=device)
+                    batch_loss_cl = torch.zeros((), device=device)
+                    batch_loss_e = torch.zeros((), device=device)
                     logits_list = []
                     for data_part in data_splits:
                         img_part, ts_part, att_mask_part, label_part = data_part
@@ -1701,7 +1713,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                             else:
                                 batch_loss_e_part = 0.01 * 0.5 * (load_balance_loss(m_w[0]) + load_balance_loss(m_w[1]))
                         else:
-                            batch_loss_e_part = 0.0
+                            batch_loss_e_part = torch.zeros((), device=device)
 
                         # ========== 两阶段训练范式：异常分类损失 ==========
                         # 阶段1: 强制切断，loss01 归零（脱离异常分类头的梯度）
@@ -1710,10 +1722,10 @@ def train_multivariate(args, config: Dict[str, Any]):
                             loss01 = torch.tensor(0.0, device=device)
 
                         # 记录未缩放的原始数值用于 log 打印 (方便你和之前的实验对比)
-                        batch_loss_bce += loss01.item()
-                        batch_loss_mse += loss02.item()
-                        batch_loss_cl += (0.1 * loss_cl).item()
-                        batch_loss_e += batch_loss_e_part if isinstance(batch_loss_e_part, float) else batch_loss_e_part.item()
+                        batch_loss_bce += loss01.detach()
+                        batch_loss_mse += loss02.detach()
+                        batch_loss_cl += (0.1 * loss_cl).detach()
+                        batch_loss_e += batch_loss_e_part.detach()
 
                         # 【核心修改】只对 loss02 乘 alpha_recon，其他 Loss 保持原样！
                         loss2 = loss2 + (alpha_recon * loss02) + 0.1 * loss_cl + batch_loss_e_part
@@ -1763,16 +1775,17 @@ def train_multivariate(args, config: Dict[str, Any]):
                     loss2 = (alpha_recon * loss_recon) + loss_e_tensor + 0.1 * loss_cl
 
                     # 提取纯数值用于打 log
-                    batch_loss_bce = loss1.item()
-                    batch_loss_mse = loss_recon.item()  # 记录原始未缩放的重构损失
-                    batch_loss_cl = (0.1 * loss_cl).item()
-                    batch_loss_e = loss_e_tensor.item() if hasattr(loss_e_tensor, 'item') else 0.0
+                    batch_loss_bce = loss1.detach()
+                    batch_loss_mse = loss_recon.detach()  # 记录原始未缩放的重构损失
+                    batch_loss_cl = (0.1 * loss_cl).detach()
+                    batch_loss_e = loss_e_tensor.detach()
 
                 # 最终反向传播：稳定的 BCE 分类 + 经过合理缩放后的 loss2 (包含降权的重构 + 对比 + 负载均衡)
                 accelerator.backward(loss1 + loss2)
 
                 # 梯度累积：按样本数触发反向传播
                 current_bs = labels.shape[0]
+                did_optimizer_step = False
                 if args.dynamic_batch:
                     accumulated_samples += current_bs
                     if accumulated_samples >= target_effective_bs:
@@ -1782,6 +1795,7 @@ def train_multivariate(args, config: Dict[str, Any]):
                         optimizer.zero_grad()
                         global_step += 1
                         accumulated_samples = 0
+                        did_optimizer_step = True
                 else:
                     global_step += 1
                     if global_step % accelerator.gradient_accumulation_steps == 0:
@@ -1789,26 +1803,28 @@ def train_multivariate(args, config: Dict[str, Any]):
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad()
+                        did_optimizer_step = True
 
-                batch_loss = loss1.item() + loss2.item()
-                total_loss += batch_loss
-                total_loss_bce += batch_loss_bce
-                total_loss_mse += batch_loss_mse
-                total_loss_cl += batch_loss_cl
-                total_loss_e += batch_loss_e
-                progress_bar.set_postfix({"Tot": f"{batch_loss:.3f}", "BCE": f"{batch_loss_bce:.3f}", "MSE": f"{batch_loss_mse:.3f}", "CL": f"{batch_loss_cl:.3f}", "Bal": f"{batch_loss_e:.4f}"})
-
-                # TensorBoard: retain scalar training metrics only.
-                log_batch_metrics(
-                    accelerator.log,
-                    global_step=global_step,
-                    batch_loss=batch_loss,
-                    batch_loss_bce=batch_loss_bce,
-                    batch_loss_mse=batch_loss_mse,
-                    batch_loss_cl=batch_loss_cl,
-                    batch_loss_e=batch_loss_e,
-                    learning_rate=optimizer.param_groups[0]['lr'],
+                loss_metrics.add(
+                    total=(loss1 + loss2).detach(),
+                    bce=batch_loss_bce,
+                    mse=batch_loss_mse,
+                    cl=batch_loss_cl,
+                    balance=batch_loss_e,
                 )
+                if did_optimizer_step:
+                    update_metrics = loss_metrics.consume_update_average()
+                    progress_bar.set_postfix({"Tot": f"{update_metrics['total']:.3f}", "BCE": f"{update_metrics['bce']:.3f}", "MSE": f"{update_metrics['mse']:.3f}", "CL": f"{update_metrics['cl']:.3f}", "Bal": f"{update_metrics['balance']:.4f}"})
+                    log_batch_metrics(
+                        accelerator.log,
+                        global_step=global_step,
+                        batch_loss=update_metrics["total"],
+                        batch_loss_bce=update_metrics["bce"],
+                        batch_loss_mse=update_metrics["mse"],
+                        batch_loss_cl=update_metrics["cl"],
+                        batch_loss_e=update_metrics["balance"],
+                        learning_rate=optimizer.param_groups[0]['lr'],
+                    )
                 if (args.cmrg_enabled and global_step > 0
                         and global_step % args.cmrg_log_interval == 0):
                     cmrg_metrics = collect_cmrg_monitoring(
@@ -1835,7 +1851,9 @@ def train_multivariate(args, config: Dict[str, Any]):
                     del labels
 
                 del images_folded, logits, loss1, loss2
-                del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+                # Legacy cleanup when ``mask = batch['mask']`` is restored:
+                # del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, mask, period, p_value
+                del local_embeddings1, local_embeddings2, m_w, loss_cl, rec, period, p_value
                 del images, time_series, att_mask, init_img_size
 
                 # 定期显存监控
@@ -1866,11 +1884,12 @@ def train_multivariate(args, config: Dict[str, Any]):
             else:
                 train_metrics = {}
 
-            avg_train_loss = total_loss / len(train_loader)
-            avg_loss_bce = total_loss_bce / len(train_loader)
-            avg_loss_mse = total_loss_mse / len(train_loader)
-            avg_loss_cl = total_loss_cl / len(train_loader)
-            avg_loss_e = total_loss_e / len(train_loader)
+            epoch_metrics = loss_metrics.epoch_average()
+            avg_train_loss = epoch_metrics["total"]
+            avg_loss_bce = epoch_metrics["bce"]
+            avg_loss_mse = epoch_metrics["mse"]
+            avg_loss_cl = epoch_metrics["cl"]
+            avg_loss_e = epoch_metrics["balance"]
 
             accelerator.log({
                 "epoch_train_loss": avg_train_loss,
@@ -2002,6 +2021,10 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=64, help='Random seed')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size (paper: 32)')
     parser.add_argument('--num_workers', type=int, default=5, help='Number of data loader workers')
+    parser.add_argument('--tsb_postprocess_workers', type=int, default=4,
+                        help='CPU processes for TSB metric post-processing (independent of DataLoader workers)')
+    parser.add_argument('--tsb_worker_cpu_threads', type=int, default=1,
+                        help='PyTorch CPU threads allowed inside each TSB post-process worker')
     parser.add_argument('--effective_batch_size', type=int, default=256,
                         help='梯度累积的目标有效 batch size，每累积这么多样本就反向传播一次 (默认: 128)')
     parser.add_argument('--dynamic_batch', action='store_true', default=False,

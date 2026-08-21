@@ -3,6 +3,61 @@
 from typing import Callable, Mapping, Any
 
 
+class DeferredLossMetrics:
+    """Accumulate detached scalar tensors and materialize them only at log boundaries."""
+
+    _NAMES = ("total", "bce", "mse", "cl", "balance")
+
+    def __init__(self) -> None:
+        self._epoch_sums = None
+        self._epoch_count = 0
+        self._window_sums = None
+        self._window_count = 0
+
+    def add(self, *, total: Any, bce: Any, mse: Any, cl: Any, balance: Any) -> None:
+        values = {
+            "total": total.detach(),
+            "bce": bce.detach(),
+            "mse": mse.detach(),
+            "cl": cl.detach(),
+            "balance": balance.detach(),
+        }
+        if self._epoch_sums is None:
+            self._epoch_sums = {name: values[name].clone() for name in self._NAMES}
+            self._window_sums = {name: values[name].clone() for name in self._NAMES}
+        else:
+            for name in self._NAMES:
+                self._epoch_sums[name] += values[name]
+            if self._window_sums is None:
+                self._window_sums = {name: values[name].clone() for name in self._NAMES}
+            else:
+                for name in self._NAMES:
+                    self._window_sums[name] += values[name]
+        self._epoch_count += 1
+        self._window_count += 1
+
+    def consume_update_average(self):
+        """Return one CPU scalar snapshot per optimizer update, then reset its window."""
+        if self._window_count == 0:
+            return None
+        averages = {
+            name: (self._window_sums[name] / self._window_count).item()
+            for name in self._NAMES
+        }
+        self._window_sums = None
+        self._window_count = 0
+        return averages
+
+    def epoch_average(self):
+        """Materialize the full-epoch mean only after the epoch has finished."""
+        if self._epoch_count == 0:
+            return {name: 0.0 for name in self._NAMES}
+        return {
+            name: (self._epoch_sums[name] / self._epoch_count).item()
+            for name in self._NAMES
+        }
+
+
 def log_batch_metrics(
     log_fn: Callable[[Mapping[str, Any], int], None],
     *,

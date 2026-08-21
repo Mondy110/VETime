@@ -14,6 +14,65 @@ import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 vision_PATH = os.path.join(BASE_DIR, 'checkpoints', 'weight_v')
 
+
+def _unfold_image_loop(x0, size, patch_size):
+    """Reference implementation kept for non-uniform per-sample fold layouts."""
+    B, L, D = x0.shape
+    recovered_list = []
+    for i in range(B):
+        x = x0[i]
+        init_h, init_w, pad, image_size, num_features = map(int, size[i])
+        h = w = image_size // patch_size
+        assert h * w == L
+        output = x.transpose(0, 1).view(D, h, w)
+        output = F.adaptive_avg_pool2d(output.unsqueeze(0), (init_h * num_features, w)).squeeze(0)
+        output_up = F.interpolate(
+            output.unsqueeze(0),
+            size=(init_h * num_features, init_w),
+            mode='bilinear',
+            align_corners=False,
+        ).squeeze(0)
+        patches = []
+        for j in range(num_features):
+            patch = output_up[:, init_h * j:init_h * (j + 1), :].view(D, -1).contiguous()
+            if pad > 0:
+                patch = patch[:, :-pad]
+            patches.append(patch)
+        recovered_list.append(torch.cat(patches, dim=-1).transpose(0, 1))
+    return torch.stack(recovered_list)
+
+
+def _unfold_image_vectorized(x0, size, patch_size):
+    """Batch equivalent of ``_unfold_image_loop`` for one shared fold layout."""
+    B, L, D = x0.shape
+    if not size:
+        raise ValueError("size must contain one fold layout per sample")
+
+    layout = tuple(map(int, size[0]))
+    if any(tuple(map(int, sample_size)) != layout for sample_size in size[1:]):
+        raise ValueError("Vectorized unfold requires identical fold layouts within a batch")
+
+    init_h, init_w, pad, image_size, num_features = layout
+    h = w = image_size // patch_size
+    assert h * w == L
+
+    # The reference path applies these operations independently per sample.
+    # Neither operation reduces across B, so retaining B is mathematically equivalent.
+    output = x0.transpose(1, 2).reshape(B, D, h, w)
+    output = F.adaptive_avg_pool2d(output, (init_h * num_features, w))
+    output_up = F.interpolate(
+        output,
+        size=(init_h * num_features, init_w),
+        mode='bilinear',
+        align_corners=False,
+    )
+
+    patches = output_up.reshape(B, D, num_features, init_h * init_w)
+    if pad > 0:
+        patches = patches[:, :, :, :-pad]
+    return patches.reshape(B, D, -1).transpose(1, 2).contiguous()
+
+
 class V_model(nn.Module):
     def __init__(self, vision_name=None, unpatch=True, MAX_L=5000, finetune_type='none',
                  use_vectorized_fold=False, **kwargs):
@@ -216,35 +275,15 @@ class V_model(nn.Module):
         return img_final, results_size_out
 
     def unfold_image(self, x0,size):
-        B, L, D = x0.shape
-        
-        recovered_list = []
-        for i in range(B):
-            x = x0[i]
-            init_h,init_w,pad,h,Num = map(int, size[i])
-            w=h = h//self.patch_size
-            
-            assert h * w == L
-            output = x.transpose(0, 1).view(D, h, w)
-            output = F.adaptive_avg_pool2d(output.unsqueeze(0), (init_h*Num, w)).squeeze(0)
-
-            output_up = F.interpolate(
-                output.unsqueeze(0), 
-                size=(init_h*Num, init_w), 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(0)
-            patches=[]
-            for j in range(Num):
-                patch=output_up[:, init_h*j:init_h*(j+1), :].view(D, -1).contiguous()
-                if pad>0:
-                    patch = patch[:,:-pad]
-                patches.append(patch)
-            unfold = torch.cat(patches, dim=-1).transpose(0, 1)
-            
-            recovered_list.append(unfold)
-        recovered_list = torch.stack(recovered_list)
-        return recovered_list
+        # Vectorized folding generates one shared layout for the whole batch.
+        # Period-based legacy folding may generate different layouts, so it
+        # deliberately retains the reference implementation as a fallback.
+        if self.use_vectorized_fold:
+            try:
+                return _unfold_image_vectorized(x0, size, self.patch_size)
+            except ValueError:
+                pass
+        return _unfold_image_loop(x0, size, self.patch_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """

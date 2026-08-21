@@ -151,9 +151,9 @@ class AnomalyDataset(Dataset):
             idx: Index of the sample to retrieve.
 
         Returns:
-            A tuple containing:
+            A tuple containing the tensors consumed by the current Query/CMRG
+            training path:
                 - time_series: Time series data as float32 tensor (L, C)
-                - normal_time_series: Normal reference time series (L, C)
                 - image: Image representation as float32 tensor (3, H, W)
                 - labels: Anomaly labels as long tensor (L,)
                 - attribute: Metadata dictionary
@@ -163,12 +163,17 @@ class AnomalyDataset(Dataset):
         sample = self.data[idx]
         img_tensor = torch.tensor(sample['image'], dtype=torch.float32)
         time_series = torch.tensor(sample['time_series'], dtype=torch.float32)
-        normal_time_series = torch.tensor(sample['normal_time_series'], dtype=torch.float32)
+        # Legacy self-supervised branch (currently unused by Query/CMRG training).
+        # Keep this conversion here as a restoration reference if a future model
+        # consumes ``normal_time_series`` again.
+        # normal_time_series = torch.tensor(sample['normal_time_series'], dtype=torch.float32)
         labels = torch.tensor(sample['labels'], dtype=torch.long)
         attribute = sample['attribute']
         period = sample['period']
         padding_value = torch.tensor(sample['padding_value'], dtype=torch.float32)
-        return time_series, normal_time_series, img_tensor, labels, attribute, period, padding_value
+        # Legacy return contract, retained for future masked/normal-reference models:
+        # return time_series, normal_time_series, img_tensor, labels, attribute, period, padding_value
+        return time_series, img_tensor, labels, attribute, period, padding_value
 
 
 def collate_fn(
@@ -186,18 +191,13 @@ def collate_fn(
     5. Pads images to match the target width
 
     Args:
-        batch: List of samples from AnomalyDataset.__getitem__. Each sample is
-               a tuple of (time_series, normal_time_series, img_tensor, labels,
-               attribute, period, padding_value).
+        batch: List of current Query/CMRG samples from AnomalyDataset.__getitem__.
         patch_size: Size of patches for masking and padding alignment.
 
     Returns:
         A dictionary containing:
             - 'time_series': Padded time series tensor (B, L_max, C)
-            - 'normal_time_series': Padded normal reference tensor (B, L_max, C)
-            - 'mask_time_series': Time series with random patches masked (B, L_max, C)
             - 'image': Padded image tensor (B, 3, H, W_max)
-            - 'mask': Boolean mask indicating masked positions (B, L_max)
             - 'labels': Padded label tensor (B, L_max) with -1 for padding
             - 'attention_mask': Boolean mask for valid positions (B, L_max)
             - 'period': Tuple of periods for each sample in batch
@@ -206,22 +206,31 @@ def collate_fn(
     Note:
         - Time series are normalized using batch-wide statistics
         - Labels are padded with -1 (ignored in loss computation)
-        - Random masking applies mask_ratio=0.3 to valid sequence regions only
+        - Legacy normal-reference and random-masking outputs are retained as
+          comments below for future self-supervised variants.
     """
-    time_series_list, normal_time_series_list, img_tensor, labels_list, attribute_list, period, padding_value = zip(*batch)
+    # Legacy masked/normal-reference return contract:
+    # time_series_list, normal_time_series_list, img_tensor, labels_list, attribute_list, period, padding_value = zip(*batch)
+    time_series_list, img_tensor, labels_list, attribute_list, period, padding_value = zip(*batch)
+
+    # Legacy masked/normal-reference preprocessing is deliberately disabled for
+    # the current Query/CMRG path.  train.py never consumes these tensors, so
+    # producing them would add CPU work and host-to-device transfer without
+    # changing the training result.  Restore this block together with the
+    # legacy __getitem__ return contract when a future model needs it.
     
     if time_series_list[0].ndim == 1:
         time_series_tensors = [ts.unsqueeze(-1) for ts in time_series_list]
-        normal_time_series_tensors = [nts.unsqueeze(-1) for nts in normal_time_series_list]
+        # normal_time_series_tensors = [nts.unsqueeze(-1) for nts in normal_time_series_list]
     else:
         time_series_tensors = [ts for ts in time_series_list]
-        normal_time_series_tensors = [nts for nts in normal_time_series_list]
+        # normal_time_series_tensors = [nts for nts in normal_time_series_list]
 
     concatenated = torch.cat(time_series_tensors, dim=0)
     mean = concatenated.mean(dim=0, keepdim=True)
     std = concatenated.std(dim=0, keepdim=True) + 1e-4
     time_series_tensors = [(ts - mean) / std for ts in time_series_tensors]
-    normal_time_series_tensors = [(nts - mean) / std for nts in normal_time_series_tensors]
+    # normal_time_series_tensors = [(nts - mean) / std for nts in normal_time_series_tensors]
 
     labels = [label for label in labels_list]
     lengths = [t.size(0) for t in labels]
@@ -238,7 +247,7 @@ def collate_fn(
         return torch.nn.utils.rnn.pad_sequence(list0, batch_first=True, padding_value=value)
 
     padded_time_series = padding_to_target_length(time_series_tensors, 0.0)
-    normal_time_series_tensors = padding_to_target_length(normal_time_series_tensors, 0.0)
+    # normal_time_series_tensors = padding_to_target_length(normal_time_series_tensors, 0.0)
     padded_labels = padding_to_target_length(labels, -1)
 
     image_inputs = image_right_padding(img_tensor, target_length, padding_value)
@@ -249,15 +258,15 @@ def collate_fn(
     for i, length in enumerate(sequence_lengths):
         attention_mask[i, length:] = False
 
-    mask_time_series, mask = create_random_mask(padded_time_series, attention_mask, patch_size)
-    normal_time_series_tensors, mask = create_random_mask(normal_time_series_tensors, attention_mask, patch_size)
+    # mask_time_series, mask = create_random_mask(padded_time_series, attention_mask, patch_size)
+    # normal_time_series_tensors, mask = create_random_mask(normal_time_series_tensors, attention_mask, patch_size)
 
     return {
         'time_series': padded_time_series,
-        'normal_time_series': normal_time_series_tensors,
-        'mask_time_series': mask_time_series,
         'image': image_inputs,
-        'mask': mask,
+        # 'normal_time_series': normal_time_series_tensors,
+        # 'mask_time_series': mask_time_series,
+        # 'mask': mask,
         'labels': padded_labels,
         'attention_mask': attention_mask,
         'period': period,

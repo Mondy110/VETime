@@ -29,6 +29,12 @@ data:
     img_size: 224
     T_sqrt: false
 
+# CPU-only TSB-AD metric post-processing.  This is intentionally separate
+# from data.num_workers, which controls DataLoader workers during training.
+evaluation:
+  postprocess_workers: 4
+  cpu_threads_per_worker: 1
+
 model:
   model_name: VETime-query-08-10
   vision_name: mae_visualize_base.pth

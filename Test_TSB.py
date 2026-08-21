@@ -28,6 +28,11 @@ from model.TS_encoder.config import default_config_t
 from model.TS_encoder.ts_model import TS_Model
 from model.VETime import VETIME
 from model.Vision_encoder.V_encoder import V_model
+from postprocess_runtime import (
+    configure_postprocess_worker,
+    postprocess_thread_limits,
+    resolve_postprocess_workers,
+)
 
 SEED = 2024
 torch.manual_seed(SEED)
@@ -194,7 +199,9 @@ def TSB_test(
     dataset_setting=PASS_LIST,
     use_list=None,
     for_m=False,
-    verbose=True
+    verbose=True,
+    postprocess_workers=None,
+    cpu_threads_per_worker=1,
 ):
     import os
     import time
@@ -280,7 +287,11 @@ def TSB_test(
     log_df = pd.DataFrame(runtime_log)
     csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}.csv')
     log_df.to_csv(csv_save_path, index=False)
-    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list, verbose=verbose)
+    avg_f1 = TSB_test_parallel_postprocess(
+        args_test, data_setting, dataset_setting, use_list, verbose=verbose,
+        num_workers=postprocess_workers,
+        cpu_threads_per_worker=cpu_threads_per_worker,
+    )
     return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
 def TSB_test_multivariate(
@@ -291,7 +302,9 @@ def TSB_test_multivariate(
     device='cuda:0',
     dataset_setting=PASS_LIST_MULTI,
     use_list=None,
-    verbose=True
+    verbose=True,
+    postprocess_workers=None,
+    cpu_threads_per_worker=1,
 ):
     """
     多变量数据集测试函数
@@ -410,7 +423,11 @@ def TSB_test_multivariate(
     csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}_multi.csv')
     log_df.to_csv(csv_save_path, index=False)
 
-    avg_f1 = TSB_test_parallel_postprocess(args_test, data_setting, dataset_setting, use_list, verbose=verbose)
+    avg_f1 = TSB_test_parallel_postprocess(
+        args_test, data_setting, dataset_setting, use_list, verbose=verbose,
+        num_workers=postprocess_workers,
+        cpu_threads_per_worker=cpu_threads_per_worker,
+    )
     return 1.0 - avg_f1
 
 def _process_single_result_file(args):
@@ -447,6 +464,7 @@ def TSB_test_parallel_postprocess(
     dataset_setting=PASS_LIST,
     use_list=None,
     num_workers=None,
+    cpu_threads_per_worker=1,
     verbose=True
 ):
     # 如果没有提供 use_list，使用全局的 USE_LIST
@@ -475,22 +493,29 @@ def TSB_test_parallel_postprocess(
 
     results = []
     ctx = mp.get_context('spawn')
-    # 动态 worker: 未指定时取 cpu_count - 2 (留 2 核给系统/主进程)
+    # Keep file-level parallelism independent from training DataLoader workers.
     cpu_cnt = mp.cpu_count()
-    if num_workers is None:
-        safe_workers = max(1, cpu_cnt - 2)
-    else:
-        safe_workers = min(num_workers, max(1, cpu_cnt - 2))
+    safe_workers = resolve_postprocess_workers(num_workers, cpu_count=cpu_cnt)
     if verbose:
-        print(f"[INFO] CPU cores: {cpu_cnt}, using {safe_workers} workers for post-processing")
-    with ProcessPoolExecutor(max_workers=safe_workers, mp_context=ctx) as executor:
-        futures = [executor.submit(_process_single_result_file, task) for task in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
-            res = future.result()
-            if res:
-                results.append(res)
-            del res, future
-            gc.collect()
+        print(
+            f"[INFO] CPU cores: {cpu_cnt}, using {safe_workers} post-process workers "
+            f"with {cpu_threads_per_worker} PyTorch CPU thread(s) each"
+        )
+    # Spawned workers inherit these BLAS/OpenMP limits at interpreter startup.
+    with postprocess_thread_limits(cpu_threads_per_worker):
+        with ProcessPoolExecutor(
+            max_workers=safe_workers,
+            mp_context=ctx,
+            initializer=configure_postprocess_worker,
+            initargs=(cpu_threads_per_worker,),
+        ) as executor:
+            futures = [executor.submit(_process_single_result_file, task) for task in tasks]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="[Stage 2] Post-processing"):
+                res = future.result()
+                if res:
+                    results.append(res)
+                del res, future
+                gc.collect()
 
     write_csv = []
     col_w = None
@@ -594,8 +619,10 @@ if __name__ == '__main__':
                         , help='VETime_weight')
     parser.add_argument('--vision_name', type=str, default='mae_visualize_base.pth'
                         , help='vision_weight')
-    parser.add_argument('--num_workers', type=int, default=None
-                        , help='Number of workers for parallel processing (default: dynamic, cpu_count-2)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='TSB metric post-process worker count (default: 4, capped by cpu_count-2)')
+    parser.add_argument('--cpu_threads_per_worker', type=int, default=1,
+                        help='PyTorch CPU threads allowed inside each TSB metric worker')
 
     args_test = parser.parse_args()
 
@@ -641,7 +668,9 @@ if __name__ == '__main__':
             args_test.data_setting, device,
             dataset_setting=dataset_pass_list,
             use_list=dataset_use_list,
-            verbose=True
+            verbose=True,
+            postprocess_workers=args_test.num_workers,
+            cpu_threads_per_worker=args_test.cpu_threads_per_worker,
         )
     else:
         # 单变量测试：原有逻辑
@@ -654,4 +683,6 @@ if __name__ == '__main__':
             model.load_state_dict(state_dict, strict=False)
 
         TSB_test(model, args_test, args_test.data_setting, device,
-                 dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False)
+                 dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False,
+                 postprocess_workers=args_test.num_workers,
+                 cpu_threads_per_worker=args_test.cpu_threads_per_worker)
