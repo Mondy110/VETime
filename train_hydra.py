@@ -10,21 +10,20 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from hydra_config import namespace_from_config
+from vetime.application.train import TrainUseCase
+from vetime.interfaces.hydra import training_config_from_mapping
 
 
 @hydra.main(config_path="configs", config_name="univariate", version_base=None)
 def run(cfg: DictConfig) -> None:
     """Compose config, adapt it, and run the established training implementation."""
-    from train import main
-
-    args = namespace_from_config(OmegaConf.to_container(cfg, resolve=True))
+    config = training_config_from_mapping(OmegaConf.to_container(cfg, resolve=True))
     result_path = Path(
-        args.output_file_path.replace("result.json", f"{args.model_name.replace('/', '-')}_result.json")
+        config.output_file_path.replace("result.json", f"{config.model.model_name.replace('/', '-')}_result.json")
     )
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
-    results = main(args)
+    results = TrainUseCase().run(config)
     with result_path.open("w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=4)
 

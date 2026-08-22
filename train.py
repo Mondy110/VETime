@@ -22,7 +22,6 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from Test_TSB import PASS_LIST, TSB_test
 from evaluation.metrics import fast_get_metrics
 from model.Vision_encoder.V_encoder import V_model
 from loss.loss import load_balance_loss
@@ -42,7 +41,6 @@ from model.cmrg_training import (
     load_model_state_compat,
     restore_optimizer_state_compat,
 )
-from Test_TSB import EarlyStopping
 from functools import partial
 from training_logging import DeferredLossMetrics, log_batch_metrics
 
@@ -162,6 +160,12 @@ def restore_requires_grad(model, accelerator, saved_requires_grad):
 
 
 def train_univariate(args):
+    # Import the benchmark adapter only when an actual training run starts.
+    # Keeping it out of module import time makes ``train.py --help`` and
+    # configuration inspection usable in environments where the optional
+    # tsb-ad benchmark package is not installed.
+    from Test_TSB import PASS_LIST, TSB_test, EarlyStopping
+
     """
     单变量训练：完全保留原有训练逻辑
 
@@ -1054,7 +1058,10 @@ def evaluate_univariate(model, val_loader, accelerator, data_setting):
 
 def main(args):
     """Run the univariate training workflow."""
-    return train_univariate(args)
+    from vetime.application.train import TrainUseCase
+    from vetime.interfaces.cli import training_config_from_namespace
+
+    return TrainUseCase().run(training_config_from_namespace(args))
 
 if __name__ == "__main__":
     # Default settings as per paper (B.4 Implementation Details)
