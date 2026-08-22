@@ -69,21 +69,6 @@ PASS_LIST_UNI = [
     "OPP",
 ]
 
-# 用于 TSB-AD-M (多变量数据集): 只保留 MSL, PSM, SMAP, SMD, SWaT，排除其他所有
-PASS_LIST_MULTI = [
-    "CATSv2",
-    "CreditCard",
-    "Daphnet",
-    "Exathlon",
-    "GECCO",
-    "GHL",
-    "Genesis",
-    "LTDB",
-    "MITDB",
-    "OPPORTUNITY",
-    "SVDB",
-    "TAO",
-]
 
 # 默认使用单变量过滤列表（保持向后兼容）
 PASS_LIST = PASS_LIST_UNI
@@ -103,13 +88,6 @@ USE_LIST_UNI = [
     "YAHOO",
 ]
 
-USE_LIST_MULTI = [
-    "MSL",
-    "PSM",
-    "SMAP",
-    "SMD",
-    "SWaT",
-]
 
 # 默认使用单变量统计列表（保持向后兼容）
 USE_LIST = USE_LIST_UNI
@@ -169,27 +147,6 @@ def dataloader_TSB(data, labels,data_setting,patch_size):
         'p_value':pad_value,
     }
 
-def create_dynamic_model(args_test, num_features, vision_model, config_v):
-    """
-    根据特征数量动态生成 VETime 模型
-
-    Args:
-        args_test: 命令行参数
-        num_features: 当前数据的特征维度
-        vision_model: 已实例化的视觉编码器（复用）
-        config_v: 视觉模型配置
-
-    Returns:
-        model: VETIME 模型实例
-    """
-    from model.TS_encoder.config import default_config_t
-    from model.TS_encoder.ts_model import TS_Model
-    from model.VETime import VETIME
-
-    default_config_t.num_features = num_features
-    ts_model = TS_Model(default_config_t)
-    model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
-    return model
 
 def TSB_test(
     model,
@@ -198,7 +155,6 @@ def TSB_test(
     device='cuda:0',
     dataset_setting=PASS_LIST,
     use_list=None,
-    for_m=False,
     verbose=True,
     postprocess_workers=None,
     cpu_threads_per_worker=1,
@@ -294,141 +250,6 @@ def TSB_test(
     )
     return 1.0 - avg_f1  # 返回验证损失（1-F1，越小越好）
 
-def TSB_test_multivariate(
-    vision_model,
-    config_v,
-    args_test,
-    data_setting=DATA_INIT_SETTING,
-    device='cuda:0',
-    dataset_setting=PASS_LIST_MULTI,
-    use_list=None,
-    verbose=True,
-    postprocess_workers=None,
-    cpu_threads_per_worker=1,
-):
-    """
-    多变量数据集测试函数
-
-    根据每个数据集的特征维度动态创建模型并加载对应权重。
-    维度变化时自动销毁旧模型、清理显存、创建新模型。
-    """
-    import gc
-
-    target_dir = args_test.target_dir
-    model_name = args_test.model_name
-    file_list = args_test.file_list
-    os.makedirs(target_dir, exist_ok=True)
-
-    if verbose:
-        print('Testing on TSB-AD-M (Multivariate) datasets...')
-
-    current_dim = None
-    active_model = None
-    patch_size = None
-    runtime_log = []
-    progress_bar = tqdm(file_list, desc=f"[Stage 1] Saving results for {model_name}")
-
-    for filename in progress_bar:
-        if any(filter_item in filename for filter_item in dataset_setting):
-            continue
-
-        output_path = os.path.join(target_dir, f'{filename.split(".")[0]}_results.pkl')
-        file_path = os.path.join(args_test.dataset_dir, filename)
-        df = pd.read_csv(file_path).dropna()
-        datas = df.iloc[:, :-1].values.astype(float)
-        labels_full = df['Label'].astype(int).to_numpy()
-
-        # 获取当前数据的特征维度
-        num_features = datas.shape[1]
-
-        # 维度变化时：销毁旧模型，创建新模型，加载权重
-        if num_features != current_dim:
-            # 清理旧模型
-            if active_model is not None:
-                del active_model
-                gc.collect()
-                torch.cuda.empty_cache()
-
-            # 创建新模型
-            active_model = create_dynamic_model(args_test, num_features, vision_model, config_v)
-            active_model.eval()
-            active_model.to(device)
-            patch_size = active_model.patch_size
-
-            # 加载用户指定的权重
-            if args_test.vetime_path is not None:
-                state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-                active_model.load_state_dict(state_dict, strict=False)
-                if verbose:
-                    print(f"[INFO] Loaded weights from {args_test.vetime_path}")
-
-            current_dim = num_features
-
-        train_index = int(filename.split('.')[0].split('_')[-3])
-        data = datas[train_index:, :]
-        labels = labels_full[train_index:]
-
-        start_time = time.time()
-        batch = {k: v.to(device) for k, v in dataloader_TSB(data, labels, data_setting, patch_size).items()}
-        labels_tensor = batch["labels"]
-        images = batch["image"]
-        time_series = batch["time_series"]
-        att_mask = batch["attention_mask"]
-
-        with torch.no_grad():
-            if len(labels) > active_model.MAX_L:
-                data_splits = active_model.split_data(images, time_series, att_mask, labels_tensor)
-                logits_list = []
-                for data_part in data_splits:
-                    img_part, ts_part, att_mask_p, label_part = data_part
-                    images_folded, init_img_size = active_model.vit_encoder.fold_image(
-                        img_part, batch['period'].cpu().numpy(), batch['p_value'], **data_setting
-                    )
-                    local_embeddings, _, _, _ = active_model(images_folded, ts_part, att_mask_p, init_img_size)
-                    _, logits_part = active_model.anomaly_detection_loss(local_embeddings, label_part)
-                    logits_list.append(logits_part)
-                logits = torch.cat(logits_list, dim=1)
-            else:
-                images_folded, init_img_size = active_model.vit_encoder.fold_image(
-                    images, batch['period'].cpu().numpy(), batch['p_value'], **data_setting
-                )
-                local_embeddings, _, _, _ = active_model(images_folded, time_series, att_mask, init_img_size)
-                _, logits = active_model.anomaly_detection_loss(local_embeddings, labels_tensor)
-
-        probs = torch.softmax(logits, dim=-1)[:, :, 1].detach().squeeze().cpu().numpy()
-        labels_np = labels_tensor.squeeze().cpu().numpy()
-        values = time_series.detach().squeeze().cpu().numpy()
-        pd.DataFrame({
-            'value': values.tolist(),
-            'label': labels_np.tolist(),
-            'anomaly_score': probs.tolist(),
-        }).to_pickle(output_path)
-
-        run_time = time.time() - start_time
-        if verbose:
-            print(f"Saved {output_path} (dim={num_features}, time: {run_time:.4f}s)")
-        runtime_log.append({
-            'filename': filename,
-            'dim': num_features,
-            'run_time_seconds': run_time
-        })
-
-        # 清理中间变量
-        del df, datas, labels_full, data, labels, batch, images, time_series, att_mask, labels_tensor
-        del images_folded, local_embeddings, logits, probs, labels_np, values
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    log_df = pd.DataFrame(runtime_log)
-    csv_save_path = os.path.join(os.getcwd(), f'runtime_log_{model_name}_multi.csv')
-    log_df.to_csv(csv_save_path, index=False)
-
-    avg_f1 = TSB_test_parallel_postprocess(
-        args_test, data_setting, dataset_setting, use_list, verbose=verbose,
-        num_workers=postprocess_workers,
-        cpu_threads_per_worker=cpu_threads_per_worker,
-    )
-    return 1.0 - avg_f1
 
 def _process_single_result_file(args):
     import gc
@@ -626,19 +447,9 @@ if __name__ == '__main__':
 
     args_test = parser.parse_args()
 
-    # 根据数据集路径自动选择过滤列表
-    if "TSB-AD-M" in args_test.dataset_dir:
-        # 多变量数据集：只跑 MSL, PSM, SMAP, SMD, SWaT
-        dataset_pass_list = PASS_LIST_MULTI
-        dataset_use_list = USE_LIST_MULTI
-        print(f"[INFO] 检测到多变量数据集路径，使用 PASS_LIST_MULTI 过滤")
-        print(f"[INFO] 将只处理以下数据集: {USE_LIST_MULTI}")
-    else:
-        # 单变量数据集：排除非原生单变量
-        dataset_pass_list = PASS_LIST_UNI
-        dataset_use_list = USE_LIST_UNI
-        print(f"[INFO] 检测到单变量数据集路径，使用 PASS_LIST_UNI 过滤")
-        print(f"[INFO] 将处理以下数据集: {USE_LIST_UNI}")
+    dataset_pass_list = PASS_LIST_UNI
+    dataset_use_list = USE_LIST_UNI
+    print(f"[INFO] 使用单变量 TSB-AD 过滤列表: {USE_LIST_UNI}")
 
     args_test.target_dir = os.path.join(args_test.save_dir, args_test.model_name)
     os.makedirs(args_test.target_dir, exist_ok = True)
@@ -660,29 +471,17 @@ if __name__ == '__main__':
     vision_model = V_model(args_test.vision_name, unpatch=True, MAX_L=max_l)
     config_v = vision_model.config
 
-    # 根据数据集路径选择测试分支
-    if "TSB-AD-M" in args_test.dataset_dir:
-        # 多变量测试：传入 vision_model，内部动态创建模型
-        TSB_test_multivariate(
-            vision_model, config_v, args_test,
-            args_test.data_setting, device,
-            dataset_setting=dataset_pass_list,
-            use_list=dataset_use_list,
-            verbose=True,
-            postprocess_workers=args_test.num_workers,
-            cpu_threads_per_worker=args_test.cpu_threads_per_worker,
-        )
-    else:
-        # 单变量测试：原有逻辑
-        ts_model = TS_Model(default_config_t)
-        model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
-        model.eval().to(device)
+    ts_model = TS_Model(default_config_t)
+    model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+    model.eval().to(device)
 
-        if args_test.vetime_path is not None:
-            state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-            model.load_state_dict(state_dict, strict=False)
+    if args_test.vetime_path is not None:
+        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
+        model.load_state_dict(state_dict, strict=False)
 
-        TSB_test(model, args_test, args_test.data_setting, device,
-                 dataset_setting=dataset_pass_list, use_list=dataset_use_list, for_m=False,
-                 postprocess_workers=args_test.num_workers,
-                 cpu_threads_per_worker=args_test.cpu_threads_per_worker)
+    TSB_test(
+        model, args_test, args_test.data_setting, device,
+        dataset_setting=dataset_pass_list, use_list=dataset_use_list,
+        postprocess_workers=args_test.num_workers,
+        cpu_threads_per_worker=args_test.cpu_threads_per_worker,
+    )
