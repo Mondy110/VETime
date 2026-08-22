@@ -10,6 +10,8 @@ from argparse import Namespace
 from collections.abc import Mapping
 from typing import Any
 
+from vetime.interfaces.hydra import training_config_from_mapping
+
 
 def _get(config: Mapping[str, Any], path: str, default: Any = None) -> Any:
     """Return a dotted config value without treating false-y values as absent."""
@@ -70,3 +72,8 @@ def namespace_from_config(config: Mapping[str, Any]) -> Namespace:
         cmrg_factorized=_get(config, "model.cmrg.factorized", True),
         cmrg_log_interval=_get(config, "model.cmrg.log_interval", 100),
     )
+
+
+def training_config_from_hydra(config: Mapping[str, Any]):
+    """Return the typed configuration used by the clean application layer."""
+    return training_config_from_mapping(config)
