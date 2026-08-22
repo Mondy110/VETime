@@ -70,8 +70,13 @@ def _target_prefix_from_state_dict(state_dict: Mapping[str, Tensor]) -> str:
 
 
 def _is_optional_temporal_key(key: str) -> bool:
-    """CMRG gates were added after the original temporal pretraining run."""
-    return ".cmrg_" in key or key.endswith("cmrg_alpha")
+    """CMRG gates and newly installed LoRA factors are not in old runs."""
+    return (
+        ".cmrg_" in key
+        or key.endswith("cmrg_alpha")
+        or key.endswith(".lora_A")
+        or key.endswith(".lora_B")
+    )
 
 
 def map_legacy_temporal_state_dict(

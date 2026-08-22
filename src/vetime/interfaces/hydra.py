@@ -40,6 +40,7 @@ def training_config_from_mapping(config: Mapping[str, Any]) -> TrainingConfig:
         use_vectorized_fold=_get(config, "model.use_vectorized_fold", False),
         query_decoder_training_mode=_get(config, "model.query_decoder_training_mode", "joint"),
         use_query_decoder=_get(config, "model.use_query_decoder", True),
+        use_gradient_checkpointing=_get(config, "model.use_gradient_checkpointing", False),
         cmrg_enabled=_get(config, "model.cmrg.enabled", False),
         cmrg_num_relation_tokens=_get(config, "model.cmrg.num_relation_tokens", 16),
         cmrg_guide_dim=_get(config, "model.cmrg.guide_dim", 512),

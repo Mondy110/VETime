@@ -30,6 +30,7 @@ class ModelConfig:
     use_vectorized_fold: bool = False
     query_decoder_training_mode: str = "joint"
     use_query_decoder: bool = True
+    use_gradient_checkpointing: bool = False
     cmrg_enabled: bool = False
     cmrg_num_relation_tokens: int = 16
     cmrg_guide_dim: int = 512

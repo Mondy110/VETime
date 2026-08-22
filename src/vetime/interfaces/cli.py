@@ -18,6 +18,7 @@ def training_config_from_namespace(namespace: Namespace) -> TrainingConfig:
         "ts_finetune_type": values.get("ts_finetune_type", "lora"),
         "use_vectorized_fold": values.get("use_vectorized_fold", False),
         "query_decoder_training_mode": values.get("query_decoder_training_mode", "joint"),
+        "use_gradient_checkpointing": values.get("use_gradient_checkpointing", False),
         "cmrg": {
             "enabled": values.get("cmrg_enabled", False),
             "num_relation_tokens": values.get("cmrg_num_relation_tokens", 16),
