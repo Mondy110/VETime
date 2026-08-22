@@ -38,6 +38,7 @@ class TemporalModel(nn.Module):
         )
         self.d_proj = config.d_proj
         self.patch_size = config.patch_size
+        self.MAX_L = 5000
         self.reconstruction_head = build_reconstruction_head(config.d_proj)
         self.anomaly_head = build_anomaly_head(config.d_proj)
 
@@ -127,3 +128,32 @@ class TemporalModel(nn.Module):
         else:
             loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
         return loss, logits
+
+    def split_data(self, images, time_series, att_mask, labels):
+        """Split long sequences on patch boundaries for the TSB evaluator."""
+        _, sequence_length, _ = time_series.shape
+        if sequence_length != labels.shape[1]:
+            raise ValueError("Data and labels must have the same length")
+        if sequence_length % self.patch_size != 0:
+            raise ValueError("sequence length must be divisible by patch_size")
+        max_patches = self.MAX_L // self.patch_size
+        if max_patches <= 0:
+            raise ValueError("MAX_L must be >= patch_size")
+        patch_count = sequence_length // self.patch_size
+        split_count = max(1, (patch_count + max_patches - 1) // max_patches)
+        base, remainder = divmod(patch_count, split_count)
+        chunks = []
+        start = 0
+        for index in range(split_count):
+            length = (base + (index < remainder)) * self.patch_size
+            end = start + length
+            chunks.append(
+                (
+                    images[:, :, :, start:end],
+                    time_series[:, start:end, :],
+                    att_mask[:, start:end],
+                    labels[:, start:end],
+                )
+            )
+            start = end
+        return chunks

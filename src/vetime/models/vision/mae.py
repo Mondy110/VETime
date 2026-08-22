@@ -49,3 +49,7 @@ class FrozenMAEEncoder(nn.Module):
 
     def unfold_image(self, image_features, init_img_size=None):
         return self.encoder.unfold_image(image_features, init_img_size)
+
+    def fold_image(self, *args, **kwargs):
+        """Delegate image folding for the legacy data pipeline."""
+        return self.encoder.fold_image(*args, **kwargs)

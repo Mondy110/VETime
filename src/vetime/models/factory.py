@@ -25,10 +25,12 @@ def build_vetime_model(
     config: TrainingConfig,
     *,
     temporal_config: TemporalModelConfig | None = None,
+    temporal: TemporalModel | None = None,
     vision_encoder: nn.Module | None = None,
 ) -> VETimeMultimodalModel:
     """Build the composed model and apply initialization policy in one place."""
-    temporal = TemporalModel(_temporal_config_for(config, temporal_config))
+    if temporal is None:
+        temporal = TemporalModel(_temporal_config_for(config, temporal_config))
     if vision_encoder is None:
         vision_encoder = FrozenMAEEncoder.from_checkpoint(
             config.paths.vision_name,

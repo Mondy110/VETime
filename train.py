@@ -43,6 +43,10 @@ from model.cmrg_training import (
 )
 from functools import partial
 from training_logging import DeferredLossMetrics, log_batch_metrics
+from vetime.infrastructure.checkpointing.temporal_legacy import load_legacy_temporal_checkpoint
+from vetime.application.build_model import build_training_model
+from vetime.models.vision.mae import FrozenMAEEncoder
+from vetime.interfaces.cli import training_config_from_namespace
 
 logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
@@ -233,39 +237,30 @@ def train_univariate(args):
     ts_model = TS_Model(default_config_t)
     if args.ts_path is not None:
         print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
-        state_ts_dict = torch.load(args.ts_path, map_location='cpu', weights_only=False)['model_state_dict']
-
-        if args.ts_finetune_type == 'lora':
-            # LoRA 模式：需要将预训练权重映射到 LoRALinear 的 original_linear 中
-            # 预训练权重的 key: ts_encoder.xxx.weight
-            # LoRA 模型的 key: ts_encoder.xxx.original_linear.weight
-            new_state_dict = {}
-            for key, value in state_ts_dict.items():
-                # 检查是否是需要映射的线性层权重
-                if any(x in key for x in ['q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'out_proj.weight',
-                                            'gate_proj.weight', 'gate_proj.bias', 'up_proj.weight', 'up_proj.bias',
-                                            'down_proj.weight', 'down_proj.bias']):
-                    # 插入 .original_linear 到 key 中
-                    parts = key.rsplit('.', 1)
-                    new_key = f"{parts[0]}.original_linear.{parts[1]}"
-                    new_state_dict[new_key] = value
-                else:
-                    new_state_dict[key] = value
-
-            # 使用 strict=False 因为 LoRA 参数 (lora_A, lora_B) 不在预训练权重中
-            missing, unexpected = ts_model.load_state_dict(new_state_dict, strict=False)
-            print(f"[INFO] TS Encoder 权重加载完成！")
-            if missing:
-                print(f"[INFO]   缺失的参数 (LoRA 参数，将随机初始化): {len([m for m in missing if 'lora' in m])} 个")
-        else:  # freeze 模式
-            # Freeze 模式：直接加载权重，不修改键名
-            ts_model.load_state_dict(state_ts_dict, strict=False)
-            print(f"[INFO] TS Encoder 权重加载完成！")
+        report = load_legacy_temporal_checkpoint(
+            ts_model,
+            args.ts_path,
+            lora=args.ts_finetune_type == 'lora',
+        )
+        print(
+            f"[INFO] TS Encoder 权重加载完成！"
+            f" ({report.loaded_keys} 个参数，新增 LoRA 参数保持随机初始化)"
+        )
     else:
         print(f"[WARNING] 未指定 --ts_path，TS Encoder 使用随机初始化！")
 
     # ========== Create VETime Model ==========
-    model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
+    # New runs use explicit composition.  The old VETIME class remains only
+    # for loading legacy full-model checkpoints whose namespace predates the
+    # clean architecture.
+    if args.vetime_path is None:
+        model = build_training_model(
+            training_config_from_namespace(args),
+            temporal=ts_model,
+            vision_encoder=FrozenMAEEncoder(vision_model),
+        )
+    else:
+        model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
     if args.vetime_path is not None:
         print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
         state_dict = torch.load(args.vetime_path, map_location='cpu', weights_only=False)

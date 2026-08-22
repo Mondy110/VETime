@@ -9,6 +9,7 @@ from vetime.models.factory import (
     build_vetime_model,
 )
 from vetime.models.temporal.config import TemporalModelConfig
+from vetime.models.temporal.model import TemporalModel
 
 
 class TinyVisionEncoder(nn.Module):
@@ -76,3 +77,15 @@ def test_factory_installs_lora_before_loading_temporal_weights():
         for name, parameter in names.items()
         if "original_linear" in name
     )
+
+
+def test_factory_accepts_injected_temporal_dependency():
+    config = build_config(ts_finetune_type="freeze")
+    temporal = TemporalModel(tiny_temporal_config())
+    model = build_vetime_model(
+        config,
+        temporal=temporal,
+        vision_encoder=TinyVisionEncoder(),
+    )
+
+    assert model.temporal is temporal

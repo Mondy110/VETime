@@ -87,6 +87,20 @@ def test_composed_model_keeps_four_value_forward_contract():
     assert vision.unfold_calls == 1
 
 
+def test_composed_model_exposes_training_protocol_without_duplicate_modules():
+    model = VETimeMultimodalModel(
+        temporal=TemporalModel(temporal_config()),
+        vision_encoder=TinyVisionEncoder(),
+        options=model_options(),
+    )
+
+    assert model.vit_encoder is model.vision_encoder
+    assert model.ts_encoder is model.temporal
+    assert callable(model.anomaly_detection_loss)
+    assert callable(model.weighted_reconstruction_loss)
+    assert callable(model.split_data)
+
+
 def test_frozen_vision_adapter_freezes_wrapped_encoder():
     wrapped = FrozenMAEEncoder(TinyVisionEncoder())
     assert not any(parameter.requires_grad for parameter in wrapped.parameters())

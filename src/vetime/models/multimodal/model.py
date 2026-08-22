@@ -83,6 +83,25 @@ class VETimeMultimodalModel(nn.Module):
         if self.use_gradient_checkpointing:
             self._enable_gradient_checkpointing()
 
+    @property
+    def vit_encoder(self):
+        """Compatibility view used by the existing data preparation loop."""
+        return self.vision_encoder
+
+    @property
+    def ts_encoder(self):
+        """Compatibility view; the canonical module remains ``temporal``."""
+        return self.temporal
+
+    def weighted_reconstruction_loss(self, *args, **kwargs):
+        return self.temporal.weighted_reconstruction_loss(*args, **kwargs)
+
+    def anomaly_detection_loss(self, *args, **kwargs):
+        return self.temporal.anomaly_detection_loss(*args, **kwargs)
+
+    def split_data(self, *args, **kwargs):
+        return self.temporal.split_data(*args, **kwargs)
+
     def _initialize_cmrg(self, options: VETimeOptions) -> None:
         guide_dim = options.cmrg_guide_dim or options.temporal_dim
         if not self.temporal.config.use_rope:
