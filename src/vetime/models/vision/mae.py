@@ -31,6 +31,7 @@ class FrozenMAEEncoder(nn.Module):
 
         encoder = V_model(
             vision_name=vision_name,
+            vision_dir=str(vision_dir),
             MAX_L=max_length,
             unpatch=True,
             finetune_type="none",

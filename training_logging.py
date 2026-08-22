@@ -41,7 +41,7 @@ class DeferredLossMetrics:
         if self._window_count == 0:
             return None
         averages = {
-            name: (self._window_sums[name] / self._window_count).item()
+            name: round((self._window_sums[name] / self._window_count).item(), 7)
             for name in self._NAMES
         }
         self._window_sums = None
@@ -53,7 +53,7 @@ class DeferredLossMetrics:
         if self._epoch_count == 0:
             return {name: 0.0 for name in self._NAMES}
         return {
-            name: (self._epoch_sums[name] / self._epoch_count).item()
+            name: round((self._epoch_sums[name] / self._epoch_count).item(), 7)
             for name in self._NAMES
         }
 

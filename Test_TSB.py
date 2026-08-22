@@ -20,7 +20,10 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from tqdm import tqdm
 
-from TSB_AD.utils.slidingWindows import find_length_rank
+try:
+    from TSB_AD.utils.slidingWindows import find_length_rank
+except ModuleNotFoundError:  # optional benchmark dependency
+    find_length_rank = None
 from dataset.dataloader import create_random_mask
 from dataset.pre_image import ts2image_Test
 from evaluation.metrics import get_metrics
@@ -72,6 +75,14 @@ PASS_LIST_UNI = [
 
 # 默认使用单变量过滤列表（保持向后兼容）
 PASS_LIST = PASS_LIST_UNI
+
+
+def _require_tsb_ad() -> None:
+    if find_length_rank is None:
+        raise RuntimeError(
+            "TSB evaluation requires the optional 'tsb-ad' package. "
+            "Install project requirements before running TSB_test."
+        )
 
 # 统计结果时使用的数据集分组
 USE_LIST_UNI = [
@@ -159,6 +170,7 @@ def TSB_test(
     postprocess_workers=None,
     cpu_threads_per_worker=1,
 ):
+    _require_tsb_ad()
     import os
     import time
     import pandas as pd
@@ -288,6 +300,7 @@ def TSB_test_parallel_postprocess(
     cpu_threads_per_worker=1,
     verbose=True
 ):
+    _require_tsb_ad()
     # 如果没有提供 use_list，使用全局的 USE_LIST
     if use_list is None:
         use_list = USE_LIST

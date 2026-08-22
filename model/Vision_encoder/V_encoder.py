@@ -75,6 +75,7 @@ def _unfold_image_vectorized(x0, size, patch_size):
 
 class V_model(nn.Module):
     def __init__(self, vision_name=None, unpatch=True, MAX_L=5000, finetune_type='none',
+                 vision_dir=None,
                  use_vectorized_fold=False, **kwargs):
         """
         Vision Encoder based on MAE/ViT.
@@ -100,7 +101,10 @@ class V_model(nn.Module):
 
         self.use_vectorized_fold = use_vectorized_fold
 
-        vision_weight = os.path.join(vision_PATH,vision_name)
+        # ``vision_dir`` is an explicit dependency for the new application
+        # layer; retain the repository default for legacy callers.
+        vision_root = vision_dir if vision_dir is not None else vision_PATH
+        vision_weight = os.path.join(str(vision_root), vision_name)
         if 'vit' in vision_name:
             self.encode_image= VitTS_AD(vision_weight)
             self.config = self.encode_image.config

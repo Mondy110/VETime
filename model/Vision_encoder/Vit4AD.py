@@ -17,7 +17,9 @@ class MAETS_AD(nn.Module):
 
     def __init__(self, ckpt_path='mae_visualize_base.pth'):
         super(MAETS_AD, self).__init__()
-        config = MAE_ARCH[ckpt_path.split('/')[-1]]
+        # ``Path.name`` handles both POSIX and Windows separators.  The
+        # previous string split failed for the repository's Windows paths.
+        config = MAE_ARCH[Path(ckpt_path).name]
         self.config = config
         self.vision_model = MaskedAutoencoderViT(**config)
         self.hidden_size = self.config['embed_dim']

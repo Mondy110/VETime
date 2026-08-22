@@ -92,6 +92,30 @@ def test_frozen_vision_adapter_freezes_wrapped_encoder():
     assert not any(parameter.requires_grad for parameter in wrapped.parameters())
 
 
+def test_frozen_vision_adapter_forwards_checkpoint_directory(monkeypatch, tmp_path):
+    calls = {}
+
+    class FakeVModel(TinyVisionEncoder):
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+            super().__init__()
+
+    import model.Vision_encoder.V_encoder as legacy_vision
+
+    monkeypatch.setattr(legacy_vision, "V_model", FakeVModel, raising=False)
+    wrapped = FrozenMAEEncoder.from_checkpoint(
+        "mae_visualize_base.pth",
+        tmp_path,
+        max_length=32,
+        use_vectorized_fold=True,
+    )
+
+    assert isinstance(wrapped, FrozenMAEEncoder)
+    assert calls["vision_dir"] == str(tmp_path)
+    assert calls["MAX_L"] == 32
+    assert calls["use_vectorized_fold"] is True
+
+
 def test_composed_model_supports_cmrg_and_query_decoder_modes():
     for options in (
         model_options(cmrg_enabled=True, cmrg_guide_dim=8, cmrg_num_heads=2),
