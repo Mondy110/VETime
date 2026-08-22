@@ -69,6 +69,11 @@ def _target_prefix_from_state_dict(state_dict: Mapping[str, Tensor]) -> str:
     return ""
 
 
+def _is_optional_temporal_key(key: str) -> bool:
+    """CMRG gates were added after the original temporal pretraining run."""
+    return ".cmrg_" in key or key.endswith("cmrg_alpha")
+
+
 def map_legacy_temporal_state_dict(
     state_dict: Mapping[str, Tensor],
     *,
@@ -125,7 +130,11 @@ def load_legacy_temporal_checkpoint(
         f"{target_prefix}reconstruction_head.",
         f"{target_prefix}anomaly_head.",
     )
-    required_keys = {key for key in target_state if key.startswith(required_prefix)}
+    required_keys = {
+        key
+        for key in target_state
+        if key.startswith(required_prefix) and not _is_optional_temporal_key(key)
+    }
     missing = tuple(sorted(required_keys - mapped.keys()))
     unexpected_target = tuple(sorted(key for key in mapped if key not in target_state))
     shape_conflicts = tuple(
