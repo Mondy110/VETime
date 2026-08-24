@@ -10,6 +10,7 @@ from vetime.models.factory import (
 )
 from vetime.models.temporal.config import TemporalModelConfig
 from vetime.models.temporal.model import TemporalModel
+from vetime.infrastructure.checkpointing.model_checkpoint import save_model_checkpoint
 
 
 class TinyVisionEncoder(nn.Module):
@@ -89,3 +90,33 @@ def test_factory_accepts_injected_temporal_dependency():
     )
 
     assert model.temporal is temporal
+
+
+def test_factory_loads_clean_model_checkpoint(tmp_path):
+    source = build_vetime_model(
+        build_config(ts_finetune_type="lora"),
+        temporal_config=tiny_temporal_config(),
+        vision_encoder=TinyVisionEncoder(),
+    )
+    path = tmp_path / "clean-model.pth"
+    save_model_checkpoint(source, path, metadata={"architecture": "vetime-clean"})
+    target_config = TrainingConfig(
+        seed=64,
+        batch_size=2,
+        paths=CheckpointPaths(
+            temporal=None,
+            vision_dir="checkpoints/weight_v",
+            vision_name="mae_visualize_base.pth",
+            model_checkpoint=str(path),
+        ),
+        model=ModelConfig(ts_finetune_type="lora"),
+    )
+
+    target = build_vetime_model(
+        target_config,
+        temporal_config=tiny_temporal_config(),
+        vision_encoder=TinyVisionEncoder(),
+    )
+
+    for key, value in source.state_dict().items():
+        torch.testing.assert_close(value, target.state_dict()[key])

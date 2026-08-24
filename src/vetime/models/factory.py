@@ -9,6 +9,7 @@ from typing import Mapping
 from torch import nn
 
 from vetime.config import TrainingConfig
+from vetime.infrastructure.checkpointing.model_checkpoint import load_model_checkpoint
 from vetime.infrastructure.checkpointing.temporal_legacy import load_legacy_temporal_checkpoint
 from vetime.models.multimodal.model import VETimeMultimodalModel, VETimeOptions
 from vetime.models.temporal.config import TemporalModelConfig
@@ -61,6 +62,8 @@ def build_vetime_model(
             Path(config.paths.temporal),
             lora=config.model.ts_finetune_type == "lora",
         )
+    elif config.paths.model_checkpoint:
+        load_model_checkpoint(model, config.paths.model_checkpoint)
     apply_temporal_finetune_policy(model, config.model.ts_finetune_type)
     return model
 

@@ -47,9 +47,10 @@ paths:
   file_list: ./dataset/TSB-AD/Datasets/File_List/TSB-AD-U.csv
   ts_path: checkpoints/weight_ts/full_mask_anomaly_head_pretrain_checkpoint_best.pth
   vision_path: ./checkpoints/weight_v
-  vetime_path: null
+  # Strict v3 VETime model initialization.  Legacy full VETime checkpoints
+  # are intentionally unsupported; use ts_path for temporal pretraining.
+  model_checkpoint: null
   resume: null
-  pretrain_from: null
   output_file_path: ./output/result.json
   keep_idx_path: null
 

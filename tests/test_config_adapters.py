@@ -5,6 +5,7 @@ import pytest
 from vetime.config import CheckpointPaths, DataConfig, ModelConfig, OptimizerConfig, TrainingConfig
 from vetime.interfaces.cli import training_config_from_namespace
 from vetime.interfaces.hydra import training_config_from_mapping
+from hydra_config import namespace_from_config
 
 
 def test_cli_and_hydra_create_equivalent_training_configuration():
@@ -61,3 +62,12 @@ def test_hydra_adapter_reads_model_checkpoint_not_vetime_path():
     )
 
     assert config.paths.model_checkpoint == "output/models/clean.pth"
+
+
+def test_hydra_namespace_exposes_only_v3_model_checkpoint_field():
+    namespace = namespace_from_config(
+        {"paths": {"model_checkpoint": "output/models/clean.pth"}}
+    )
+
+    assert namespace.model_checkpoint == "output/models/clean.pth"
+    assert not hasattr(namespace, "vetime_path")

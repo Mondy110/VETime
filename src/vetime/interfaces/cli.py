@@ -111,9 +111,6 @@ def namespace_from_training_config(config: TrainingConfig) -> Namespace:
         vision_path=config.paths.vision_dir,
         ts_path=config.paths.temporal,
         model_checkpoint=config.paths.model_checkpoint,
-        # Transitional placeholder: the legacy loop will stop reading this
-        # field when versioned model-checkpoint loading is wired in.
-        vetime_path=None,
         resume=config.paths.resume,
         keep_idx_path=config.paths.keep_idx_path,
         device=config.device,

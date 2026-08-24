@@ -32,18 +32,24 @@ import logging
 from tqdm.auto import tqdm
 import os
 from datetime import datetime
-from model.VETime import VETIME
 from model.CMRG import CMRGContext
 from model.cmrg_training import (
     add_cmrg_injection_mode_argument,
     collect_cmrg_monitoring,
     configure_freeze_mode,
-    load_model_state_compat,
-    restore_optimizer_state_compat,
 )
 from functools import partial
 from training_logging import DeferredLossMetrics, log_batch_metrics
-from vetime.infrastructure.checkpointing.temporal_legacy import load_legacy_temporal_checkpoint
+from vetime.infrastructure.checkpointing.model_checkpoint import (
+    load_model_checkpoint,
+    save_model_checkpoint,
+)
+from vetime.infrastructure.checkpointing.resume import (
+    ResumeState,
+    load_resume_checkpoint,
+    save_resume_checkpoint,
+)
+from vetime.infrastructure.logging import log_runtime_topology
 from vetime.application.build_model import build_training_model
 from vetime.models.vision.mae import FrozenMAEEncoder
 from vetime.interfaces.cli import training_config_from_namespace
@@ -204,7 +210,7 @@ def train_univariate(args):
         project_dir="./output/logs"
     )
 
-    logger.info(f"Using {accelerator.num_processes} {'GPUs' if accelerator.num_processes > 1 else 'CPU'}")
+    logger.info("Using device %s with %s process(es)", accelerator.device, accelerator.num_processes)
     print(f"[INFO] 梯度累积: {gradient_accumulation_steps} 步 (batch_size={args.batch_size} × 累积步数 = {args.batch_size * gradient_accumulation_steps} 样本/更新)")
 
     # ========== Vision Encoder (Frozen MAE, as per paper) ==========
@@ -235,44 +241,34 @@ def train_univariate(args):
     apply_cmrg_config(args)
 
     ts_model = TS_Model(default_config_t)
-    if args.ts_path is not None:
-        print(f"[INFO] 正在加载 TS Encoder 权重: {args.ts_path}")
-        report = load_legacy_temporal_checkpoint(
-            ts_model,
-            args.ts_path,
-            lora=args.ts_finetune_type == 'lora',
-        )
-        print(
-            f"[INFO] TS Encoder 权重加载完成！"
-            f" ({report.loaded_keys} 个参数，新增 LoRA 参数保持随机初始化)"
-        )
+    training_config = training_config_from_namespace(args)
+    if args.ts_path:
+        print(f"[INFO] 初始化来源: 时序预训练权重 {args.ts_path}")
+    elif args.model_checkpoint:
+        print(f"[INFO] 初始化来源: VETime v3 模型权重 {args.model_checkpoint}")
+    elif args.resume:
+        print(f"[INFO] 初始化来源: 训练恢复检查点 {args.resume}")
     else:
-        print(f"[WARNING] 未指定 --ts_path，TS Encoder 使用随机初始化！")
+        print("[WARNING] 未指定初始化权重，模型将随机初始化")
 
-    # ========== Create VETime Model ==========
-    # New runs use explicit composition.  The old VETIME class remains only
-    # for loading legacy full-model checkpoints whose namespace predates the
-    # clean architecture.
-    if args.vetime_path is None:
-        model = build_training_model(
-            training_config_from_namespace(args),
-            temporal=ts_model,
-            vision_encoder=FrozenMAEEncoder(vision_model),
-        )
-    else:
-        model = VETIME(config_v, vision_model, default_config_t, ts_model, args.model_name)
-    if args.vetime_path is not None:
-        print(f"[INFO] 正在加载 VETime 完整权重: {args.vetime_path}")
-        state_dict = torch.load(args.vetime_path, map_location='cpu', weights_only=False)
-        load_model_state_compat(model, state_dict, "legacy VETime weights")
-        print(f"[INFO] VETime 权重加载完成（用于继续训练）")
-    else:
-        print(f"[INFO] 未指定 --vetime_path，VETime 融合模块从头训练")
+    # The factory is the only model assembly boundary.  It accepts legacy
+    # temporal pretraining but deliberately rejects legacy full VETime weights.
+    model = build_training_model(
+        training_config,
+        temporal=ts_model,
+        vision_encoder=FrozenMAEEncoder(vision_model),
+    )
 
     if args.ts_finetune_type == 'freeze':
         configure_freeze_mode(model)
     enable_cmrg_monitoring(model)
 
+    initialization_source = (
+        "temporal_pretrain" if args.ts_path else
+        "model_checkpoint" if args.model_checkpoint else
+        "training_resume" if args.resume else "random_initialization"
+    )
+    log_runtime_topology(model, accelerator.device, initialization_source)
     del vision_model, ts_model
 
     # Print trainable parameters statistics
@@ -436,66 +432,27 @@ def train_univariate(args):
 
     # ========== 处理resume恢复 ==========
     start_epoch = 0
-    best_val_loss_resume = None  # 用于恢复早停中的最佳验证损失
     checkpoint_dir = f'./output/checkpoints/{args.model_name}'
     if args.resume:
         resume_path = args.resume
         if not os.path.exists(resume_path):
-            print(f"[ERROR] Resume checkpoint 不存在: {resume_path}")
+            raise FileNotFoundError(f"Resume checkpoint 不存在: {resume_path}")
         else:
-            print(f"[INFO] 正在加载resume checkpoint: {resume_path}")
-            checkpoint = torch.load(resume_path, map_location='cpu', weights_only=False)
-
-            if 'model_state_dict' in checkpoint:
-                # 完整checkpoint格式
-                unwrapped_model = accelerator.unwrap_model(model)
-                missing, unexpected = unwrapped_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-                print(f"[INFO] 模型权重已恢复")
-                if missing:
-                    print(f"  缺失的参数: {len(missing)} 个")
-                if unexpected:
-                    print(f"  未预期的参数: {len(unexpected)} 个")
-
-                if restore_optimizer_state_compat(
-                    optimizer, checkpoint.get('optimizer_state_dict')
-                ):
-                    print(f"[INFO] Optimizer状态已恢复")
-
-                start_epoch = checkpoint['epoch'] + 1
-                global_step = checkpoint['global_step']
-                best_val_loss_resume = checkpoint.get('best_val_loss')
-                if best_val_loss_resume is not None:
-                    early_stopping.val_loss_min = best_val_loss_resume
-                    print(f"[INFO] 早停最佳验证损失已恢复: {best_val_loss_resume:.4f}")
-
-                # 恢复调度器状态
-                scheduler_state = checkpoint.get('scheduler_state_dict')
-                if scheduler_state is not None:
-                    scheduler.load_state_dict(scheduler_state)
-                    print(f"[INFO] 学习率调度器状态已恢复，当前LR={scheduler.get_last_lr()[0]:.2e}")
-                else:
-                    print(f"[WARNING] 旧checkpoint无调度器状态，手动推进{global_step}步（可能存在微小误差）")
-                    for _ in range(global_step):
-                        scheduler.step()
-
-                # 恢复随机状态
-                random_state = checkpoint.get('random_state', {})
-                if 'python' in random_state:
-                    random.setstate(random_state['python'])
-                if 'numpy' in random_state:
-                    np.random.set_state(random_state['numpy'])
-                if 'torch' in random_state:
-                    torch.set_rng_state(random_state['torch'])
-                if 'cuda' in random_state and random_state['cuda'] is not None:
-                    torch.cuda.set_rng_state_all(random_state['cuda'])
-                print(f"[INFO] 随机状态已恢复")
-
-                print(f"[INFO] 从epoch {start_epoch} 继续训练，global_step={global_step}")
-            else:
-                # 旧格式：仅模型权重
-                unwrapped_model = accelerator.unwrap_model(model)
-                unwrapped_model.load_state_dict(checkpoint, strict=False)
-                print(f"[INFO] 旧格式checkpoint，仅恢复了模型权重，从epoch 0开始训练")
+            print(f"[INFO] 正在加载 v3 resume checkpoint: {resume_path}")
+            resume_state = load_resume_checkpoint(
+                resume_path,
+                accelerator.unwrap_model(model),
+                optimizer,
+                scheduler,
+            )
+            start_epoch = resume_state.epoch + 1
+            global_step = resume_state.global_step
+            if resume_state.best_val_loss is not None:
+                early_stopping.val_loss_min = resume_state.best_val_loss
+                early_stopping.best_score = -resume_state.best_val_loss
+                print(f"[INFO] 早停最佳验证损失已恢复: {resume_state.best_val_loss:.4f}")
+            early_stopping.counter = resume_state.patience_counter
+            print(f"[INFO] Resume 已恢复：epoch={start_epoch}, global_step={global_step}")
 
     for epoch in range(start_epoch, epochs):
         # ========== 两阶段训练范式（Two-Stage Training）==========
@@ -805,7 +762,11 @@ def train_univariate(args):
                 unwrapped_model = accelerator.unwrap_model(model)
                 best_model_path = f'./output/{args.model_name}__{img_size}_best.pth'
                 if accelerator.is_main_process:
-                    torch.save(unwrapped_model.state_dict(), best_model_path)
+                    save_model_checkpoint(
+                        unwrapped_model,
+                        best_model_path,
+                        {"metric": "split_val_loss", "value": avg_val_loss, "epoch": epoch + 1},
+                    )
                     print(f"  Best model saved: {best_model_path} (val_loss={avg_val_loss:.4f})")
             if early_stopping.early_stop:
                 print("Early stopping triggered (based on validation split).")
@@ -824,7 +785,12 @@ def train_univariate(args):
                 unwrapped_model = accelerator.unwrap_model(model)
                 timestamp = datetime.now().strftime("%m%d-%H")
                 name_save = f'./output/{args.model_name}__{img_size}_{avg_tsb_val_loss:.4f}_{timestamp}.pth'
-                torch.save(unwrapped_model.state_dict(), name_save)
+                if accelerator.is_main_process:
+                    save_model_checkpoint(
+                        unwrapped_model,
+                        name_save,
+                        {"metric": "tsb_val_loss", "value": avg_tsb_val_loss, "epoch": epoch + 1},
+                    )
                 logger.info(f"Model saved at epoch {epoch+1} with TSB_val_loss={avg_tsb_val_loss:.4f}")
 
                 epoch_log = {
@@ -861,7 +827,12 @@ def train_univariate(args):
                 unwrapped_model = accelerator.unwrap_model(model)
                 timestamp = datetime.now().strftime("%m%d-%H")
                 name_save = f'./output/{args.model_name}__{img_size}_{avg_val_loss:.4f}_{timestamp}.pth'
-                torch.save(unwrapped_model.state_dict(), name_save)
+                if accelerator.is_main_process:
+                    save_model_checkpoint(
+                        unwrapped_model,
+                        name_save,
+                        {"metric": "tsb_val_loss", "value": avg_val_loss, "epoch": epoch + 1},
+                    )
                 logger.info(f"Model saved at epoch {epoch+1} with val_loss={avg_val_loss:.4f}")
 
                 epoch_log = {
@@ -897,8 +868,8 @@ def train_univariate(args):
         )
         save_full_checkpoint(
             model, optimizer, scheduler, epoch, global_step,
-            early_stopping.val_loss_min,  # best_val_loss
-            0,  # patience_counter (由 EarlyStopping 对象管理)
+            early_stopping.val_loss_min,
+            early_stopping.counter,
             epoch_checkpoint_path, accelerator
         )
 
@@ -910,9 +881,9 @@ def train_univariate(args):
     if args.val_mode == 'split':
         best_model_path = f'./output/{args.model_name}__{img_size}_best.pth'
         if os.path.exists(best_model_path):
-            print(f"\n[INFO] 加载早停保存的最佳模型: {best_model_path}")
+            print(f"\n[INFO] 加载 v3 最佳模型: {best_model_path}")
             unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.load_state_dict(torch.load(best_model_path, map_location='cpu', weights_only=False))
+            load_model_checkpoint(unwrapped_model, best_model_path)
 
     loss_all = TSB_test(
         model, args, args.data_setting, device, dataset_setting=PASS_LIST, verbose=False,
@@ -938,41 +909,24 @@ def save_full_checkpoint(
     save_path: str,
     accelerator
 ):
-    """
-    保存完整的训练状态checkpoint
-
-    Args:
-        model: 模型实例
-        optimizer: 优化器实例
-        epoch: 当前epoch（已完成）
-        global_step: 全局步数
-        best_val_loss: 最佳验证损失
-        patience_counter: 早停计数器
-        save_path: 保存路径
-        accelerator: Accelerator实例
-    """
+    """Save only the strict v3 training-resume protocol."""
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
-
-    checkpoint = {
-        'model_state_dict': unwrapped_model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'epoch': epoch,
-        'global_step': global_step,
-        'best_val_loss': best_val_loss,
-        'patience_counter': patience_counter,
-        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-        'random_state': {
-            'python': random.getstate(),
-            'numpy': np.random.get_state(),
-            'torch': torch.get_rng_state(),
-            'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        }
-    }
-
     if accelerator.is_main_process:
-        torch.save(checkpoint, save_path)
-        print(f"[INFO] 完整Checkpoint已保存: {save_path}")
+        save_resume_checkpoint(
+            save_path,
+            unwrapped_model,
+            optimizer,
+            scheduler,
+            ResumeState(
+                epoch=epoch,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                patience_counter=patience_counter,
+            ),
+            {"model_name": getattr(unwrapped_model, "model_name", "VETime")},
+        )
+        print(f"[INFO] v3 Resume checkpoint 已保存: {save_path}")
 
 
 
@@ -1107,7 +1061,8 @@ if __name__ == "__main__":
     parser.add_argument('--data_setting', type=str, default=DATA_INIT_SETTING, help='Data settings')
     parser.add_argument('--vision_path', type=str, default='./checkpoints/weight_v', help='vision_weight directory')
     parser.add_argument('--ts_path', type=str, default=None, help='TS Encoder pre-trained weight path')
-    parser.add_argument('--vetime_path', type=str, default=None, help='VETime full model weight path')
+    parser.add_argument('--model_checkpoint', type=str, default=None,
+                        help='VETime v3 model checkpoint path (strict load)')
     parser.add_argument('--vision_name', type=str, default='mae_visualize_base.pth', help='vision_weight filename')
     # Optimizer parameters (as per paper)
     parser.add_argument('--learning_rate', type=float, default=5e-4, help='Learning rate (paper: 5e-4)')
@@ -1134,7 +1089,7 @@ if __name__ == "__main__":
     parser.add_argument('--cmrg_log_interval', type=int, default=100,
                         help='Global-step interval for CMRG monitoring')
     parser.add_argument('--resume', type=str, default=None,
-                        help='从checkpoint继续训练的路径（完整状态恢复）')
+                        help='v3 training-resume checkpoint path (strict state restore)')
 
     args = parser.parse_args()
     output_file_path = args.output_file_path.replace('result.json', f'{args.model_name.replace("/", "-")}_result.json')
