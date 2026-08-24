@@ -454,6 +454,17 @@ if __name__ == '__main__':
                         help='MAE checkpoint directory')
     parser.add_argument('--vision_name', type=str, default='mae_visualize_base.pth'
                         , help='vision_weight')
+    parser.add_argument('--ts_finetune_type', choices=['freeze', 'lora', 'full'], default='lora')
+    parser.add_argument('--cmrg_enabled', action='store_true',
+                        help='Match the CMRG setting used when saving the v3 model checkpoint')
+    parser.add_argument('--cmrg_num_relation_tokens', type=int, default=16)
+    parser.add_argument('--cmrg_guide_dim', type=int, default=512)
+    parser.add_argument('--cmrg_num_heads', type=int, default=8)
+    parser.add_argument('--cmrg_metric_init', default='identity')
+    parser.add_argument('--cmrg_gate_init', type=float, default=0.0)
+    parser.add_argument('--cmrg_injection_mode', choices=['all_layers', 'last_layer'], default='all_layers')
+    parser.add_argument('--cmrg_factorized', action='store_true', default=True)
+    parser.add_argument('--cmrg_log_interval', type=int, default=100)
     parser.add_argument('--num_workers', type=int, default=None,
                         help='TSB metric post-process worker count (default: 4, capped by cpu_count-2)')
     parser.add_argument('--cpu_threads_per_worker', type=int, default=1,

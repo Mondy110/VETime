@@ -34,22 +34,20 @@ VETime introduces a Reversible Image Conversion and a Patch-Level Temporal Align
 
 ```
 VETime/
-├── train.py                  # Main training script (with Accelerate support)
-├── Test_TSB.py               # TSB-AD benchmark evaluation and inference
-├── model/
-│   ├── VETime.py             # VETIME main model architecture
-│   ├── VTS_module.py         # Vision-Time Series fusion module
-│   ├── Vision_encoder/       # Vision backbone (MAE, ViT)
-│   └── TS_encoder/           # Time series encoder
+├── src/vetime/               # Application package
+│   ├── models/               # temporal, vision, multimodal composition
+│   ├── data/                 # datasets, collation, image conversion
+│   ├── losses/               # training losses
+│   ├── metrics/              # TSB metrics and supporting implementations
+│   └── infrastructure/       # checkpointing and runtime logging
+├── train_hydra.py            # Primary Hydra training entry point
+├── train.py                  # CLI training entry point
+├── Test_TSB.py               # TSB-AD evaluation entry point
 ├── dataset/
-│   ├── dataloader.py         # Data loaders and collate functions
-│   ├── pre_image.py          # Time series to image conversion utilities
-│   └── TSB-AD/               # TSB-AD benchmark datasets
-├── loss/
-│   └── loss.py               # Contrastive loss, etc.
-├── evaluation/
-│   ├── metrics.py            # Comprehensive anomaly detection metrics
-│   └── basic_metrics.py      # Basic metric implementations
+│   └── TSB-AD/               # TSB-AD benchmark assets (data only)
+├── checkpoints/
+│   ├── weight_ts/            # legacy-compatible temporal pretraining weights
+│   └── weight_v/             # MAE weights
 └── requirements.txt          # Dependencies list
 ```
 
@@ -114,26 +112,50 @@ After downloading and extracting, place the datasets in the following directory 
 └── File_List/         # Evaluation split files
 ```
 
-### Hydra experiment configuration
+### Training and checkpoint protocol
 
-The QueryDecoder experiment branch supports a layered Hydra configuration while
-keeping the original `train.py` command line unchanged. Edit the shared values
-in `configs/base.yaml`, QueryDecoder/CMRG settings in
-`configs/model/query_cmrg.yaml`, and experiment-specific values in
-`configs/univariate.yaml`.
+`train_hydra.py` is the primary entry point.  It prints the device, clean
+composition class, CMRG/QueryDecoder state, trainable parameter groups, and
+the initialization source before training begins.
 
-For example, run micro-batches of 64 with an effective batch size of 256:
+First verify the two supplied pretraining checkpoints without starting a run:
 
 ```bash
-python train_hydra.py data.batch_size=64 data.effective_batch_size=256
+export PYTHONPATH=src:.
+python scripts/validate_checkpoints.py --full-model
 ```
 
-Command-line overrides can also select staged QueryDecoder training and enable
-CMRG:
+For a new run initialized from the supplied temporal pretraining and MAE
+weights:
 
 ```bash
-python train_hydra.py model.query_decoder_training_mode=staged model.cmrg.enabled=true
+python train_hydra.py
 ```
+
+The initialization sources are mutually exclusive:
+
+- `paths.ts_path`: the original temporal pretraining checkpoint; MAE is always read from `paths.vision_path` and is frozen.
+- `paths.model_checkpoint`: a strict v3 VETime model checkpoint.
+- `paths.resume`: a strict v3 training-resume checkpoint (model, optimizer, scheduler, RNG and progress).
+
+Legacy complete VETime checkpoints (`--vetime_path`) are deliberately not supported. To use a v3 model checkpoint with Hydra, disable the temporal source in the same command:
+
+```bash
+python train_hydra.py paths.ts_path=null paths.model_checkpoint=./output/VETime-query-08-24__224_best.pth
+```
+
+To resume an interrupted run:
+
+```bash
+python train_hydra.py paths.ts_path=null paths.resume=./output/checkpoints/VETime-query-08-24/univariate_epoch0_full.pth
+```
+
+Best model files use the v3 `vetime_model` format. Periodic files use the v3
+`training_resume` format. Both formats perform strict loading and reject raw
+state dictionaries or obsolete full-model checkpoints. When evaluating a v3
+model, provide the same architecture switches used for training (for example
+`--cmrg_enabled` when CMRG was enabled); strict loading will otherwise report
+the mismatch instead of silently dropping weights.
 
 ---
 
@@ -157,8 +179,9 @@ VETime employs the following comprehensive metrics for evaluation:
 ```bash
 python Test_TSB.py \
     --model_name VETime \
-    --dataset_test_dir ./dataset/TSB-AD/Datasets/TSB-AD-U \
-    --file_list ./dataset/TSB-AD/Datasets/File_List/TSB-AD-U.csv
+    --dataset_dir ./dataset/TSB-AD/Datasets/TSB-AD-U \
+    --model_checkpoint ./output/VETime-query-08-24__224_best.pth \
+    --cmrg_enabled
 ```
 
 ---
