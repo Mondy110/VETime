@@ -1,7 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from model.VTS_module import QueryDecoder
+from vetime.models.multimodal.modules import QueryDecoder
 
 
 def test_query_decoder_output_shape():
@@ -38,7 +38,7 @@ def test_query_decoder_with_mask():
 
 def test_rope_consistency():
     """验证 QueryDecoder 的 RoPE 与 TS_encoder 一致"""
-    from model.TS_encoder.encoding_utils import RotaryEmbedding
+    from vetime.models.temporal.encoding_utils import RotaryEmbedding
 
     D = 256
     N = 128
@@ -135,7 +135,7 @@ def test_query_decoder_disabled_by_default():
     """验证 QueryDecoder 默认禁用，不影响现有代码路径"""
     # 这个测试验证 QueryDecoder 只是一个独立模块
     # VETIME 模型默认不使用 QueryDecoder (use_query_decoder=False)
-    from model.VTS_module import QueryDecoder
+    from vetime.models.multimodal.modules import QueryDecoder
 
     # QueryDecoder 可以独立实例化，不影响现有代码
     decoder = QueryDecoder(d_model=256, num_heads=8)

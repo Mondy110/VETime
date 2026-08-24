@@ -1,6 +1,6 @@
 import torch
 
-from dataset.dataloader import collate_fn
+from vetime.data.legacy_dataloader import collate_fn
 
 
 def _sample(length, values):

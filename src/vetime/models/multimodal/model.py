@@ -8,9 +8,9 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
-from loss.loss import win_Contrastive_Loss
-from model.CMRG import CMRGContext, CrossModalRelationGuider, RelationDistiller
-from model.VTS_module import M_moe, QueryDecoder, V_Attention, VTS_Alignment
+from vetime.losses.legacy import win_Contrastive_Loss
+from .cmrg import CMRGContext, CrossModalRelationGuider, RelationDistiller
+from .modules import M_moe, QueryDecoder, V_Attention, VTS_Alignment
 
 from vetime.models.temporal.model import TemporalModel
 

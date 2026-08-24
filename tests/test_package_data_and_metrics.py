@@ -1,9 +1,9 @@
 import torch
 import numpy as np
 
-from dataset.dataloader import collate_fn as legacy_collate_fn
-from evaluation.metrics import fast_get_metrics as legacy_fast_get_metrics
-from loss.loss import load_balance_loss as legacy_load_balance_loss
+from vetime.data.legacy_dataloader import collate_fn as legacy_collate_fn
+from vetime.metrics.tsb import fast_get_metrics as legacy_fast_get_metrics
+from vetime.losses.legacy import load_balance_loss as legacy_load_balance_loss
 from postprocess_runtime import resolve_postprocess_workers as legacy_workers
 from training_logging import DeferredLossMetrics as LegacyDeferredLossMetrics
 

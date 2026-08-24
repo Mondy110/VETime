@@ -1,9 +1,8 @@
 """Training utilities for CMRG that do not depend on the training runtime."""
 
 from typing import Optional
-import warnings
 
-from model.CMRG import CMRGContext
+from .cmrg import CMRGContext
 
 
 def add_cmrg_injection_mode_argument(parser):
@@ -14,34 +13,6 @@ def add_cmrg_injection_mode_argument(parser):
         default="all_layers",
         help="CMRG attention injection mode",
     )
-
-
-def load_model_state_compat(model, state_dict, description="model"):
-    """Load legacy weights non-strictly and report compatibility gaps."""
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"[INFO] {description} loaded (strict=False)")
-    if missing:
-        print(f"  Missing parameters ({len(missing)}): {list(missing)}")
-    if unexpected:
-        print(f"  Unexpected parameters ({len(unexpected)}): {list(unexpected)}")
-    return missing, unexpected
-
-
-def restore_optimizer_state_compat(optimizer, state_dict):
-    """Restore optimizer state when compatible, otherwise continue safely."""
-    if state_dict is None:
-        warnings.warn(
-            "Optimizer restore skipped: checkpoint has no optimizer state",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return False
-    try:
-        optimizer.load_state_dict(state_dict)
-    except (ValueError, KeyError, RuntimeError) as error:
-        warnings.warn(f"Optimizer restore skipped: {error}", RuntimeWarning, stacklevel=2)
-        return False
-    return True
 
 
 def configure_freeze_mode(model):
@@ -67,7 +38,7 @@ def collect_cmrg_monitoring(model, cmrg_context: Optional[CMRGContext]):
     if not getattr(model, "cmrg_enabled", False) or cmrg_context is None:
         return {}
 
-    layers = model.ts_encoder.ts_encoder.transformer_encoder.layers
+    layers = model.temporal.encoder.transformer_encoder.layers
     metrics = {}
     for layer_idx, layer in enumerate(layers):
         alpha = layer.cmrg_alpha.detach()

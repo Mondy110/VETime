@@ -1,6 +1,6 @@
 import torch
 from transformers import CLIPVisionModel
-from model.Vision_encoder.models_mae import MaskedAutoencoderViT,MAE_ARCH
+from .models_mae import MaskedAutoencoderViT,MAE_ARCH
 from torch import nn
 
 from huggingface_hub import snapshot_download

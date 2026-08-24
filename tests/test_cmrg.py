@@ -5,26 +5,24 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from model.CMRG import (
+from vetime.models.multimodal.cmrg import (
     CMRGContext,
     CrossModalRelationGuider,
     RelationDistiller,
 )
-from model.cmrg_training import (
+from vetime.models.multimodal.training_policy import (
     add_cmrg_injection_mode_argument,
     collect_cmrg_monitoring,
     configure_freeze_mode,
-    load_model_state_compat,
-    restore_optimizer_state_compat,
 )
-from model.TS_encoder.encoding_utils import (
+from vetime.models.temporal.encoding_utils import (
     CustomTransformerEncoder,
     MultiheadAttentionWithRoPE,
     RotaryEmbedding,
 )
-from model.TS_encoder.ts_encoder import TimeSeriesEncoder
-from model.TS_encoder.ts_model import TS_Model
-from model.VETime import VETIME
+from vetime.models.temporal.legacy_encoder import TimeSeriesEncoder, TimeSeriesConfig
+from vetime.models.temporal.legacy_model import TS_Model
+from vetime.models.multimodal.model import VETimeMultimodalModel, VETimeOptions
 
 def test_relation_distiller_returns_relation_tokens_without_dropout():
     distiller = RelationDistiller(vision_dim=768, guide_dim=512, num_relation_tokens=16, num_heads=8)
@@ -281,8 +279,6 @@ class _RecordingTimeSeriesEncoder(TimeSeriesEncoder):
 
 
 def _tiny_vetime_config(cmrg_enabled):
-    from model.TS_encoder.ts_encoder import TimeSeriesConfig
-
     return TimeSeriesConfig(
         d_model=8,
         d_proj=2,
@@ -301,7 +297,7 @@ def _tiny_vetime_config(cmrg_enabled):
 def _make_tiny_vetime(cmrg_enabled=True, use_gradient_checkpointing=False):
     config = _tiny_vetime_config(cmrg_enabled)
     ts_model = TS_Model(config)
-    ts_model.ts_encoder = _RecordingTimeSeriesEncoder(
+    ts_model.encoder = _RecordingTimeSeriesEncoder(
         d_model=config.d_model,
         d_proj=config.d_proj,
         patch_size=config.patch_size,
@@ -312,13 +308,19 @@ def _make_tiny_vetime(cmrg_enabled=True, use_gradient_checkpointing=False):
         use_lora=config.use_lora,
     )
     vision = _CountingVisionEncoder()
-    return VETIME(
-        config,
-        vision,
-        config,
-        ts_model,
-        use_query_decoder=False,
-        use_gradient_checkpointing=use_gradient_checkpointing,
+    return VETimeMultimodalModel(
+        temporal=ts_model,
+        vision_encoder=vision,
+        options=VETimeOptions(
+            vision_dim=8,
+            temporal_dim=8,
+            max_length=8,
+            cmrg_enabled=config.cmrg_enabled,
+            cmrg_guide_dim=8,
+            cmrg_num_heads=2,
+            use_query_decoder=False,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+        ),
     ), vision
 
 
@@ -394,9 +396,7 @@ def test_cmrg_monitoring_reports_gates_for_inactive_layers():
     encoder.layers[1].cmrg_alpha.data.fill_(0.75)
     model = SimpleNamespace(
         cmrg_enabled=True,
-        ts_encoder=SimpleNamespace(
-            ts_encoder=SimpleNamespace(transformer_encoder=encoder)
-        ),
+        temporal=SimpleNamespace(encoder=SimpleNamespace(transformer_encoder=encoder)),
     )
 
     metrics = collect_cmrg_monitoring(model, _cmrg_context())
@@ -434,33 +434,6 @@ def test_cmrg_monitoring_reports_factorized_relative_qk_strength():
     metrics = collect_cmrg_monitoring(model, context)
 
     assert metrics["cmrg/rho_0"] == pytest.approx(expected.item(), rel=1e-6)
-
-
-def test_legacy_model_load_reports_missing_and_unexpected_keys(capsys):
-    model = torch.nn.Linear(2, 1)
-    legacy_state = {"weight": model.weight.detach().clone(), "retired": torch.ones(1)}
-
-    missing, unexpected = load_model_state_compat(model, legacy_state, "legacy VETime")
-
-    assert missing == ["bias"]
-    assert unexpected == ["retired"]
-    report = capsys.readouterr().out
-    assert "strict=False" in report
-    assert "1" in report
-
-
-def test_incompatible_optimizer_resume_is_skipped_with_warning():
-    source_param = torch.nn.Parameter(torch.ones(()))
-    source_optimizer = torch.optim.AdamW([source_param])
-    incompatible_state = source_optimizer.state_dict()
-    target_optimizer = torch.optim.AdamW(
-        [torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.zeros(()))]
-    )
-
-    with pytest.warns(RuntimeWarning, match="Optimizer.*skipped"):
-        restored = restore_optimizer_state_compat(target_optimizer, incompatible_state)
-
-    assert restored is False
 
 
 @pytest.mark.parametrize("mode", ["all_layers", "last_layer"])
@@ -511,7 +484,7 @@ def test_freeze_mode_keeps_cmrg_modules_and_gates_trainable():
 
     parameters = dict(model.named_parameters())
     assert all(param.requires_grad for name, param in parameters.items() if "cmrg_" in name)
-    assert not parameters["ts_encoder.ts_encoder.embedding_layer.weight"].requires_grad
+    assert not parameters["temporal.encoder.embedding_layer.weight"].requires_grad
     assert not parameters[
-        "ts_encoder.ts_encoder.transformer_encoder.layers.0.self_attn.q_proj.weight"
+        "temporal.encoder.transformer_encoder.layers.0.self_attn.q_proj.weight"
     ].requires_grad

@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
-from model.TS_encoder.encoding_utils import CustomTransformerEncoder, RotaryEmbedding
+from .encoding_utils import CustomTransformerEncoder, RotaryEmbedding
 
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-from model.CMRG import CMRGContext
+from vetime.models.multimodal.cmrg import CMRGContext
 
 
 @dataclass

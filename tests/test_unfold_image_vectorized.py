@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from dataset.pre_image import ts2image_1d
-from model.Vision_encoder.V_encoder import (
+from vetime.data.pre_image import ts2image_1d
+from vetime.models.vision.legacy_mae.V_encoder import (
     V_model,
     _unfold_image_loop,
     _unfold_image_vectorized,

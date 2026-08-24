@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.Vision_encoder.Vit4AD import MAETS_AD, VitTS_AD
+from .Vit4AD import MAETS_AD, VitTS_AD
 # from loss.head import AD_classifier,TS_Reconstruction,AD_Reconstruction_P
 
 import os

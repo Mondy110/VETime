@@ -27,7 +27,7 @@ class FrozenMAEEncoder(nn.Module):
         max_length: int = 5000,
         use_vectorized_fold: bool = False,
     ) -> "FrozenMAEEncoder":
-        from model.Vision_encoder.V_encoder import V_model
+        from .legacy_mae.V_encoder import V_model
 
         encoder = V_model(
             vision_name=vision_name,

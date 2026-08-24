@@ -1,5 +1,5 @@
 """Sampler boundary for length-aware training batches."""
 
-from dataset.dataloader import DynamicLengthBatchSampler
+from .legacy_dataloader import DynamicLengthBatchSampler
 
 __all__ = ["DynamicLengthBatchSampler"]

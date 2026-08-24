@@ -24,9 +24,9 @@ try:
     from TSB_AD.utils.slidingWindows import find_length_rank
 except ModuleNotFoundError:  # optional benchmark dependency
     find_length_rank = None
-from dataset.dataloader import create_random_mask
-from dataset.pre_image import ts2image_Test
-from evaluation.metrics import get_metrics
+from vetime.data.legacy_dataloader import create_random_mask
+from vetime.data.pre_image import ts2image_Test
+from vetime.metrics.tsb import get_metrics
 from postprocess_runtime import (
     configure_postprocess_worker,
     postprocess_thread_limits,

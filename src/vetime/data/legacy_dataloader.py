@@ -16,7 +16,7 @@ import pickle
 from torch.utils.data import Dataset, Sampler
 import random
 
-from dataset.pre_image import ts2image_1d
+from .pre_image import ts2image_1d
 
 
 class AnomalyDataset(Dataset):

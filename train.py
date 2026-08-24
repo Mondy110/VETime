@@ -22,18 +22,18 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from evaluation.metrics import fast_get_metrics
-from model.Vision_encoder.V_encoder import V_model
-from loss.loss import load_balance_loss
-from model.TS_encoder.ts_model import TS_Model
-from model.TS_encoder.config import default_config_t
-from dataset.dataloader import AnomalyDataset, collate_fn, DynamicLengthBatchSampler
+from vetime.metrics.tsb import fast_get_metrics
+from vetime.models.vision.legacy_mae.V_encoder import V_model
+from vetime.losses.legacy import load_balance_loss
+from vetime.models.temporal.legacy_model import TS_Model
+from vetime.models.temporal.legacy_config import default_config_t
+from vetime.data.legacy_dataloader import AnomalyDataset, collate_fn, DynamicLengthBatchSampler
 import logging
 from tqdm.auto import tqdm
 import os
 from datetime import datetime
-from model.CMRG import CMRGContext
-from model.cmrg_training import (
+from vetime.models.multimodal.cmrg import CMRGContext
+from vetime.models.multimodal.training_policy import (
     add_cmrg_injection_mode_argument,
     collect_cmrg_monitoring,
     configure_freeze_mode,

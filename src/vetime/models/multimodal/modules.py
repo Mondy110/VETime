@@ -249,7 +249,7 @@ class M_moe(nn.Module):
         return c_fusion, m_w
 
 
-from model.TS_encoder.encoding_utils import RotaryEmbedding
+from vetime.models.temporal.encoding_utils import RotaryEmbedding
 
 
 class QueryDecoder(nn.Module):

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Any, Tuple, Optional
-from model.CMRG import CMRGContext, factorized_product_frobenius
+from vetime.models.multimodal.cmrg import CMRGContext, factorized_product_frobenius
 
 
 class LoRALinear(nn.Module):

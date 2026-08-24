@@ -114,7 +114,7 @@ def test_frozen_vision_adapter_forwards_checkpoint_directory(monkeypatch, tmp_pa
             calls.update(kwargs)
             super().__init__()
 
-    import model.Vision_encoder.V_encoder as legacy_vision
+    import vetime.models.vision.legacy_mae.V_encoder as legacy_vision
 
     monkeypatch.setattr(legacy_vision, "V_model", FakeVModel, raising=False)
     wrapped = FrozenMAEEncoder.from_checkpoint(

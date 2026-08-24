@@ -6,7 +6,7 @@ import torch
 from vetime.infrastructure.checkpointing.temporal_legacy import load_legacy_temporal_checkpoint
 from vetime.models.temporal.config import TemporalModelConfig
 from vetime.models.temporal.model import TemporalModel
-from model.TS_encoder.ts_model import TS_Model
+from vetime.models.temporal.legacy_model import TS_Model
 
 
 @pytest.fixture()
