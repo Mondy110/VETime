@@ -37,7 +37,7 @@ def save_resume_checkpoint(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "kind": "training_resume",
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
@@ -79,15 +79,18 @@ def _restore_random_state(random_state: Mapping[str, Any]) -> None:
 
 def load_resume_checkpoint(path: str | Path, model: nn.Module, optimizer, scheduler):
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    kind = payload.get("kind") if isinstance(payload, Mapping) else None
-    if kind == "temporal_pretrain":
-        raise CheckpointCompatibilityError("expected a training_resume checkpoint, got temporal_pretrain")
-    if kind not in ("training_resume", None):
-        raise CheckpointCompatibilityError(f"expected a training_resume checkpoint, got {kind!r}")
-    if not isinstance(payload, Mapping) or "model_state_dict" not in payload:
+    if not isinstance(payload, Mapping):
+        raise CheckpointCompatibilityError("resume checkpoint must be a versioned mapping")
+    if payload.get("format_version") != 3:
+        raise CheckpointCompatibilityError("expected checkpoint format_version=3")
+    if payload.get("kind") != "training_resume":
+        raise CheckpointCompatibilityError(
+            f"expected a training_resume checkpoint, got {payload.get('kind')!r}"
+        )
+    if "model_state_dict" not in payload:
         raise CheckpointCompatibilityError("resume checkpoint does not contain model_state_dict")
     try:
-        model.load_state_dict(payload["model_state_dict"], strict=False)
+        model.load_state_dict(payload["model_state_dict"], strict=True)
     except (RuntimeError, KeyError, ValueError) as error:
         raise CheckpointCompatibilityError(f"resume model state is incompatible: {error}") from error
     _restore_optimizer(optimizer, payload.get("optimizer_state_dict"))

@@ -24,7 +24,7 @@ def save_model_checkpoint(model: nn.Module, path: str | Path, metadata: Mapping[
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "format_version": 2,
+            "format_version": 3,
             "kind": "vetime_model",
             "model_state_dict": model.state_dict(),
             "metadata": dict(metadata),
@@ -35,14 +35,20 @@ def save_model_checkpoint(model: nn.Module, path: str | Path, metadata: Mapping[
 
 def load_model_checkpoint(model: nn.Module, path: str | Path) -> ModelLoadReport:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(payload, Mapping) and payload.get("kind") == "temporal_pretrain":
-        raise CheckpointCompatibilityError("expected a vetime_model checkpoint, got training pretrain")
-    state_dict = payload.get("model_state_dict", payload) if isinstance(payload, Mapping) else None
+    if not isinstance(payload, Mapping):
+        raise CheckpointCompatibilityError("model checkpoint must be a versioned mapping")
+    if payload.get("format_version") != 3:
+        raise CheckpointCompatibilityError("expected checkpoint format_version=3")
+    if payload.get("kind") != "vetime_model":
+        raise CheckpointCompatibilityError(
+            f"expected a vetime_model checkpoint, got {payload.get('kind')!r}"
+        )
+    state_dict = payload.get("model_state_dict")
     if not isinstance(state_dict, Mapping):
         raise CheckpointCompatibilityError("model checkpoint does not contain model_state_dict")
     try:
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        model.load_state_dict(state_dict, strict=True)
     except (RuntimeError, KeyError, ValueError) as error:
         raise CheckpointCompatibilityError(f"model checkpoint is incompatible: {error}") from error
-    metadata = payload.get("metadata", {}) if isinstance(payload, Mapping) else {}
-    return ModelLoadReport(tuple(missing), tuple(unexpected), metadata)
+    metadata = payload.get("metadata", {})
+    return ModelLoadReport((), (), metadata)

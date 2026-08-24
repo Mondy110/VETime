@@ -23,7 +23,7 @@ def test_new_model_checkpoint_contains_version_and_kind(tmp_path: Path):
     save_model_checkpoint(model, path, metadata={"run": "test"})
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    assert payload["format_version"] == 2
+    assert payload["format_version"] == 3
     assert payload["kind"] == "vetime_model"
     assert payload["metadata"]["run"] == "test"
 
@@ -41,9 +41,17 @@ def test_model_checkpoint_round_trip_restores_parameters(tmp_path: Path):
     torch.testing.assert_close(target.bias, source.bias)
 
 
+def test_model_loader_rejects_legacy_raw_state_dict(tmp_path: Path):
+    path = tmp_path / "legacy.pth"
+    torch.save({"model_state_dict": {}}, path)
+
+    with pytest.raises(CheckpointCompatibilityError, match="format_version"):
+        load_model_checkpoint(nn.Linear(2, 1), path)
+
+
 def test_resume_loader_rejects_temporal_pretrain_checkpoint(tmp_path: Path):
     path = tmp_path / "temporal.pth"
-    torch.save({"format_version": 2, "kind": "temporal_pretrain", "model_state_dict": {}}, path)
+    torch.save({"format_version": 3, "kind": "temporal_pretrain", "model_state_dict": {}}, path)
     model = nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(model.parameters())
 

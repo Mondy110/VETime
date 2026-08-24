@@ -28,9 +28,8 @@ def training_config_from_mapping(config: Mapping[str, Any]) -> TrainingConfig:
         temporal=_get(config, "paths.ts_path"),
         vision_dir=_get(config, "paths.vision_path", "./checkpoints/weight_v"),
         vision_name=_get(config, "model.vision_name", "mae_visualize_base.pth"),
-        vetime=_get(config, "paths.vetime_path"),
+        model_checkpoint=_get(config, "paths.model_checkpoint"),
         resume=_get(config, "paths.resume"),
-        pretrain_from=_get(config, "paths.pretrain_from"),
         keep_idx_path=_get(config, "paths.keep_idx_path"),
     )
     model = ModelConfig(

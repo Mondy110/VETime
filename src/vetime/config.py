@@ -16,9 +16,8 @@ class CheckpointPaths:
     temporal: str | None
     vision_dir: str
     vision_name: str
-    vetime: str | None = None
+    model_checkpoint: str | None = None
     resume: str | None = None
-    pretrain_from: str | None = None
     keep_idx_path: str | None = None
 
 
@@ -110,5 +109,14 @@ class TrainingConfig:
             raise ValueError("num_epochs must be positive")
         if self.tsb_postprocess_workers <= 0 or self.tsb_worker_cpu_threads <= 0:
             raise ValueError("TSB worker settings must be positive")
-        if self.paths.resume and self.paths.temporal:
-            raise ValueError("resume and temporal pretraining paths are mutually exclusive")
+        initialization_sources = tuple(
+            source
+            for source in (
+                self.paths.temporal,
+                self.paths.model_checkpoint,
+                self.paths.resume,
+            )
+            if source
+        )
+        if len(initialization_sources) > 1:
+            raise ValueError("exactly one initialization source may be specified")

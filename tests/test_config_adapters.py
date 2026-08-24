@@ -41,3 +41,23 @@ def test_config_rejects_non_positive_batch_size():
             training=OptimizerConfig(),
             data=DataConfig(),
         )
+
+
+def test_config_rejects_multiple_initialization_sources():
+    paths = CheckpointPaths(
+        temporal="checkpoints/weight_ts/temporal.pth",
+        vision_dir="checkpoints/weight_v",
+        vision_name="mae_visualize_base.pth",
+        model_checkpoint="output/models/model.pth",
+    )
+
+    with pytest.raises(ValueError, match="exactly one initialization source"):
+        TrainingConfig(seed=64, batch_size=2, paths=paths)
+
+
+def test_hydra_adapter_reads_model_checkpoint_not_vetime_path():
+    config = training_config_from_mapping(
+        {"paths": {"model_checkpoint": "output/models/clean.pth"}}
+    )
+
+    assert config.paths.model_checkpoint == "output/models/clean.pth"

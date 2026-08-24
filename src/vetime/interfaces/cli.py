@@ -68,9 +68,8 @@ def training_config_from_namespace(namespace: Namespace) -> TrainingConfig:
             "output_file_path": values.get("output_file_path", "./output/result.json"),
             "vision_path": values.get("vision_path", "./checkpoints/weight_v"),
             "ts_path": values.get("ts_path"),
-            "vetime_path": values.get("vetime_path"),
+            "model_checkpoint": values.get("model_checkpoint"),
             "resume": values.get("resume"),
-            "pretrain_from": values.get("pretrain_from"),
             "keep_idx_path": values.get("keep_idx_path"),
         },
     }
@@ -111,9 +110,11 @@ def namespace_from_training_config(config: TrainingConfig) -> Namespace:
         output_file_path=config.output_file_path,
         vision_path=config.paths.vision_dir,
         ts_path=config.paths.temporal,
-        vetime_path=config.paths.vetime,
+        model_checkpoint=config.paths.model_checkpoint,
+        # Transitional placeholder: the legacy loop will stop reading this
+        # field when versioned model-checkpoint loading is wired in.
+        vetime_path=None,
         resume=config.paths.resume,
-        pretrain_from=config.paths.pretrain_from,
         keep_idx_path=config.paths.keep_idx_path,
         device=config.device,
         cmrg_enabled=config.model.cmrg_enabled,
