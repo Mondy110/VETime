@@ -216,7 +216,7 @@ git commit -m "refactor: remove legacy full VETime checkpoint path"
 - Create: `src/vetime/losses/core.py`
 - Create: `src/vetime/metrics/{core.py,basic_metrics.py,sliding_windows.py,affiliation/}`
 - Modify: all imports under `src/vetime`, root entries and tests
-- Delete: legacy Python source under `model/`, `loss/`, `evaluation/`, `dataset/`
+- Delete: legacy Python source under `model/`, `loss/`, `evaluation/`, and only `dataset/*.py`
 - Test: `tests/test_import_boundaries.py`
 
 **Interfaces:** `src/vetime` 不含 `from model.`、`from dataset.`、`from loss.`、`from evaluation.` import。
@@ -257,6 +257,7 @@ Expected: PASS.
 ~~~bash
 git add src tests train.py train_hydra.py Test_TSB.py scripts configs
 git rm -r model loss evaluation
+git rm dataset/__init__.py dataset/dataloader.py dataset/pre_image.py
 git commit -m "refactor: remove legacy runtime implementation directories"
 ~~~
 
