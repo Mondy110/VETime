@@ -27,15 +27,14 @@ except ModuleNotFoundError:  # optional benchmark dependency
 from dataset.dataloader import create_random_mask
 from dataset.pre_image import ts2image_Test
 from evaluation.metrics import get_metrics
-from model.TS_encoder.config import default_config_t
-from model.TS_encoder.ts_model import TS_Model
-from model.VETime import VETIME
-from model.Vision_encoder.V_encoder import V_model
 from postprocess_runtime import (
     configure_postprocess_worker,
     postprocess_thread_limits,
     resolve_postprocess_workers,
 )
+from vetime.application.build_model import build_training_model
+from vetime.infrastructure.logging import log_runtime_topology
+from vetime.interfaces.cli import training_config_from_namespace
 
 SEED = 2024
 torch.manual_seed(SEED)
@@ -449,8 +448,10 @@ if __name__ == '__main__':
     parser.add_argument('--data_setting', type=str, default=DATA_INIT_SETTING, help='Device to use for evaluation')
     parser.add_argument('--ts_path', type=str, default='./checkpoints/weight_ts/full_mask_anomaly_head_pretrain_checkpoint_best.pth'
                         , help='TS_weight')
-    parser.add_argument('--vetime_path', type=str, default='./checkpoints/VETime.pth'
-                        , help='VETime_weight')
+    parser.add_argument('--model_checkpoint', type=str, default=None,
+                        help='Strict v3 VETime model checkpoint')
+    parser.add_argument('--vision_path', type=str, default='./checkpoints/weight_v',
+                        help='MAE checkpoint directory')
     parser.add_argument('--vision_name', type=str, default='mae_visualize_base.pth'
                         , help='vision_weight')
     parser.add_argument('--num_workers', type=int, default=None,
@@ -459,6 +460,10 @@ if __name__ == '__main__':
                         help='PyTorch CPU threads allowed inside each TSB metric worker')
 
     args_test = parser.parse_args()
+    # A full v3 model already includes the temporal encoder; its checkpoint is
+    # therefore the sole initialization source for evaluation.
+    if args_test.model_checkpoint:
+        args_test.ts_path = None
 
     dataset_pass_list = PASS_LIST_UNI
     dataset_use_list = USE_LIST_UNI
@@ -472,25 +477,14 @@ if __name__ == '__main__':
 
     device = args_test.device
 
-    # 从 checkpoint 推断 MAX_L（位置编码长度）
-    max_l = 5000  # 默认值
-    if args_test.vetime_path is not None and os.path.exists(args_test.vetime_path):
-        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-        if 'pos_emb_v' in state_dict:
-            max_l = state_dict['pos_emb_v'].shape[1]
-            print(f"[INFO] Detected MAX_L={max_l} from checkpoint")
-
-    # 预先实例化共用的 vision_model（单变量和多变量共用）
-    vision_model = V_model(args_test.vision_name, unpatch=True, MAX_L=max_l)
-    config_v = vision_model.config
-
-    ts_model = TS_Model(default_config_t)
-    model = VETIME(config_v, vision_model, default_config_t, ts_model, args_test.model_name)
+    config = training_config_from_namespace(args_test)
+    model = build_training_model(config)
     model.eval().to(device)
-
-    if args_test.vetime_path is not None:
-        state_dict = torch.load(args_test.vetime_path, map_location='cpu')
-        model.load_state_dict(state_dict, strict=False)
+    log_runtime_topology(
+        model,
+        torch.device(device),
+        "temporal_pretrain" if args_test.ts_path else "model_checkpoint" if args_test.model_checkpoint else "random_initialization",
+    )
 
     TSB_test(
         model, args_test, args_test.data_setting, device,
